@@ -21,6 +21,8 @@ export interface ManagedDataItem {
   revision?: string;
   /** Only explicitly eligible items may participate in time-based bulk cleanup. */
   cleanupEligible?: boolean;
+  /** Explicit opt-in for force cleanup; hard ownership/current-session guards still apply. */
+  forceCleanupEligible?: boolean;
   protectionReason?: string;
 }
 
@@ -49,6 +51,8 @@ export interface ManagedDeleteRequest {
   revision: string;
   item: ManagedDataItem;
   context: ManagedDataContext;
+  /** Refreshes host session identity at the destructive edge after user confirmation. */
+  revalidateContext?: () => ManagedDataContext;
 }
 
 export interface ManagedDeleteResult {
@@ -64,6 +68,8 @@ export interface ManagedDataSource {
   delete(cwd: string, itemId: string, context?: ManagedDataContext): Promise<boolean>;
   /** Required for time-based cleanup; legacy sources remain explicit-delete only. */
   guardedDelete?(request: ManagedDeleteRequest): Promise<ManagedDeleteResult>;
+  /** May bypass a source's soft protection, but must retain revision, path, and ownership guards. */
+  forceDelete?(request: ManagedDeleteRequest): Promise<ManagedDeleteResult>;
 }
 
 export class DataManagerRegistry {
@@ -260,16 +266,54 @@ async function confirmDelete(
   );
 }
 
+async function confirmForceDelete(
+  ctx: ExtensionCommandContext,
+  source: ManagedDataSource,
+  snapshot: ManagedDataSnapshot,
+  item: ManagedDataItem,
+  context: ManagedDataContext,
+): Promise<void> {
+  if (!source.forceDelete || item.forceCleanupEligible !== true || !item.revision) {
+    ctx.ui.notify(`Item ${item.id} is not eligible for force deletion.`, "warning");
+    return;
+  }
+  const warning = [
+    item.title,
+    item.detail,
+    item.protectionReason ? `Protection being overridden: ${item.protectionReason}` : undefined,
+    "This permanently removes host-managed local data.",
+  ].filter((line): line is string => Boolean(line)).join("\n");
+  if (!await ctx.ui.confirm(`Force delete from ${snapshot.label}?`, warning)) return;
+  if (!await ctx.ui.confirm("Confirm irreversible force delete?", `Delete ${item.id} permanently? This cannot be undone.`)) return;
+  const revalidateContext = () => commandContext(ctx, context.now);
+  const latestContext = revalidateContext();
+  const result = await source.forceDelete({
+    cwd: latestContext.cwd,
+    itemId: item.id,
+    revision: item.revision,
+    item,
+    context: latestContext,
+    revalidateContext,
+  });
+  const deleted = result.status === "deleted";
+  const message = deleted
+    ? `Force-deleted ${item.id} from ${snapshot.label}.${result.message ? ` Warning: ${result.message}` : ""}`
+    : `${result.status === "missing" ? "Item no longer exists" : `Could not force-delete ${item.id} (${result.status})`}: ${result.message ?? item.id}`;
+  ctx.ui.notify(message, deleted && !result.message ? "info" : "warning");
+}
+
 interface CleanupCandidate {
   source: ManagedDataSource;
   snapshot: ManagedDataSnapshot;
   item: ManagedDataItem;
+  deleteMode: "guarded" | "force";
 }
 
 interface CleanupPreview {
   candidates: CleanupCandidate[];
   skippedOldItems: number;
   failures: SnapshotFailure[];
+  force: boolean;
 }
 
 async function cleanupPreview(
@@ -277,6 +321,7 @@ async function cleanupPreview(
   context: ManagedDataContext,
   durationMs: number,
   sourceId: string | undefined,
+  force: boolean,
 ): Promise<CleanupPreview> {
   const sources = sourceId ? [registry.get(sourceId)].filter((value): value is ManagedDataSource => value !== undefined) : registry.list();
   const loaded = await loadSnapshots(registry, context, sources);
@@ -289,18 +334,21 @@ async function cleanupPreview(
     for (const item of snapshot.items) {
       const updatedAt = itemTime(item);
       if (updatedAt === undefined || updatedAt > cutoff) continue;
-      if (item.cleanupEligible === true && !item.protectionReason && item.revision && source.guardedDelete) {
-        candidates.push({ source, snapshot, item });
+      const guarded = item.cleanupEligible === true && !item.protectionReason && Boolean(item.revision && source.guardedDelete);
+      const forced = force && item.forceCleanupEligible === true && Boolean(item.revision && source.forceDelete);
+      if (guarded || forced) {
+        candidates.push({ source, snapshot, item, deleteMode: forced && !guarded ? "force" : "guarded" });
       } else {
         skippedOldItems += 1;
       }
     }
   }
-  return { candidates, skippedOldItems, failures: loaded.failures };
+  return { candidates, skippedOldItems, failures: loaded.failures, force };
 }
 
 function cleanupPreviewText(age: string, preview: CleanupPreview): string {
   const bytes = preview.candidates.reduce((total, candidate) => total + candidate.item.sizeBytes, 0);
+  const forceCount = preview.candidates.filter((candidate) => candidate.deleteMode === "force").length;
   const bySource = new Map<string, { label: string; count: number; bytes: number }>();
   for (const candidate of preview.candidates) {
     const entry = bySource.get(candidate.source.id) ?? { label: candidate.snapshot.label, count: 0, bytes: 0 };
@@ -309,8 +357,9 @@ function cleanupPreviewText(age: string, preview: CleanupPreview): string {
     bySource.set(candidate.source.id, entry);
   }
   return [
-    `Cleanup items older than ${age}: ${preview.candidates.length} items · ${formatBytes(bytes)}`,
+    `${preview.force ? "Force cleanup" : "Cleanup"} items older than ${age}: ${preview.candidates.length} items · ${formatBytes(bytes)}`,
     ...[...bySource.values()].map((entry) => `- ${entry.label}: ${entry.count} items · ${formatBytes(entry.bytes)}`),
+    ...(preview.force ? [`Force-authorized protected items: ${forceCount}`] : []),
     `Protected/skipped old items: ${preview.skippedOldItems}`,
     ...failureLines(preview.failures),
   ].join("\n");
@@ -320,25 +369,32 @@ async function deleteCleanupCandidate(
   candidate: CleanupCandidate,
   context: ManagedDataContext,
   cutoff: number,
+  revalidateContext: () => ManagedDataContext,
 ): Promise<ManagedDeleteResult> {
   try {
-    const latest = await candidate.source.load(context.cwd, context);
+    const latestContext = candidate.deleteMode === "force" ? revalidateContext() : context;
+    const latest = await candidate.source.load(latestContext.cwd, latestContext);
     const item = latest.items.find((value) => value.id === candidate.item.id);
     if (!item) return { status: "missing" };
     if (item.revision !== candidate.item.revision) return { status: "stale", message: "item changed after preview" };
     const updatedAt = itemTime(item);
-    if (item.protectionReason || item.cleanupEligible !== true || updatedAt === undefined || updatedAt > cutoff) {
-      return { status: "protected", message: item.protectionReason ?? "item is no longer cleanup-eligible" };
+    if (updatedAt === undefined || updatedAt > cutoff) {
+      return { status: "protected", message: "item is no longer old enough for cleanup" };
     }
-    if (!candidate.source.guardedDelete || !item.revision) {
-      return { status: "protected", message: "source does not support guarded cleanup" };
+    const deleter = candidate.deleteMode === "force" ? candidate.source.forceDelete : candidate.source.guardedDelete;
+    const eligible = candidate.deleteMode === "force"
+      ? item.forceCleanupEligible === true
+      : item.cleanupEligible === true && !item.protectionReason;
+    if (!eligible || !deleter || !item.revision) {
+      return { status: "protected", message: item.protectionReason ?? `item is no longer ${candidate.deleteMode}-cleanup-eligible` };
     }
-    return await candidate.source.guardedDelete({
-      cwd: context.cwd,
+    return await deleter({
+      cwd: latestContext.cwd,
       itemId: item.id,
       revision: item.revision,
       item,
-      context,
+      context: latestContext,
+      ...(candidate.deleteMode === "force" ? { revalidateContext } : {}),
     });
   } catch (error) {
     return { status: "failed", message: error instanceof Error ? error.message : String(error) };
@@ -352,28 +408,34 @@ async function executeCleanup(
   ctx: ExtensionCommandContext,
   registry: DataManagerRegistry,
   context: ManagedDataContext,
+  force = false,
 ): Promise<void> {
-  const preview = await cleanupPreview(registry, context, durationMs, sourceId);
+  const preview = await cleanupPreview(registry, context, durationMs, sourceId, force);
   const summary = cleanupPreviewText(age, preview);
   if (preview.candidates.length === 0) {
     ctx.ui.notify(summary, preview.failures.length > 0 ? "warning" : "info");
     return;
   }
-  const confirmed = await ctx.ui.confirm("Clean local storage?", `${summary}\n\nEvery item will be revalidated before deletion.`);
+  const title = force ? "Force clean local storage?" : "Clean local storage?";
+  const confirmed = await ctx.ui.confirm(title, `${summary}\n\nEvery item will be revalidated before deletion.`);
   if (!confirmed) return;
+  if (force && !await ctx.ui.confirm(
+    "Confirm irreversible force cleanup?",
+    `Permanently delete ${preview.candidates.length} old items, including ${preview.candidates.filter((candidate) => candidate.deleteMode === "force").length} protected items? This cannot be undone.`,
+  )) return;
 
   const counts: Record<ManagedDeleteStatus, number> = { deleted: 0, missing: 0, protected: 0, stale: 0, partial: 0, failed: 0 };
   const itemResults: Array<{ candidate: CleanupCandidate; result: ManagedDeleteResult }> = [];
   let reclaimedBytes = 0;
   const cutoff = context.now.getTime() - durationMs;
   for (const candidate of preview.candidates) {
-    const result = await deleteCleanupCandidate(candidate, context, cutoff);
+    const result = await deleteCleanupCandidate(candidate, context, cutoff, () => commandContext(ctx, context.now));
     itemResults.push({ candidate, result });
     counts[result.status] += 1;
     if (result.status === "deleted") reclaimedBytes += result.reclaimedBytes ?? candidate.item.sizeBytes;
   }
   const protectedOrStale = counts.protected + counts.stale;
-  const summaryLine = `Cleanup complete · deleted ${counts.deleted} · partial ${counts.partial} · missing ${counts.missing} · protected/stale ${protectedOrStale} · failed ${counts.failed} · reclaimed ${formatBytes(reclaimedBytes)}`;
+  const summaryLine = `${force ? "Force cleanup" : "Cleanup"} complete · deleted ${counts.deleted} · partial ${counts.partial} · missing ${counts.missing} · protected/stale ${protectedOrStale} · failed ${counts.failed} · reclaimed ${formatBytes(reclaimedBytes)}`;
   const itemLines = itemResults.map(({ candidate, result }) =>
     `- ${candidate.snapshot.label} · ${candidate.item.id}: ${result.status}${result.message ? ` · ${result.message}` : ""}`
   );
@@ -422,7 +484,7 @@ async function runInteractive(
     ctx.ui.notify(message, loaded.failures.length > 0 ? "warning" : "info");
     return;
   }
-  const actions = ["Storage statistics", "Browse stored data", "Quick cleanup"];
+  const actions = ["Storage statistics", "Browse stored data", "Quick cleanup", "Force cleanup"];
   const action = await ctx.ui.select("Local data manager", actions);
   if (action === undefined) return;
   if (action === actions[0]) {
@@ -433,8 +495,9 @@ async function runInteractive(
     await runBrowseInteractive(ctx, registry, context, loaded.snapshots);
     return;
   }
+  const force = action === actions[3];
   const targetLabels = ["All eligible sources", ...loaded.snapshots.map((snapshot) => `${snapshot.label} · ${snapshot.sourceId}`)];
-  const target = await ctx.ui.select("Quick cleanup source", targetLabels);
+  const target = await ctx.ui.select(force ? "Force cleanup source" : "Quick cleanup source", targetLabels);
   if (target === undefined) return;
   const ages = ["24h", "7d", "30d", "90d"];
   const age = await ctx.ui.select("Delete items older than", ages);
@@ -442,10 +505,10 @@ async function runInteractive(
   const duration = parseCleanupAge(age);
   if (duration === undefined) return;
   const snapshot = loaded.snapshots[targetLabels.indexOf(target) - 1];
-  await executeCleanup(age, duration, snapshot?.sourceId, ctx, registry, context);
+  await executeCleanup(age, duration, snapshot?.sourceId, ctx, registry, context, force);
 }
 
-const USAGE = "Usage: /data-manager [list | show <source> | delete <source> <item-id> | stats [<source>] | cleanup <Nh|Nd|Nw> [<source>|all]]";
+const USAGE = "Usage: /data-manager [list | show <source> | delete <source> <item-id> | force-delete <source> <item-id> | stats [<source>] | cleanup|force-cleanup <Nh|Nd|Nw> [<source>|all]]";
 
 function availableSources(registry: DataManagerRegistry): string {
   return registry.list().map((item) => item.id).join(", ") || "(none)";
@@ -486,7 +549,7 @@ export async function executeDataManagerCommand(
     ctx.ui.notify([formatStatistics(loaded.snapshots), ...failureLines(loaded.failures)].join("\n"), loaded.failures.length > 0 ? "warning" : "info");
     return;
   }
-  if (action === "cleanup" && tokens.length >= 2 && tokens.length <= 3) {
+  if ((action === "cleanup" || action === "force-cleanup") && tokens.length >= 2 && tokens.length <= 3) {
     const age = tokens[1]!;
     const duration = parseCleanupAge(age);
     const requestedSource = tokens[2]?.toLowerCase();
@@ -495,13 +558,14 @@ export async function executeDataManagerCommand(
       ctx.ui.notify(`${USAGE}\nAvailable sources: ${availableSources(registry)}`, "warning");
       return;
     }
-    await executeCleanup(age, duration, sourceId, ctx, registry, context);
+    await executeCleanup(age, duration, sourceId, ctx, registry, context, action === "force-cleanup");
     return;
   }
 
   const sourceId = tokens[1];
   const source = sourceId ? registry.get(sourceId) : undefined;
-  if (!source || ((action === "show" && tokens.length !== 2) || (action === "delete" && tokens.length !== 3))) {
+  const itemAction = action === "delete" || action === "force-delete";
+  if (!source || (action !== "show" && !itemAction) || (action === "show" ? tokens.length !== 2 : tokens.length !== 3)) {
     ctx.ui.notify(`${USAGE}\nAvailable sources: ${availableSources(registry)}`, "warning");
     return;
   }
@@ -510,17 +574,14 @@ export async function executeDataManagerCommand(
     ctx.ui.notify(formatSnapshot(snapshot), "info");
     return;
   }
-  if (action === "delete") {
-    const itemId = tokens[2];
-    const item = itemId ? snapshot.items.find((candidate) => candidate.id === itemId) : undefined;
-    if (!item) {
-      ctx.ui.notify(itemId ? `Unknown item in ${source.id}: ${itemId}` : USAGE, "warning");
-      return;
-    }
-    await confirmDelete(ctx, source, snapshot, item, context);
+  const itemId = tokens[2];
+  const item = itemId ? snapshot.items.find((candidate) => candidate.id === itemId) : undefined;
+  if (!item) {
+    ctx.ui.notify(itemId ? `Unknown item in ${source.id}: ${itemId}` : USAGE, "warning");
     return;
   }
-  ctx.ui.notify(USAGE, "warning");
+  if (action === "force-delete") await confirmForceDelete(ctx, source, snapshot, item, context);
+  else await confirmDelete(ctx, source, snapshot, item, context);
 }
 
 export function registerDataManagerCommand(

@@ -120,6 +120,7 @@ test("cleanup age accepts bounded hour, day, and week durations", () => {
 function guardedRegistry(
   loadItems: () => ManagedDataItem[],
   guardedDelete: ManagedDataSource["guardedDelete"],
+  forceDelete?: ManagedDataSource["forceDelete"],
 ): DataManagerRegistry {
   const value = new DataManagerRegistry();
   value.register({
@@ -137,6 +138,7 @@ function guardedRegistry(
     },
     async delete() { return false; },
     guardedDelete,
+    ...(forceDelete ? { forceDelete } : {}),
   });
   return value;
 }
@@ -179,6 +181,76 @@ test("protected items cannot enter explicit deletion confirmation", async () => 
   assert.match(h.notifications[0]!.message, /Protected item old-item: current session/);
 });
 
+test("force delete requires explicit source opt-in and two confirmations", async () => {
+  const h = harness(true);
+  const deletions: string[] = [];
+  await executeDataManagerCommand("force-delete managed old-item", h.ctx, guardedRegistry(
+    () => [oldItem({ cleanupEligible: false, forceCleanupEligible: true, protectionReason: "soft protection" })],
+    async () => ({ status: "protected" }),
+    async (request) => {
+      deletions.push(request.itemId);
+      return { status: "deleted", reclaimedBytes: request.item.sizeBytes };
+    },
+  ), fixedNow);
+  assert.equal(h.confirmations.length, 2);
+  assert.match(h.confirmations[0]!.message, /Protection being overridden: soft protection/);
+  assert.match(h.confirmations[1]!.title, /irreversible/);
+  assert.deepEqual(deletions, ["old-item"]);
+  assert.match(h.notifications.at(-1)?.message ?? "", /Force-deleted old-item/);
+});
+
+test("hard-protected items cannot enter force deletion confirmation", async () => {
+  const h = harness(true);
+  let deleted = false;
+  await executeDataManagerCommand("force-delete managed old-item", h.ctx, guardedRegistry(
+    () => [oldItem({ cleanupEligible: false, forceCleanupEligible: false, protectionReason: "current session" })],
+    async () => ({ status: "protected" }),
+    async () => {
+      deleted = true;
+      return { status: "deleted" };
+    },
+  ), fixedNow);
+  assert.equal(h.confirmations.length, 0);
+  assert.equal(deleted, false);
+  assert.match(h.notifications[0]!.message, /not eligible for force deletion/);
+});
+
+test("force delete refreshes session identity after confirmation", async () => {
+  let currentSessionId = "before-confirmation";
+  let confirmations = 0;
+  let observedContext: string | undefined;
+  let observedRevalidation: string | undefined;
+  const ctx = {
+    cwd: "D:/workspace",
+    sessionManager: {
+      getSessionId: () => currentSessionId,
+      getSessionFile: () => `D:/sessions/${currentSessionId}.jsonl`,
+      getSessionDir: () => "D:/sessions",
+    },
+    ui: {
+      notify() {},
+      async confirm() {
+        confirmations += 1;
+        if (confirmations === 1) currentSessionId = "after-confirmation";
+        return true;
+      },
+      async select() { return undefined; },
+    },
+  } as unknown as ExtensionCommandContext;
+  await executeDataManagerCommand("force-delete managed old-item", ctx, guardedRegistry(
+    () => [oldItem({ cleanupEligible: false, forceCleanupEligible: true, protectionReason: "soft protection" })],
+    async () => ({ status: "protected" }),
+    async (request) => {
+      observedContext = request.context.currentSessionId;
+      observedRevalidation = request.revalidateContext?.().currentSessionId;
+      return { status: "protected" };
+    },
+  ), fixedNow);
+  assert.equal(confirmations, 2);
+  assert.equal(observedContext, "after-confirmation");
+  assert.equal(observedRevalidation, "after-confirmation");
+});
+
 test("time cleanup previews, confirms, and uses guarded deletion", async () => {
   const h = harness(true);
   const deletions: string[] = [];
@@ -193,6 +265,31 @@ test("time cleanup previews, confirms, and uses guarded deletion", async () => {
   assert.match(h.confirmations[0]!.message, /1 items · 128 B/);
   assert.deepEqual(deletions, ["old-item"]);
   assert.match(h.notifications.at(-1)?.message ?? "", /deleted 1 .* reclaimed 128 B/);
+});
+
+test("force cleanup includes opted-in protected items and keeps ordinary cleanup unchanged", async () => {
+  const protectedItem = oldItem({ cleanupEligible: false, forceCleanupEligible: true, protectionReason: "inactivity is unproven" });
+  const ordinary = harness(true);
+  let forceCalls = 0;
+  const value = guardedRegistry(
+    () => [protectedItem],
+    async () => ({ status: "protected" }),
+    async () => {
+      forceCalls += 1;
+      return { status: "deleted", reclaimedBytes: protectedItem.sizeBytes };
+    },
+  );
+  await executeDataManagerCommand("cleanup 7d managed", ordinary.ctx, value, fixedNow);
+  assert.equal(ordinary.confirmations.length, 0);
+  assert.equal(forceCalls, 0);
+  assert.match(ordinary.notifications[0]!.message, /Protected\/skipped old items: 1/);
+
+  const forced = harness(true);
+  await executeDataManagerCommand("force-cleanup 7d managed", forced.ctx, value, fixedNow);
+  assert.equal(forced.confirmations.length, 2);
+  assert.match(forced.confirmations[0]!.message, /Force-authorized protected items: 1/);
+  assert.equal(forceCalls, 1);
+  assert.match(forced.notifications.at(-1)?.message ?? "", /Force cleanup complete · deleted 1/);
 });
 
 test("time cleanup cancellation and legacy sources have no side effects", async () => {

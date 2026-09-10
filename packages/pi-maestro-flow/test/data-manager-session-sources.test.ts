@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { existsSync } from "node:fs";
+import { appendFileSync, existsSync, readdirSync } from "node:fs";
 import { appendFile, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
@@ -56,7 +56,7 @@ async function jsonl(path: string, records: unknown[]): Promise<void> {
   await writeFile(path, `${records.map((value) => JSON.stringify(value)).join("\n")}\n`, "utf8");
 }
 
-test("session-history inventories only regular transcripts and protects every item", async () => {
+test("session-history force deletion removes only valid non-current workspace transcripts", async () => {
   const dir = join(root, "transcript-inventory");
   await mkdir(dir, { recursive: true });
   const current = join(dir, "current.jsonl");
@@ -66,16 +66,110 @@ test("session-history inventories only regular transcripts and protects every it
   await symlink(old, join(dir, "linked.jsonl"), "file");
 
   const source = createSessionHistoryDataSource();
-  const snapshot = await source.load("/ws", {
+  const context = {
     cwd: "/ws", now: new Date(), currentSessionId: "current", currentSessionFile: current, currentSessionDir: dir,
-  });
+  };
+  const snapshot = await source.load("/ws", context);
   assert.equal(snapshot.items.length, 2);
   assert.ok(snapshot.items.every((item) => item.cleanupEligible === false && item.protectionReason));
-  assert.match(snapshot.items.find((item) => item.title === "current")!.protectionReason!, /active/);
-  assert.match(snapshot.items.find((item) => item.title === "old")!.protectionReason!, /host-owned/);
-  assert.equal(await source.delete("/ws", snapshot.items[0]!.id), false);
+  const currentItem = snapshot.items.find((item) => item.title === "current")!;
+  const oldItem = snapshot.items.find((item) => item.title === "old")!;
+  assert.match(currentItem.protectionReason!, /active/);
+  assert.equal(currentItem.forceCleanupEligible, false);
+  assert.match(oldItem.protectionReason!, /host-owned/);
+  assert.equal(oldItem.forceCleanupEligible, true);
+  assert.equal(await source.delete("/ws", currentItem.id), false);
+
+  const protectedResult = await source.forceDelete!({
+    cwd: "/ws", itemId: currentItem.id, revision: currentItem.revision!, item: currentItem, context,
+  });
+  assert.equal(protectedResult.status, "protected");
   assert.equal(existsSync(current), true);
+
+  const deleted = await source.forceDelete!({
+    cwd: "/ws", itemId: oldItem.id, revision: oldItem.revision!, item: oldItem, context,
+  });
+  assert.equal(deleted.status, "deleted");
+  assert.equal(existsSync(old), false);
+});
+
+test("session-history force deletion rejects a transcript changed after preview", async () => {
+  const dir = join(root, "transcript-stale");
+  await mkdir(dir, { recursive: true });
+  const old = join(dir, "old.jsonl");
+  await writeFile(old, `${JSON.stringify({ type: "session", id: "old-stale", cwd: "/ws" })}\n`);
+  const source = createSessionHistoryDataSource();
+  const context = { cwd: "/ws", now: new Date(), currentSessionId: "current", currentSessionDir: dir };
+  const item = (await source.load("/ws", context)).items[0]!;
+  await appendFile(old, `${JSON.stringify({ type: "message", text: "changed" })}\n`);
+  const result = await source.forceDelete!({ cwd: "/ws", itemId: item.id, revision: item.revision!, item, context });
+  assert.equal(result.status, "stale");
   assert.equal(existsSync(old), true);
+});
+
+test("session-history force deletion fails closed without current-session identity", async () => {
+  const dir = join(root, "transcript-no-current-identity");
+  await mkdir(dir, { recursive: true });
+  const old = join(dir, "old.jsonl");
+  await writeFile(old, `${JSON.stringify({ type: "session", id: "identity-unknown", cwd: "/ws" })}\n`);
+  const source = createSessionHistoryDataSource();
+  const context = { cwd: "/ws", now: new Date(), currentSessionDir: dir };
+  const item = (await source.load("/ws", context)).items[0]!;
+  assert.equal(item.forceCleanupEligible, false);
+  assert.match(item.protectionReason ?? "", /identity is unavailable/);
+  const result = await source.forceDelete!({ cwd: "/ws", itemId: item.id, revision: item.revision!, item, context });
+  assert.equal(result.status, "protected");
+  assert.equal(existsSync(old), true);
+});
+
+test("session-history force deletion restores a transcript that becomes current at the destructive edge", async () => {
+  const dir = join(root, "transcript-becomes-current");
+  await mkdir(dir, { recursive: true });
+  const old = join(dir, "old.jsonl");
+  await writeFile(old, `${JSON.stringify({ type: "session", id: "becomes-current", cwd: "/ws" })}\n`);
+  const source = createSessionHistoryDataSource();
+  const context = { cwd: "/ws", now: new Date(), currentSessionId: "other", currentSessionDir: dir };
+  const item = (await source.load("/ws", context)).items[0]!;
+  const result = await source.forceDelete!({
+    cwd: "/ws",
+    itemId: item.id,
+    revision: item.revision!,
+    item,
+    context,
+    revalidateContext: () => ({ ...context, currentSessionId: "becomes-current", currentSessionFile: old }),
+  });
+  assert.equal(result.status, "protected");
+  assert.equal(existsSync(old), true);
+});
+
+test("session-history force deletion detects same-inode writes after quarantine", async () => {
+  const dir = join(root, "transcript-quarantine-write");
+  await mkdir(dir, { recursive: true });
+  const old = join(dir, "old.jsonl");
+  await writeFile(old, `${JSON.stringify({ type: "session", id: "quarantine-write", cwd: "/ws" })}\n`);
+  const source = createSessionHistoryDataSource();
+  const context = { cwd: "/ws", now: new Date(), currentSessionId: "other", currentSessionDir: dir };
+  const item = (await source.load("/ws", context)).items[0]!;
+  let revalidations = 0;
+  const result = await source.forceDelete!({
+    cwd: "/ws",
+    itemId: item.id,
+    revision: item.revision!,
+    item,
+    context,
+    revalidateContext: () => {
+      revalidations += 1;
+      if (revalidations === 2) {
+        const quarantine = readdirSync(dir).find((name) => name.endsWith(".transcript-delete"));
+        assert.ok(quarantine);
+        appendFileSync(join(dir, quarantine), `${JSON.stringify({ type: "message", text: "late write" })}\n`);
+      }
+      return context;
+    },
+  });
+  assert.equal(result.status, "stale");
+  assert.equal(existsSync(old), true);
+  assert.match(await readFile(old, "utf8"), /late write/);
 });
 
 test("usage history uses full-digest keys and migrates legacy records losslessly", async () => {
