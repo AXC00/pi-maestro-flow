@@ -1,15 +1,10 @@
 // types.ts - Core type definitions
-import type { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
-import type { SSEClientTransport } from "@modelcontextprotocol/sdk/client/sse.js";
-import type { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
+import type { Transport as McpSdkTransport } from "@modelcontextprotocol/sdk/shared/transport.js";
 import type { TextContent, ImageContent } from "@earendil-works/pi-ai";
 import type { UiStreamMode } from "./ui-stream-types.ts";
 
-// Transport type (stdio + HTTP)
-export type Transport =
-  | StdioClientTransport
-  | SSEClientTransport
-  | StreamableHTTPClientTransport;
+// Any MCP SDK transport owned by the manager, including ephemeral Fabric mounts.
+export type Transport = McpSdkTransport;
 
 // Import sources for config
 export type ImportKind =

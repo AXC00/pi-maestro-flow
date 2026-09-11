@@ -76,6 +76,11 @@ export interface McpServerManagerOptions {
   resourceCloseTimeoutMs?: number;
 }
 
+export interface McpEphemeralTransportProvider {
+  readonly definition: ServerDefinition;
+  create(signal: AbortSignal): Transport | Promise<Transport>;
+}
+
 type TrackStartupResource = (resource: CloseableResource, description: string) => void;
 
 type UiStreamListener = (serverName: string, notification: ServerStreamResultPatchNotification["params"]) => void;
@@ -434,6 +439,7 @@ export class McpServerManager {
   private acceptedUrlElicitations = new Map<string, Set<string>>();
   private connectionDrainWaiters = new WeakMap<ServerConnection, Set<() => void>>();
   private connectionLeaseCounts = new WeakMap<ServerConnection, number>();
+  private ephemeralTransports = new Map<string, McpEphemeralTransportProvider>();
   private defaultRequestTimeoutMs: number | undefined;
   private readonly startupDrainTimeoutMs: number;
   private readonly connectionLeaseDrainTimeoutMs: number;
@@ -468,6 +474,22 @@ export class McpServerManager {
 
   setDefaultRequestTimeoutMs(timeoutMs: number | undefined): void {
     this.defaultRequestTimeoutMs = normalizeRequestTimeoutMs(timeoutMs);
+  }
+
+  registerEphemeralServer(name: string, provider: McpEphemeralTransportProvider): void {
+    if (this.ephemeralTransports.has(name) || this.connections.has(name) || this.connectPromises.has(name)) {
+      throw new Error(`Server "${name}" is already registered.`);
+    }
+    this.ephemeralTransports.set(name, provider);
+  }
+
+  async unregisterEphemeralServer(name: string): Promise<void> {
+    this.ephemeralTransports.delete(name);
+    await this.close(name);
+  }
+
+  getEphemeralServer(name: string): McpEphemeralTransportProvider | undefined {
+    return this.ephemeralTransports.get(name);
   }
 
   getRequestOptions(name: string, signal?: AbortSignal): RequestOptions | undefined {
@@ -589,8 +611,12 @@ export class McpServerManager {
     trackStartupResource?.(client, `${name} client`);
 
     let transport: Transport;
+    const ephemeral = this.ephemeralTransports.get(name);
 
-    if (definition.command) {
+    if (ephemeral !== undefined) {
+      transport = await ephemeral.create(signal ?? new AbortController().signal);
+      trackStartupResource?.(transport, `${name} Fabric transport`);
+    } else if (definition.command) {
       let command = definition.command;
       let args = definition.args ?? [];
 

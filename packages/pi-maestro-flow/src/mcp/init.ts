@@ -1,6 +1,6 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { McpExtensionState } from "./state.ts";
-import type { ToolMetadata } from "./types.ts";
+import type { ServerDefinition, ToolMetadata } from "./types.ts";
 import { existsSync } from "node:fs";
 import { loadMcpConfig } from "./config.ts";
 import { ConsentManager } from "./consent-manager.ts";
@@ -24,8 +24,13 @@ import { logger } from "./logger.ts";
 import { authenticate, supportsOAuth } from "./mcp-auth-flow.ts";
 import { getMissingConfiguredDirectToolServers } from "./direct-tools.ts";
 import { throwIfAborted } from "./abort.ts";
+import { FabricMcpMountRegistry, type FabricMcpMountRegistryOptions } from "./fabric-mount-registry.ts";
 
 const FAILURE_BACKOFF_MS = 60 * 1000;
+
+export interface InitializeMcpOptions {
+  fabricMounts?: Omit<FabricMcpMountRegistryOptions, "manager" | "onHidden">;
+}
 
 export function isTuiMode(ctx: Pick<ExtensionContext, "hasUI">): boolean {
   return ctx.hasUI;
@@ -33,7 +38,8 @@ export function isTuiMode(ctx: Pick<ExtensionContext, "hasUI">): boolean {
 
 export async function initializeMcp(
   pi: ExtensionAPI,
-  ctx: ExtensionContext
+  ctx: ExtensionContext,
+  options: InitializeMcpOptions = {},
 ): Promise<McpExtensionState> {
   const configPath = pi.getFlag("mcp-config") as string | undefined;
   const config = loadMcpConfig(configPath, ctx.cwd, { includeProject: ctx.isProjectTrusted() });
@@ -77,6 +83,17 @@ export async function initializeMcp(
     ui,
     sendMessage: (message, options) => pi.sendMessage(message as unknown as Parameters<typeof pi.sendMessage>[0], options),
   };
+  if (options.fabricMounts !== undefined) {
+    state.fabricMounts = new FabricMcpMountRegistry({
+      ...options.fabricMounts,
+      manager,
+      reservedServerNames: Object.keys(config.mcpServers),
+      onHidden: (serverName) => {
+        state.toolMetadata.delete(serverName);
+        state.failureTracker.delete(serverName);
+      },
+    });
+  }
 
   const serverEntries = Object.entries(config.mcpServers);
   if (serverEntries.length === 0) {
@@ -237,20 +254,34 @@ export async function initializeMcp(
   return state;
 }
 
+export function getRuntimeServerDefinition(state: McpExtensionState, serverName: string): ServerDefinition | undefined {
+  return state.config.mcpServers[serverName] ?? state.fabricMounts?.getDefinition(serverName);
+}
+
+export function getRuntimeServerNames(state: McpExtensionState): string[] {
+  return [...new Set([
+    ...Object.keys(state.config.mcpServers),
+    ...(state.fabricMounts?.list().map((mount) => mount.serverName) ?? []),
+  ])];
+}
+
 export function updateServerMetadata(state: McpExtensionState, serverName: string): void {
   const connection = state.manager.getConnection(serverName);
   if (!connection || connection.status !== "connected") return;
 
-  const definition = state.config.mcpServers[serverName];
+  const definition = getRuntimeServerDefinition(state, serverName);
   if (!definition) return;
 
-  const prefix = state.config.settings?.toolPrefix ?? "server";
+  const prefix = state.fabricMounts?.hasServer(serverName)
+    ? "server"
+    : state.config.settings?.toolPrefix ?? "server";
 
   const { metadata } = buildToolMetadata(connection.tools, connection.resources, definition, serverName, prefix);
   state.toolMetadata.set(serverName, metadata);
 }
 
 export function updateMetadataCache(state: McpExtensionState, serverName: string): void {
+  if (state.fabricMounts?.hasServer(serverName)) return;
   const connection = state.manager.getConnection(serverName);
   if (!connection || connection.status !== "connected") return;
 
@@ -294,7 +325,7 @@ export function flushMetadataCache(state: McpExtensionState): void {
 export function updateStatusBar(state: McpExtensionState): void {
   const ui = state.ui;
   if (!ui) return;
-  const total = Object.keys(state.config.mcpServers).length;
+  const total = getRuntimeServerNames(state).length;
   if (total === 0) {
     ui.setStatus("mcp", undefined);
     return;
@@ -374,7 +405,7 @@ export async function lazyConnect(state: McpExtensionState, serverName: string, 
   const failedAgo = getFailureAgeSeconds(state, serverName);
   if (failedAgo !== null) return false;
 
-  const definition = state.config.mcpServers[serverName];
+  const definition = getRuntimeServerDefinition(state, serverName);
   if (!definition) return false;
 
   try {

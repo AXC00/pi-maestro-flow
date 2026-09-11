@@ -5,6 +5,7 @@ import type { McpServerManager } from "./server-manager.ts";
 import type { ToolMetadata, McpConfig, UiSessionMessages, UiStreamSummary } from "./types.ts";
 import type { UiResourceHandler } from "./ui-resource-handler.ts";
 import type { UiServerHandle } from "./ui-server.ts";
+import type { FabricMcpMountRegistry } from "./fabric-mount-registry.ts";
 
 export interface CompletedUiSession {
   serverName: string;
@@ -28,6 +29,7 @@ export type SendMessageFn = (
 export interface McpExtensionState {
   manager: McpServerManager;
   lifecycle: McpLifecycleManager;
+  fabricMounts?: FabricMcpMountRegistry;
   toolMetadata: Map<string, ToolMetadata[]>;
   config: McpConfig;
   failureTracker: Map<string, number>;

@@ -8,11 +8,12 @@ import { loadMcpConfig } from "./config.ts";
 import { buildProxyDescription, createDirectToolExecutor, getMissingConfiguredDirectToolServers, resolveDirectTools } from "./direct-tools.ts";
 import { flushMetadataCache, initializeMcp, updateStatusBar } from "./init.ts";
 import { loadMetadataCache } from "./metadata-cache.ts";
-import { executeAuthComplete, executeAuthStart, executeCall, executeConnect, executeDescribe, executeList, executeSearch, executeStatus, executeUiMessages } from "./proxy-modes.ts";
+import { executeAuthComplete, executeAuthStart, executeCall, executeConnect, executeDescribe, executeFabricMount, executeFabricUnmount, executeFabricValidate, executeList, executeSearch, executeStatus, executeUiMessages } from "./proxy-modes.ts";
 import { getConfigPathFromArgv, normalizeDirectToolInputSchema, truncateAtWord } from "./utils.ts";
 import { initializeOAuth, shutdownOAuth } from "./mcp-auth-flow.ts";
 import { createMcpDirectToolCallRenderer, createMcpDirectToolResultRenderer, renderMcpProxyToolCall, renderMcpProxyToolResult } from "./tool-result-renderer.ts";
 import { toolErrorOverride } from "./error-signal.ts";
+import type { FabricMcpMountRegistryOptions } from "./fabric-mount-registry.ts";
 
 export interface McpAdapterHandle {
   openManager(ctx: ExtensionContext): Promise<void>;
@@ -21,6 +22,10 @@ export interface McpAdapterHandle {
 export interface McpAdapterOptions {
   /** Explicit UI language; otherwise follows the shared runtime TUI locale. */
   locale?: SupportedSettingsLocale;
+  /** Optional host adapter for session-scoped, route-bound Fabric MCP mounts. */
+  createFabricMounts?: (
+    session: { sessionId: string; cwd: string },
+  ) => Omit<FabricMcpMountRegistryOptions, "manager" | "onHidden"> | undefined | Promise<Omit<FabricMcpMountRegistryOptions, "manager" | "onHidden"> | undefined>;
 }
 
 const MCP_UI = {
@@ -260,26 +265,26 @@ export default function mcpAdapter(pi: ExtensionAPI, options: McpAdapterOptions 
       currentState.uiServer = null;
     }
 
-    let flushError: unknown;
+    const failures: unknown[] = [];
+    try {
+      await currentState.fabricMounts?.closeAll();
+    } catch (error) {
+      failures.push(error);
+    }
     try {
       flushMetadataCache(currentState);
     } catch (error) {
-      flushError = error;
+      failures.push(error);
     }
-
     try {
       await currentState.lifecycle.gracefulShutdown();
     } catch (error) {
-      if (flushError) {
-        console.error("MCP: graceful shutdown failed after metadata flush error", error);
-      } else {
-        throw error;
-      }
+      failures.push(error);
     }
-
-    if (flushError) {
-      throw flushError;
+    if (failures.length > 1) {
+      for (const error of failures.slice(1)) console.error("MCP: additional shutdown cleanup failed", error);
     }
+    if (failures.length > 0) throw failures[0];
   }
 
   const sessionLifecycle = new McpSessionLifecycle<McpExtensionState>(
@@ -347,7 +352,7 @@ export default function mcpAdapter(pi: ExtensionAPI, options: McpAdapterOptions 
             console.error("MCP OAuth initialization failed:", err);
           });
         },
-        (lifecycleSignal) => {
+        async (lifecycleSignal) => {
           const signal = ctx.signal
             ? AbortSignal.any([ctx.signal, lifecycleSignal])
             : lifecycleSignal;
@@ -358,7 +363,14 @@ export default function mcpAdapter(pi: ExtensionAPI, options: McpAdapterOptions 
               return typeof value === "function" ? value.bind(target) : value;
             },
           });
-          return initializeMcp(pi, initContext);
+          const sessionId = (ctx.sessionManager as { getSessionId?: () => string }).getSessionId?.();
+          if (options.createFabricMounts !== undefined && !sessionId) {
+            throw new Error("Fabric MCP mounts require a concrete Pi session identity.");
+          }
+          const fabricMounts = options.createFabricMounts === undefined
+            ? undefined
+            : await options.createFabricMounts({ sessionId: sessionId!, cwd: ctx.cwd });
+          return initializeMcp(pi, initContext, { fabricMounts });
         },
       );
     } catch (error) {
@@ -496,7 +508,7 @@ export default function mcpAdapter(pi: ExtensionAPI, options: McpAdapterOptions 
         regex: Type.Optional(Type.Boolean({ description: "Treat search as regex (default: substring match)" })),
         includeSchemas: Type.Optional(Type.Boolean({ description: "Include parameter schemas in search results (default: true)" })),
         server: Type.Optional(Type.String({ description: "Filter to specific server (also disambiguates tool calls)" })),
-        action: Type.Optional(Type.String({ description: "Action: 'ui-messages', 'auth-start', or 'auth-complete'" })),
+        action: Type.Optional(Type.String({ description: "Action: 'ui-messages', 'auth-start', 'auth-complete', 'mount', 'validate', or 'unmount'" })),
       }),
       renderResult: renderMcpProxyToolResult,
       async execute(_toolCallId: string, params: {
@@ -544,6 +556,15 @@ export default function mcpAdapter(pi: ExtensionAPI, options: McpAdapterOptions 
           };
         }
 
+        if (params.action === "mount") {
+          return executeFabricMount(state, parsedArgs?.route ?? parsedArgs, signal);
+        }
+        if (params.action === "validate") {
+          return executeFabricValidate(state, parsedArgs?.mountId, parsedArgs?.routeRevision);
+        }
+        if (params.action === "unmount") {
+          return executeFabricUnmount(state, parsedArgs?.mountId);
+        }
         if (params.action === "ui-messages") {
           return executeUiMessages(state);
         }

@@ -2,9 +2,11 @@ import type { AgentToolResult, ToolInfo } from "@earendil-works/pi-coding-agent"
 import { UrlElicitationRequiredError } from "@modelcontextprotocol/sdk/types.js";
 import { checkSync } from "recheck";
 import type { McpExtensionState } from "./state.ts";
+import type { EndpointRouteHandle } from "pi-maestro-fabric-core/v1";
+import type { FabricMcpMountedServer } from "./fabric-mount-registry.ts";
 import type { ToolMetadata, McpContent } from "./types.ts";
 import { getServerPrefix, parseUiPromptHandoff } from "./types.ts";
-import { lazyConnect, updateServerMetadata, updateMetadataCache, getFailureAgeSeconds, updateStatusBar } from "./init.ts";
+import { getRuntimeServerDefinition, getRuntimeServerNames, lazyConnect, updateServerMetadata, updateMetadataCache, getFailureAgeSeconds, updateStatusBar } from "./init.ts";
 import { abortable, throwIfAborted } from "./abort.ts";
 import { buildToolMetadata, getToolNames, findToolByName, formatSchema } from "./tool-metadata.ts";
 import { resolveMcpResultContent, transformMcpContent } from "./tool-registrar.ts";
@@ -190,10 +192,125 @@ export function executeUiMessages(state: McpExtensionState): ProxyToolResult {
   };
 }
 
+export async function executeFabricMount(
+  state: McpExtensionState,
+  route: unknown,
+  signal?: AbortSignal,
+): Promise<ProxyToolResult> {
+  if (!state.fabricMounts) {
+    return {
+      content: [{ type: "text" as const, text: "Fabric MCP mounts are not available in this runtime." }],
+      details: { mode: "mount", error: "fabric_unavailable" },
+    };
+  }
+  if (typeof route !== "object" || route === null || Array.isArray(route)) {
+    return {
+      content: [{ type: "text" as const, text: "Fabric MCP mount requires args.route with an Endpoint Route handle." }],
+      details: { mode: "mount", error: "missing_route" },
+    };
+  }
+  const controller = signal ? undefined : new AbortController();
+  let mounted: FabricMcpMountedServer | undefined;
+  try {
+    mounted = await state.fabricMounts.mount(route as EndpointRouteHandle, signal ?? controller!.signal);
+    const definition = state.fabricMounts.getDefinition(mounted.serverName)!;
+    const connection = await state.manager.connect(mounted.serverName, definition, signal);
+    if (connection.status !== "connected") throw new Error(`Fabric MCP server reported ${connection.status}`);
+    updateServerMetadata(state, mounted.serverName);
+    state.failureTracker.delete(mounted.serverName);
+    updateStatusBar(state);
+    return {
+      content: [{ type: "text" as const, text: `Mounted ${mounted.serverName} (${connection.tools.length} tools).` }],
+      details: { mode: "mount", server: mounted.serverName, mount: mounted.lease, references: mounted.references },
+    };
+  } catch (error) {
+    let cleanupMessage = "";
+    if (mounted !== undefined) {
+      try {
+        await state.fabricMounts.unmount(mounted.lease.mountId);
+      } catch (cleanupError) {
+        cleanupMessage = ` Cleanup also failed: ${cleanupError instanceof Error ? cleanupError.message : String(cleanupError)}`;
+      }
+    }
+    const message = `${error instanceof Error ? error.message : String(error)}${cleanupMessage}`;
+    return {
+      content: [{ type: "text" as const, text: `Failed to mount Fabric MCP Endpoint: ${message}` }],
+      details: { mode: "mount", error: signal?.aborted ? "aborted" : "mount_failed", message },
+    };
+  }
+}
+
+export async function executeFabricValidate(
+  state: McpExtensionState,
+  mountId: unknown,
+  routeRevision?: unknown,
+): Promise<ProxyToolResult> {
+  if (!state.fabricMounts) {
+    return {
+      content: [{ type: "text" as const, text: "Fabric MCP mounts are not available in this runtime." }],
+      details: { mode: "validate", error: "fabric_unavailable" },
+    };
+  }
+  if (typeof mountId !== "string" || mountId.length === 0) {
+    return {
+      content: [{ type: "text" as const, text: "Fabric MCP validation requires args.mountId." }],
+      details: { mode: "validate", error: "missing_mount" },
+    };
+  }
+  try {
+    const mounted = await state.fabricMounts.validate(
+      mountId,
+      typeof routeRevision === "number" ? routeRevision : undefined,
+    );
+    return {
+      content: [{ type: "text" as const, text: `Fabric MCP mount ${mountId} is active.` }],
+      details: { mode: "validate", server: mounted.serverName, mount: mounted.lease, references: mounted.references },
+    };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    return {
+      content: [{ type: "text" as const, text: `Fabric MCP mount validation failed: ${message}` }],
+      details: { mode: "validate", error: "mount_invalid", mountId, message },
+    };
+  }
+}
+
+export async function executeFabricUnmount(
+  state: McpExtensionState,
+  mountId: unknown,
+): Promise<ProxyToolResult> {
+  if (!state.fabricMounts) {
+    return {
+      content: [{ type: "text" as const, text: "Fabric MCP mounts are not available in this runtime." }],
+      details: { mode: "unmount", error: "fabric_unavailable" },
+    };
+  }
+  if (typeof mountId !== "string" || mountId.length === 0) {
+    return {
+      content: [{ type: "text" as const, text: "Fabric MCP unmount requires args.mountId." }],
+      details: { mode: "unmount", error: "missing_mount" },
+    };
+  }
+  try {
+    await state.fabricMounts.unmount(mountId);
+    updateStatusBar(state);
+    return {
+      content: [{ type: "text" as const, text: `Unmounted Fabric MCP mount ${mountId}.` }],
+      details: { mode: "unmount", mountId },
+    };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    return {
+      content: [{ type: "text" as const, text: `Failed to unmount Fabric MCP mount: ${message}` }],
+      details: { mode: "unmount", error: "unmount_failed", mountId, message },
+    };
+  }
+}
+
 export function executeStatus(state: McpExtensionState): ProxyToolResult {
   const servers: Array<{ name: string; status: string; toolCount: number; failedAgo: number | null }> = [];
 
-  for (const name of Object.keys(state.config.mcpServers)) {
+  for (const name of getRuntimeServerNames(state)) {
     const connection = state.manager.getConnection(name);
     const metadata = state.toolMetadata.get(name);
     const toolCount = metadata?.length ?? 0;
@@ -471,7 +588,7 @@ export function executeSearch(
 }
 
 export function executeList(state: McpExtensionState, server: string): ProxyToolResult {
-  if (!state.config.mcpServers[server]) {
+  if (!getRuntimeServerDefinition(state, server)) {
     return {
       content: [{ type: "text" as const, text: `Server "${server}" not found. Use mcp({}) to see available servers.` }],
       details: { mode: "list", server, tools: [], count: 0, error: "not_found" },
@@ -527,7 +644,7 @@ export function executeList(state: McpExtensionState, server: string): ProxyTool
 
 export async function executeConnect(state: McpExtensionState, serverName: string, signal?: AbortSignal): Promise<ProxyToolResult> {
   throwIfAborted(signal);
-  const definition = state.config.mcpServers[serverName];
+  const definition = getRuntimeServerDefinition(state, serverName);
   if (!definition) {
     return {
       content: [{ type: "text" as const, text: `Server "${serverName}" not found. Use mcp({}) to see available servers.` }],
@@ -594,7 +711,7 @@ export async function executeCall(
   let autoAuthAttempted = false;
   const prefixMode = state.config.settings?.toolPrefix ?? "server";
 
-  if (serverName && !state.config.mcpServers[serverName]) {
+  if (serverName && !getRuntimeServerDefinition(state, serverName)) {
     return {
       content: [{ type: "text" as const, text: `Server "${serverName}" not found. Use mcp({}) to see available servers.` }],
       details: { mode: "call", error: "server_not_found", server: serverName },
@@ -670,7 +787,7 @@ export async function executeCall(
   let prefixMatchedServer: string | undefined;
 
   if (!serverName && !toolMeta && prefixMode !== "none") {
-    const candidates = Object.keys(state.config.mcpServers)
+    const candidates = getRuntimeServerNames(state)
       .map(name => ({ name, prefix: getServerPrefix(name, prefixMode) }))
       .filter(c => c.prefix && toolName.startsWith(c.prefix + "_"))
       .sort((a, b) => b.prefix.length - a.prefix.length);
@@ -767,7 +884,7 @@ export async function executeCall(
       };
     }
 
-    const definition = state.config.mcpServers[serverName];
+    const definition = getRuntimeServerDefinition(state, serverName);
     if (!definition) {
       return {
         content: [{ type: "text" as const, text: `Server "${serverName}" not connected` }],

@@ -18,6 +18,7 @@ const publicFiles = [
   "fixed-ssh-channel.ts",
   "stream-channel.ts",
   "channel-router.ts",
+  "mcp-mount-provider.ts",
 ];
 const runtimeFiles = [...publicFiles, "directory-authority.ts"];
 
