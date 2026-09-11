@@ -16,8 +16,11 @@ import { GatewayPolicy, GatewayPolicyError } from "./policy.ts";
 import { GatewayPairingStore } from "./pairing-store.ts";
 import { gatewayError } from "./result.ts";
 import { validateGatewayValue } from "./validation.ts";
-import { gatewayHandoffRoot, gatewayJobsRoot, gatewayMaestroReceiptRoot, gatewayOperationReceiptRoot, gatewaySessionsRoot, gatewayTasksRoot } from "./state-paths.ts";
+import { gatewayFabricStorePath, gatewayHandoffRoot, gatewayJobsRoot, gatewayMaestroReceiptRoot, gatewayOperationReceiptRoot, gatewaySessionsRoot, gatewayTasksRoot } from "./state-paths.ts";
 import { WorkspaceRegistry } from "./workspace-registry.ts";
+import { GatewayFabricStore } from "./fabric/store.ts";
+import { GatewayFabricEventAdapter } from "./fabric/event-adapter.ts";
+import { recoverGatewayFabric } from "./fabric/recovery.ts";
 import { ExecService } from "./services/exec-service.ts";
 import { FileService } from "./services/file-service.ts";
 import { HostService } from "./services/host-service.ts";
@@ -52,6 +55,8 @@ export interface GatewayRuntimeOptions {
   teammatePort?: GatewayTeammatePort;
   pairingStore?: GatewayPairingStore;
   operationReceiptStore?: GatewayOperationReceiptStore;
+  fabricStore?: GatewayFabricStore;
+  fabricEventAdapter?: GatewayFabricEventAdapter;
   warningSink?: (message: string) => void;
   maestroRunner?: RunCliRunner;
   maestroEnvironment?: NodeJS.ProcessEnv;
@@ -91,6 +96,8 @@ export class GatewayRuntime {
   readonly sessionStore: SessionStore;
   readonly todoStore: GatewayTodoStore;
   readonly operationReceipts: GatewayOperationReceiptStore;
+  readonly fabricStore: GatewayFabricStore;
+  readonly fabricEvents: GatewayFabricEventAdapter;
   readonly session: GatewaySessionService;
   readonly todo: GatewayTodoService;
   readonly board: BoardService;
@@ -187,6 +194,16 @@ export class GatewayRuntime {
       root: config.state.operationReceiptRoot ?? (stateRoot ? join(stateRoot, "operation-receipts") : gatewayOperationReceiptRoot(this.cwd)),
       observer: this.observer,
     });
+    this.fabricStore = options.fabricStore ?? new GatewayFabricStore({
+      path: stateRoot ? join(stateRoot, "fabric", "state.json") : gatewayFabricStorePath(),
+    });
+    this.fabricEvents = options.fabricEventAdapter ?? new GatewayFabricEventAdapter({
+      store: this.fabricStore,
+      journal: this.teammate.eventJournal,
+    });
+    if (this.fabricEvents.store !== this.fabricStore || this.fabricEvents.journal !== this.teammate.eventJournal) {
+      throw new Error("Gateway Fabric event adapter must use the runtime Fabric store and event journal");
+    }
     this.eventStream = new GatewayEventStream(this.teammate.eventJournal, { observer: this.observer });
     this.session = new GatewaySessionService({ store: this.sessionStore, todos: this.todoStore, teammate: this.teammate, receipts: this.operationReceipts, authMode: config.auth.mode, policy: this.policy, stream: this.eventStream });
     this.todo = new GatewayTodoService({ store: this.todoStore, sessions: this.sessionStore, authMode: config.auth.mode });
@@ -269,6 +286,7 @@ export class GatewayRuntime {
   static async create(options: GatewayRuntimeOptions = {}): Promise<GatewayRuntime> {
     const config = options.config ?? await loadGatewayConfig(options.configPath);
     const runtime = new GatewayRuntime(config, options);
+    await recoverGatewayFabric({ store: runtime.fabricStore, eventAdapter: runtime.fabricEvents });
     await runtime.operationReceipts.recoverInterrupted();
     return runtime;
   }

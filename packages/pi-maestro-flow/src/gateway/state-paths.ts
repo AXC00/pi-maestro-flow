@@ -20,6 +20,8 @@ export const GATEWAY_HANDOFF_DIRECTORY = "handoffs" as const;
 export const GATEWAY_OPERATION_RECEIPT_DIRECTORY = "operation-receipts" as const;
 export const GATEWAY_MAESTRO_RECEIPT_DIRECTORY = "maestro-receipts" as const;
 export const GATEWAY_TUNNELS_DIRECTORY = "tunnels" as const;
+export const GATEWAY_FABRIC_DIRECTORY = "fabric" as const;
+export const GATEWAY_FABRIC_STORE_FILE = "state.json" as const;
 
 /** Return UTF-8 byte length, used for every wire/durable bound. */
 export function utf8Bytes(value: string): number {
@@ -83,6 +85,12 @@ export function gatewayServiceManifestPath(homeDir = homedir()): string {
 export function gatewayTunnelsRoot(homeDir = homedir()): string {
   return join(gatewayGlobalStateRoot(homeDir), GATEWAY_TUNNELS_DIRECTORY);
 }
+export function gatewayFabricRoot(homeDir = homedir()): string {
+  return join(gatewayGlobalStateRoot(homeDir), GATEWAY_FABRIC_DIRECTORY);
+}
+export function gatewayFabricStorePath(homeDir = homedir()): string {
+  return join(gatewayFabricRoot(homeDir), GATEWAY_FABRIC_STORE_FILE);
+}
 export const getGatewayOwnerPath = gatewayOwnerPath;
 export const gatewayOwnerRecordPath = gatewayOwnerPath;
 
@@ -144,6 +152,8 @@ export interface GatewayStatePaths {
   handoffRoot: string;
   operationReceiptRoot: string;
   maestroReceiptRoot: string;
+  fabricRoot: string;
+  fabricStorePath: string;
 }
 
 export function createGatewayStatePaths(cwd = process.cwd(), homeDir = homedir()): GatewayStatePaths {
@@ -166,6 +176,8 @@ export function createGatewayStatePaths(cwd = process.cwd(), homeDir = homedir()
     handoffRoot: join(workspaceRoot, GATEWAY_HANDOFF_DIRECTORY),
     operationReceiptRoot: join(workspaceRoot, GATEWAY_OPERATION_RECEIPT_DIRECTORY),
     maestroReceiptRoot: join(workspaceRoot, GATEWAY_MAESTRO_RECEIPT_DIRECTORY),
+    fabricRoot: join(globalRoot, GATEWAY_FABRIC_DIRECTORY),
+    fabricStorePath: join(globalRoot, GATEWAY_FABRIC_DIRECTORY, GATEWAY_FABRIC_STORE_FILE),
   };
 }
 
@@ -239,9 +251,21 @@ function safePathToken(value: string): string {
 export interface AtomicWriteOptions {
   mode?: number;
   maximumBytes?: number;
+  /** Test-only crash seam around the atomic directory-entry replacement. */
+  fault?: (point: "before-rename" | "after-rename") => void | Promise<void>;
 }
 
-/** Write via a same-directory, fsynced temporary file followed by rename. */
+async function syncGatewayDirectory(path: string): Promise<void> {
+  // Windows does not expose directory handles through fs.open; rename is the
+  // strongest available boundary there. POSIX needs directory fsync for the
+  // renamed entry itself to survive power loss.
+  if (process.platform === "win32") return;
+  const handle = await open(path, "r");
+  try { await handle.sync(); }
+  finally { await handle.close(); }
+}
+
+/** Write via a same-directory, fsynced temporary file and directory-fsynced rename. */
 export async function writeGatewayFileAtomic(
   path: string,
   content: string | Uint8Array,
@@ -260,11 +284,14 @@ export async function writeGatewayFileAtomic(
     await handle.sync();
     await handle.close();
     handle = undefined;
+    await options.fault?.("before-rename");
     await rename(temporary, path);
+    await options.fault?.("after-rename");
     try { await chmod(path, options.mode ?? 0o600); } catch (error) {
       const code = (error as NodeJS.ErrnoException).code;
       if (code !== "ENOENT" && code !== "EPERM" && code !== "EINVAL" && code !== "ENOSYS") throw error;
     }
+    await syncGatewayDirectory(dirname(path));
   } finally {
     await handle?.close().catch(() => undefined);
     await rm(temporary, { force: true }).catch(() => undefined);

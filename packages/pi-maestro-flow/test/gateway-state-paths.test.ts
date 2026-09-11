@@ -6,6 +6,7 @@ import {
   createGatewayStatePaths,
   gatewayAgentDirectory,
   gatewayConfigPath,
+  gatewayFabricStorePath,
   gatewayGlobalStateRoot,
   gatewayNativeRoot,
   gatewayOperationReceiptRoot,
@@ -40,6 +41,8 @@ test("Gateway uses the Pi agent native root while workspace state remains unchan
   assert.equal(paths.globalRoot, join(nativeRoot, "v1"));
   assert.equal(paths.ownerPath, join(nativeRoot, "v1", "owner.json"));
   assert.equal(paths.workspaceRegistryPath, join(nativeRoot, "v1", "workspaces.json"));
+  assert.equal(paths.fabricStorePath, join(nativeRoot, "v1", "fabric", "state.json"));
+  assert.equal(gatewayFabricStorePath(home), paths.fabricStorePath);
   assert.equal(paths.workspaceRoot, gatewayStateRoot(cwd));
   assert.equal(paths.operationReceiptRoot, gatewayOperationReceiptRoot(cwd));
 });
@@ -54,6 +57,7 @@ test("PI_CODING_AGENT_DIR overrides only the user-global Gateway root", (t) => {
   assert.equal(gatewayAgentDirectory(home), resolve(override));
   assert.equal(gatewayConfigPath(home), join(resolve(override), "gateway", "config.yaml"));
   assert.equal(gatewayGlobalStateRoot(home), join(resolve(override), "gateway", "v1"));
+  assert.equal(gatewayFabricStorePath(home), join(resolve(override), "gateway", "v1", "fabric", "state.json"));
   const canonicalCwd = process.platform === "win32" ? resolve(cwd).toLowerCase() : resolve(cwd);
   assert.equal(gatewayStateRoot(cwd), join(canonicalCwd, ".pi", "gateway", "v1"));
 });
