@@ -201,6 +201,30 @@ test("teammate relay reports asynchronous IPC callback failures explicitly", asy
   }
 });
 
+test("teammate relay treats a closed IPC pipe as unavailable without exposing EPIPE", async () => {
+  const previousChild = process.env.PI_TEAMMATE_CHILD;
+  const sendDescriptor = Object.getOwnPropertyDescriptor(process, "send");
+  process.env.PI_TEAMMATE_CHILD = "1";
+  Object.defineProperty(process, "send", {
+    configurable: true,
+    value(_message: unknown, callback: (error: NodeJS.ErrnoException | null) => void) {
+      queueMicrotask(() => callback(Object.assign(new Error("write EPIPE"), { code: "EPIPE" })));
+      return true;
+    },
+  });
+  try {
+    assert.deepEqual(
+      await requestTeammateInteraction("permission", {}, 50),
+      { ok: false, reason: "unavailable" },
+    );
+  } finally {
+    if (sendDescriptor) Object.defineProperty(process, "send", sendDescriptor);
+    else delete (process as typeof process & { send?: unknown }).send;
+    if (previousChild === undefined) delete process.env.PI_TEAMMATE_CHILD;
+    else process.env.PI_TEAMMATE_CHILD = previousChild;
+  }
+});
+
 test("teammate relay reports response timeout separately from send failure", async () => {
   const previousChild = process.env.PI_TEAMMATE_CHILD;
   const sendDescriptor = Object.getOwnPropertyDescriptor(process, "send");

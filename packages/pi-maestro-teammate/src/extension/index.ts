@@ -5530,15 +5530,20 @@ export default function registerTeammateExtension(
           })(),
           onChildRequest: (event: Record<string, unknown>, reply: (msg: unknown) => void) => {
           if (!ownsDispatchGeneration()) {
-            reply({
-              type: "teammate_proxy_result",
-              requestId: event.requestId,
-              result: {
-                content: [{ type: "text", text: "Parent session generation changed; stale child request rejected." }],
-                isError: true,
-                details: { mode: "single", results: [] },
-              },
-            });
+            const error = new Error("Parent session generation changed; stale child request rejected.");
+            if (event.type === "teammate_interaction_request" || event.type === "teammate_rpc_ui_request") {
+              replyChildRequestFailure(event, reply, error);
+            } else {
+              reply({
+                type: "teammate_proxy_result",
+                requestId: event.requestId,
+                result: {
+                  content: [{ type: "text", text: error.message }],
+                  isError: true,
+                  details: { mode: "single", results: [] },
+                },
+              });
+            }
             return;
           }
           if (event.type === "teammate_interaction_request" || event.type === "teammate_rpc_ui_request") {
@@ -11377,6 +11382,7 @@ import {
   progressDurationMs,
   reclaimResultReadyAgents,
   reconcileSettledAgentsForSession,
+  replyChildRequestFailure,
   resolveAgentCorrelationId,
   resolveLocalAgentSenderContext,
   resolveWatchTarget,

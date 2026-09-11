@@ -2241,15 +2241,20 @@ export async function handleProxyRequest(
         },
         onChildRequest: (evt, rep) => {
           if (!ownsDispatchGeneration()) {
-            rep({
-              type: "teammate_proxy_result",
-              requestId: evt.requestId,
-              result: {
-                content: [{ type: "text", text: "Parent session generation changed; stale child request rejected." }],
-                isError: true,
-                details: { mode: "single", results: [] },
-              },
-            });
+            const error = new Error("Parent session generation changed; stale child request rejected.");
+            if (evt.type === "teammate_interaction_request" || evt.type === "teammate_rpc_ui_request") {
+              replyChildRequestFailure(evt, rep, error);
+            } else {
+              rep({
+                type: "teammate_proxy_result",
+                requestId: evt.requestId,
+                result: {
+                  content: [{ type: "text", text: error.message }],
+                  isError: true,
+                  details: { mode: "single", results: [] },
+                },
+              });
+            }
             return;
           }
           if (evt.type === "teammate_interaction_request" || evt.type === "teammate_rpc_ui_request") {

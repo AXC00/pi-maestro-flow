@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 
 interface PendingInteraction {
   resolve: (result: unknown) => void;
+  fail: (reason: TeammateInteractionFailureReason, error?: string) => void;
   timer: ReturnType<typeof setTimeout>;
 }
 
@@ -71,6 +72,7 @@ export async function requestTeammateInteraction<T>(
     state.pending.set(requestId, {
       timer,
       resolve: (result) => finish({ ok: true, result: result as T }),
+      fail: (reason, error) => finish({ ok: false, reason, ...(error === undefined ? {} : { error }) }),
     });
     try {
       process.send?.({
@@ -80,16 +82,10 @@ export async function requestTeammateInteraction<T>(
         correlationId: process.env.PI_TEAMMATE_CORRELATION_ID,
         payload,
       }, (error) => {
-        if (error) {
-          finish({ ok: false, reason: "send-failed", error: error.message });
-        }
+        if (error) finish(relaySendFailure(error));
       });
     } catch (error) {
-      finish({
-        ok: false,
-        reason: "send-failed",
-        error: error instanceof Error ? error.message : String(error),
-      });
+      finish(relaySendFailure(error));
     }
   });
 }
@@ -103,6 +99,17 @@ function relayState(): RelayState {
   return created;
 }
 
+function relaySendFailure(error: unknown): TeammateInteractionResult<never> {
+  const message = error instanceof Error ? error.message : String(error);
+  const code = error && typeof error === "object" && "code" in error
+    ? String((error as { code?: unknown }).code ?? "")
+    : "";
+  if (process.connected === false || code === "EPIPE" || code === "ERR_IPC_CHANNEL_CLOSED" || /\bEPIPE\b/u.test(message)) {
+    return { ok: false, reason: "unavailable" };
+  }
+  return { ok: false, reason: "send-failed", error: message };
+}
+
 function installListener(state: RelayState): void {
   if (state.installed) return;
   state.installed = true;
@@ -114,5 +121,8 @@ function installListener(state: RelayState): void {
     state.pending.delete(record.requestId);
     clearTimeout(pending.timer);
     pending.resolve(record.result);
+  });
+  process.on("disconnect", () => {
+    for (const pending of [...state.pending.values()]) pending.fail("unavailable");
   });
 }

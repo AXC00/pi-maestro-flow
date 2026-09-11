@@ -2431,6 +2431,33 @@ test("stale child requests cannot admit work after the parent session generation
 
   assert.equal(spawns, 1);
   assert.match(JSON.stringify(reply), /stale child request rejected/);
+
+  let permissionReply: Record<string, unknown> | undefined;
+  options!.onChildRequest?.({
+    type: "teammate_interaction_request",
+    interaction: "permission",
+    requestId: "late-permission",
+  }, (message) => { permissionReply = message as Record<string, unknown>; });
+  assert.deepEqual(permissionReply, {
+    type: "teammate_interaction_response",
+    requestId: "late-permission",
+    result: {
+      action: "cancel",
+      error: "Parent session generation changed; stale child request rejected.",
+    },
+  });
+
+  let rpcUiReply: Record<string, unknown> | undefined;
+  options!.onChildRequest?.({
+    type: "teammate_rpc_ui_request",
+    id: "late-ui",
+    method: "confirm",
+  }, (message) => { rpcUiReply = message as Record<string, unknown>; });
+  assert.deepEqual(rpcUiReply, {
+    type: "extension_ui_response",
+    id: "late-ui",
+    cancelled: true,
+  });
   await hooks.get("session_shutdown")?.[0]?.();
 });
 
