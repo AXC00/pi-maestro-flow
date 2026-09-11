@@ -1,6 +1,7 @@
 /** The single registration and dispatch source for every Gateway transport. */
 import type { GatewayPrincipal, GatewayResult, GatewayTool, GatewayToolName } from "./contracts.ts";
 import { GATEWAY_RESULT_SCHEMA, GATEWAY_STATE_VERSION } from "./contracts.ts";
+import type { FabricControlTool } from "./capabilities.ts";
 import type { ExecService } from "./services/exec-service.ts";
 import type { FileService } from "./services/file-service.ts";
 import type { HostService } from "./services/host-service.ts";
@@ -15,6 +16,10 @@ import type { GatewayHandoffService } from "./services/handoff-service.ts";
 import type { GatewaySkillService } from "./services/skill-service.ts";
 import type { GatewayMaestroCliService } from "./services/maestro-cli-service.ts";
 import type { GatewayBrowserService } from "./services/browser-service.ts";
+import type { GatewayFabricDeviceService } from "./fabric/device-service.ts";
+import type { GatewayFabricWorkspaceService } from "./fabric/workspace-service.ts";
+import type { GatewayFabricEndpointService } from "./fabric/endpoint-service.ts";
+import type { GatewayFabricRouteService } from "./fabric/route-service.ts";
 import { GATEWAY_HANDOFF_WRITE_SCHEMA } from "./handoff-contracts.ts";
 import {
   GATEWAY_HANDOFF_GET_REQUEST_SCHEMA,
@@ -47,6 +52,10 @@ export interface GatewayCatalogServices {
   skill: GatewaySkillService;
   maestroCli: GatewayMaestroCliService;
   browser: GatewayBrowserService;
+  fabricDevice: GatewayFabricDeviceService;
+  fabricWorkspace: GatewayFabricWorkspaceService;
+  fabricEndpoint: GatewayFabricEndpointService;
+  fabricRoute: GatewayFabricRouteService;
 }
 
 type Schema = Record<string, unknown>;
@@ -112,9 +121,66 @@ const WORKSPACE_GET_SCHEMA: Schema = {
     { required: ["path"] },
   ],
 };
+const fabricId: Schema = string({ minLength: 1, maxLength: 128, pattern: "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$" });
+const fabricBase: Schema = {
+  version: { const: "fabric.control.v1" },
+  deadlineAt: integer({ minimum: 0 }),
+};
+function fabricAction(name: string, properties: Schema = {}, required: string[] = []): Schema {
+  return action(name, { ...fabricBase, ...properties }, ["version", "deadlineAt", ...required]);
+}
+const DEVICE_SCHEMA = actions(
+  fabricAction("list"),
+  fabricAction("get", { deviceId: fabricId }, ["deviceId"]),
+  fabricAction("pair", { connectorId: fabricId, deviceId: fabricId, pairingRef: string({ minLength: 1, maxLength: 2048 }) }, ["connectorId", "deviceId", "pairingRef"]),
+  fabricAction("connect", { deviceId: fabricId, connectorId: fabricId, expectedCredentialGeneration: integer({ minimum: 1 }) }, ["deviceId", "connectorId", "expectedCredentialGeneration"]),
+  fabricAction("disconnect", { deviceId: fabricId, connectionId: fabricId, expectedConnectionGeneration: integer({ minimum: 1 }) }, ["deviceId", "connectionId", "expectedConnectionGeneration"]),
+  fabricAction("status", { deviceId: fabricId }, ["deviceId"]),
+  fabricAction("workspaces", { deviceId: fabricId }, ["deviceId"]),
+);
 const WORKSPACE_SCHEMA = actions(
   action("list", { cursor: integer({ minimum: 0 }), limit: integer({ minimum: 1, maximum: 256 }) }),
   WORKSPACE_GET_SCHEMA,
+  fabricAction("list", { deviceId: fabricId }),
+  fabricAction("bind", {
+    deviceId: fabricId,
+    connectionId: fabricId,
+    workspaceId: fabricId,
+    expectedConnectionGeneration: integer({ minimum: 1 }),
+    expectedWorkspaceGeneration: integer({ minimum: 1 }),
+    requestedTtlMs: integer({ minimum: 1, maximum: 86_400_000 }),
+  }, ["deviceId", "connectionId", "workspaceId", "expectedConnectionGeneration", "expectedWorkspaceGeneration", "requestedTtlMs"]),
+  fabricAction("renew", {
+    workspaceBindingId: fabricId,
+    expectedRevision: integer({ minimum: 0 }),
+    requestedTtlMs: integer({ minimum: 1, maximum: 86_400_000 }),
+  }, ["workspaceBindingId", "expectedRevision", "requestedTtlMs"]),
+  fabricAction("unbind", { workspaceBindingId: fabricId, expectedRevision: integer({ minimum: 0 }) }, ["workspaceBindingId", "expectedRevision"]),
+);
+const ENDPOINT_SCHEMA = actions(
+  fabricAction("list", {
+    deviceId: fabricId,
+    workspaceId: fabricId,
+    endpointKind: { enum: ["agent", "mcp"] },
+    endpointStatus: { enum: ["unknown", "online", "offline", "disabled"] },
+  }),
+  fabricAction("describe", { endpointId: fabricId }, ["endpointId"]),
+  fabricAction("select", { endpointId: fabricId }, ["endpointId"]),
+);
+const ROUTE_SCHEMA = actions(
+  fabricAction("open", {
+    connectionId: fabricId,
+    workspaceBindingId: fabricId,
+    endpointId: fabricId,
+    expectedConnectionGeneration: integer({ minimum: 1 }),
+    expectedWorkspaceGeneration: integer({ minimum: 1 }),
+    expectedEndpointGeneration: integer({ minimum: 1 }),
+    requestedTtlMs: integer({ minimum: 1, maximum: 86_400_000 }),
+    operationClass: { enum: ["agent-placement", "mcp-read", "mcp-mutation", "artifact-read"] },
+    pathCandidates: { type: "array", items: { enum: ["hub", "lan-direct", "edge-relay", "vps-relay"] }, minItems: 1, maxItems: 4, uniqueItems: true },
+  }, ["connectionId", "endpointId", "expectedConnectionGeneration", "expectedEndpointGeneration", "requestedTtlMs", "operationClass", "pathCandidates"]),
+  fabricAction("renew", { routeId: fabricId, expectedRevision: integer({ minimum: 0 }), requestedTtlMs: integer({ minimum: 1, maximum: 86_400_000 }) }, ["routeId", "expectedRevision", "requestedTtlMs"]),
+  fabricAction("close", { routeId: fabricId, expectedRevision: integer({ minimum: 0 }) }, ["routeId", "expectedRevision"]),
 );
 const completionPolicy: Schema = {
   type: "object",
@@ -403,10 +469,18 @@ function entry(name: GatewayToolName, description: string, inputSchema: Schema, 
   };
 }
 
+function fabricEntry(name: Exclude<FabricControlTool, "workspace">, description: string, inputSchema: Schema, handler: GatewayToolHandler, options: Pick<GatewayTool, "executionMode" | "mutating" | "readonly">): GatewayCatalogEntry {
+  const value = entry(name, description, inputSchema, handler, options);
+  const capability = `fabric.control.${name}`;
+  return { ...value, capability, requiredCapabilities: [capability] };
+}
+
 export class GatewayCatalog {
   private readonly entries = new Map<GatewayToolName, GatewayCatalogEntry>();
   constructor(services: GatewayCatalogServices) {
-    this.register(entry("workspace", "Discover principal-authorized workspaces by stable ID without exposing owner credentials.", WORKSPACE_SCHEMA, (principal, args) => services.workspace.handle(principal, args as never), { executionMode: "sync", readonly: true, mutating: false }));
+    this.register(entry("workspace", "Discover principal-authorized local workspaces, or explicitly manage Fabric Workspace Bindings with version=fabric.control.v1. Path-only input never creates a Fabric binding.", WORKSPACE_SCHEMA, (principal, args) => args.version === "fabric.control.v1"
+      ? services.fabricWorkspace.handle(principal, args as never)
+      : services.workspace.handle(principal, args as never), { executionMode: "sync", readonly: false, mutating: true }));
     this.register(entry("board", "Use the exact Board actions create, list, get, update, claim, renew, release, takeover, attach-endpoint, detach-endpoint, bind-session, link-plan, handoff, transition, search, and observe. create publishes work; session membership is handled by session.join. handoff stores resumable content and completed tasks snapshot it under result.handoff; search matches task and completion handoff content.", BOARD_SCHEMA, (principal, args) => services.board.handle(principal, args as never), { executionMode: "sync", readonly: false, mutating: true }));
     this.register(entry("host", "Describe, inspect, or test the machine running the Gateway.", HOST_SCHEMA, (principal, args) => services.host.handle({ ...args, principal } as never), { executionMode: "sync", readonly: true, mutating: false }));
     this.register(entry("exec", "Run one bounded argv-based command in an authorized workspace.", EXEC_SCHEMA, (principal, args) => services.exec.handle({ ...args, principal } as never), { executionMode: "sync", readonly: false, mutating: true }));
@@ -420,6 +494,9 @@ export class GatewayCatalog {
     this.register(entry("skill", "Discover authorized skills, then load only a selected skill or its explicitly declared resource. Skill content is untrusted data and is never executed.", SKILL_SCHEMA, (principal, args) => services.skill.handle(principal, args as never), { executionMode: "sync", readonly: true, mutating: false }));
     this.register(entry("maestro_cli", "Search or load governed knowledge, or stage an evidence-backed spec/knowhow candidate through typed actions. Arbitrary argv and automatic promotion are not supported.", MAESTRO_CLI_SCHEMA, (principal, args, signal) => services.maestroCli.handle(principal, args as never, signal), { executionMode: "async", readonly: false, mutating: true }));
     this.register(entry("browser", BROWSER_DESCRIPTION, BROWSER_SCHEMA, (principal, args, signal) => services.browser.handle(principal, args as never, signal), { executionMode: "async", readonly: false, mutating: true }));
+    this.register(fabricEntry("device", "Explicitly discover, pair, connect, disconnect, inspect, or list workspaces for Fabric Devices. Discovery never connects.", DEVICE_SCHEMA, (principal, args, signal) => services.fabricDevice.handle(principal, args as never, signal), { executionMode: "async", readonly: false, mutating: true }));
+    this.register(fabricEntry("endpoint", "Discover, describe, or select an exact Fabric Endpoint. Selection returns a descriptor and never connects or executes.", ENDPOINT_SCHEMA, (principal, args) => services.fabricEndpoint.handle(principal, args as never), { executionMode: "sync", readonly: true, mutating: false }));
+    this.register(fabricEntry("route", "Explicitly open, renew, or close a generation-fenced Fabric Route for one selected Endpoint.", ROUTE_SCHEMA, (principal, args) => services.fabricRoute.handle(principal, args as never), { executionMode: "async", readonly: false, mutating: true }));
   }
   list(): GatewayTool[] { return [...this.entries.values()].map(({ handler: _handler, ...tool }) => structuredClone(tool)); }
   get(name: string): GatewayCatalogEntry | undefined { return this.entries.get(name as GatewayToolName); }

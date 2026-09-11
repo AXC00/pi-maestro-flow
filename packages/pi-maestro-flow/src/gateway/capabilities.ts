@@ -56,3 +56,23 @@ export function principalHasFabricDataPlane(principal: GatewayPrincipal, action:
   const requested = `${FABRIC_DATA_SCOPE}.${action}`;
   return principal.scopes.some((scope) => scope === FABRIC_DATA_SCOPE || scope === `${FABRIC_DATA_SCOPE}.*` || scope === requested);
 }
+
+export const FABRIC_CONTROL_SCOPE = "fabric.control" as const;
+export type FabricControlTool = "device" | "workspace" | "endpoint" | "route";
+
+/** Fabric control grants never inherit legacy `gateway` or wildcard scopes. */
+export function principalHasFabricControlPlane(
+  principal: GatewayPrincipal,
+  tool: FabricControlTool,
+  action: string,
+): boolean {
+  if (principal.transport === "stdio") return true;
+  if (principal.authenticated !== true || !CAPABILITY_PART.test(action)) return false;
+  const toolScope = `${FABRIC_CONTROL_SCOPE}.${tool}`;
+  const requested = `${toolScope}.${action}`;
+  return principal.scopes.some((scope) => scope === FABRIC_CONTROL_SCOPE
+    || scope === `${FABRIC_CONTROL_SCOPE}.*`
+    || scope === toolScope
+    || scope === `${toolScope}.*`
+    || scope === requested);
+}

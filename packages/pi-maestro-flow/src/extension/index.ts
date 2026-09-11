@@ -253,6 +253,7 @@ import { registerSkillManager, runSkillManager } from "../skills/skill-manager.t
 import { SkillManagerStore } from "../skills/skill-manager-store.ts";
 import { registerIntelligenceTools, shutdownIntelligenceTools } from "../tools/intelligence.ts";
 import { registerGatewayBoardTool } from "../tools/gateway-board.ts";
+import { registerGatewayFabricTools } from "../tools/fabric.ts";
 import { createLspTool } from "../tools/lsp-tool.ts";
 import { lspManager } from "../tools/lsp/manager.ts";
 import { registerSmartSearchTool } from "../tools/smart-search.ts";
@@ -2138,6 +2139,7 @@ When NOT to use:
   registerIntelligenceTools(pi);
   registerFff(pi);
   registerGatewayBoardTool(pi);
+  registerGatewayFabricTools(pi);
   registerBashBg(pi);
   registerLoop(pi);
   registerFlowSchedule(pi, {
@@ -4690,6 +4692,7 @@ function registerMaestroChildSurface(pi: ExtensionAPI): void {
   registerResourceTool(pi);
   registerSessionHistoryTool(pi, { isCompactRecoveryEnabled: (ctx) => newContextToolsEnabled(ctx.cwd) });
   registerGatewayBoardTool(pi);
+  registerGatewayFabricTools(pi);
   pi.registerTool(createLspTool() as never);
   pi.registerTool(createTeammateChildBrowserTool());
   pi.registerTool(createTeammateChildComputerUseTool());

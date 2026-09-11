@@ -89,7 +89,7 @@ test("Gateway protocol, config, and durable record versions are independent and 
 });
 
 test("Board contracts are strict and enforce revision, claim, hash, cursor, and time invariants", () => {
-  assert.deepEqual(GATEWAY_TOOL_NAMES, ["workspace", "board", "host", "exec", "job", "file", "teammate", "session", "todo", "monitor", "handoff", "skill", "maestro_cli", "browser"]);
+  assert.deepEqual(GATEWAY_TOOL_NAMES, ["workspace", "board", "host", "exec", "job", "file", "teammate", "session", "todo", "monitor", "handoff", "skill", "maestro_cli", "browser", "device", "endpoint", "route"]);
   const workspaceId = "a".repeat(64);
   const claim = { claimantId: "agent-1", principalId: "stdio:agent-1", actorType: "pi", generation: 1, claimedAt: now, leaseExpiresAt: now + 60_000 };
   const task = {

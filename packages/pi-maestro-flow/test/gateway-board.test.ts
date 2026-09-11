@@ -13,7 +13,7 @@ function taskOf(result: Awaited<ReturnType<GatewayRuntime["call"]>>) {
   return (result.data as { task?: { id: string; revision: number; status: string; phase: string; claim?: { generation: number }; endpointBindings?: Array<{ kind: string; endpointId: string; principalId: string }>; sessionBinding?: { sessionId: string }; planBinding?: { todoIds: string[] }; handoff?: { summary?: string; nextSteps?: string[]; resourceUris?: string[] }; result?: { handoff?: { summary?: string; nextSteps?: string[]; resourceUris?: string[] } } } } | undefined)?.task;
 }
 
-test("13-tool runtime closes the workspace Board to Session/Todo collaboration loop", async (t) => {
+test("17-tool runtime closes the workspace Board to Session/Todo collaboration loop", async (t) => {
   const root = await mkdtemp(join(tmpdir(), "gateway-board-runtime-"));
   const otherRoot = await mkdtemp(join(tmpdir(), "gateway-board-runtime-other-"));
   const config = createTestGatewayConfig(root, { mode: "bearer", token: "secret" });
@@ -27,7 +27,7 @@ test("13-tool runtime closes the workspace Board to Session/Todo collaboration l
   const web = createGatewayPrincipal("http", "web", { authenticated: true, workspaceId });
   const foreign = createGatewayPrincipal("http", "foreign", { authenticated: true, workspaceId: otherWorkspaceId });
 
-  assert.deepEqual(runtime.catalog.list().map((tool) => tool.name), ["workspace", "board", "host", "exec", "job", "file", "teammate", "session", "todo", "monitor", "handoff", "skill", "maestro_cli", "browser"]);
+  assert.deepEqual(runtime.catalog.list().map((tool) => tool.name), ["workspace", "board", "host", "exec", "job", "file", "teammate", "session", "todo", "monitor", "handoff", "skill", "maestro_cli", "browser", "device", "endpoint", "route"]);
   assert.equal((await runtime.call("board", { action: "list", workspaceId, extra: true }, web)).error?.code, "invalid_arguments");
   assert.equal((await runtime.call("teammate", { action: "start", workspaceId, params: { tasks: [{ prompt: "work", unknown: true }] } }, web)).error?.code, "invalid_arguments");
   assert.equal((await runtime.call("teammate", { action: "start", workspaceId, prompt: "work", options: { onProgress: "unsafe" } }, web)).error?.code, "invalid_arguments");

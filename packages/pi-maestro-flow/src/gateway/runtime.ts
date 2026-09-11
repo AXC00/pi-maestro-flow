@@ -29,6 +29,11 @@ import {
 } from "./fabric/endpoint-dispatcher.ts";
 import { FabricHttpChannelServer } from "./fabric/http-channel-server.ts";
 import { McpEndpointBridge, type FabricMcpSourceRegistration } from "./fabric/mcp-endpoint.ts";
+import { GatewayFabricControlSupport, type GatewayFabricControlRuntime } from "./fabric/control-support.ts";
+import { GatewayFabricDeviceService } from "./fabric/device-service.ts";
+import { GatewayFabricWorkspaceService } from "./fabric/workspace-service.ts";
+import { GatewayFabricEndpointService } from "./fabric/endpoint-service.ts";
+import { GatewayFabricRouteService } from "./fabric/route-service.ts";
 import { ExecService } from "./services/exec-service.ts";
 import { FileService } from "./services/file-service.ts";
 import { HostService } from "./services/host-service.ts";
@@ -53,7 +58,11 @@ import { browserManager, type BrowserManagerLike } from "../tools/browser/manage
 import { browserBridge } from "../tools/browser/bridge-server.ts";
 import type { RunCliRunner } from "../session/cli-adapter.ts";
 import { GATEWAY_MCP_INSTRUCTIONS } from "./prompt-guidance.ts";
-import { principalHasGatewayAction } from "./capabilities.ts";
+import {
+  principalHasFabricControlPlane,
+  principalHasGatewayAction,
+  type FabricControlTool,
+} from "./capabilities.ts";
 
 export interface GatewayRuntimeOptions {
   config?: GatewayConfig;
@@ -65,6 +74,8 @@ export interface GatewayRuntimeOptions {
   operationReceiptStore?: GatewayOperationReceiptStore;
   fabricStore?: GatewayFabricStore;
   fabricEventAdapter?: GatewayFabricEventAdapter;
+  /** Explicit host-owned Fabric managers. Omission keeps control tools present but disabled. */
+  fabricControlRuntime?: GatewayFabricControlRuntime;
   fabricRouteAuthority?: FabricRouteAuthority;
   fabricEndpointDirectory?: FabricEndpointDirectory;
   fabricEndpointRegistrations?: readonly FabricEndpointRegistration[];
@@ -95,6 +106,8 @@ const READ_ACTIONS: Partial<Record<GatewayToolName, ReadonlySet<string>>> = {
   skill: new Set(["list", "load"]),
   maestro_cli: new Set(["search", "load"]),
   browser: new Set(["guide", "status"]),
+  device: new Set(["list", "get", "status", "workspaces"]),
+  endpoint: new Set(["list", "describe", "select"]),
 };
 
 export class GatewayRuntime {
@@ -115,6 +128,11 @@ export class GatewayRuntime {
   readonly operationReceipts: GatewayOperationReceiptStore;
   readonly fabricStore: GatewayFabricStore;
   readonly fabricEvents: GatewayFabricEventAdapter;
+  readonly fabricControlRuntime?: GatewayFabricControlRuntime;
+  readonly fabricDevice: GatewayFabricDeviceService;
+  readonly fabricWorkspace: GatewayFabricWorkspaceService;
+  readonly fabricEndpoint: GatewayFabricEndpointService;
+  readonly fabricRoute: GatewayFabricRouteService;
   readonly fabricEndpointDispatcher?: FabricEndpointDispatcher;
   readonly fabricHttpChannelServer?: FabricHttpChannelServer;
   readonly fabricMcpEndpoint?: McpEndpointBridge;
@@ -224,6 +242,7 @@ export class GatewayRuntime {
     if (this.fabricEvents.store !== this.fabricStore || this.fabricEvents.journal !== this.teammate.eventJournal) {
       throw new Error("Gateway Fabric event adapter must use the runtime Fabric store and event journal");
     }
+    this.fabricControlRuntime = options.fabricControlRuntime;
     this.fabricMcpEndpoint = options.fabricMcpEndpoint ?? (options.fabricMcpSources === undefined ? undefined : new McpEndpointBridge({
       registry: this.registry,
       policy: this.policy,
@@ -238,11 +257,13 @@ export class GatewayRuntime {
         handler: this.fabricMcpEndpoint!,
       }))),
     ];
+    const fabricRouteAuthority = options.fabricRouteAuthority ?? this.fabricControlRuntime?.admissions;
+    const fabricEndpointDirectory = options.fabricEndpointDirectory ?? this.fabricControlRuntime?.directory;
     this.fabricEndpointDispatcher = options.fabricEndpointDispatcher ?? (
-      options.fabricRouteAuthority !== undefined && options.fabricEndpointDirectory !== undefined
+      fabricRouteAuthority !== undefined && fabricEndpointDirectory !== undefined
         ? new FabricEndpointDispatcher({
-          routes: options.fabricRouteAuthority,
-          endpoints: options.fabricEndpointDirectory,
+          routes: fabricRouteAuthority,
+          endpoints: fabricEndpointDirectory,
           registrations: endpointRegistrations,
           maxPendingRequests: config.limits.maxConcurrentRequests,
           maxRequestBytes: config.limits.maxRequestBytes,
@@ -265,6 +286,11 @@ export class GatewayRuntime {
         maxPendingRequests: config.limits.maxConcurrentRequests,
       },
     }));
+    const fabricControl = new GatewayFabricControlSupport(this.fabricControlRuntime, this.policy, this.registry);
+    this.fabricDevice = new GatewayFabricDeviceService(fabricControl);
+    this.fabricWorkspace = new GatewayFabricWorkspaceService(fabricControl);
+    this.fabricEndpoint = new GatewayFabricEndpointService(fabricControl);
+    this.fabricRoute = new GatewayFabricRouteService(fabricControl, (routeId, reason) => this.fabricHttpChannelServer?.closeRoute(routeId, reason));
     this.eventStream = new GatewayEventStream(this.teammate.eventJournal, { observer: this.observer });
     this.session = new GatewaySessionService({ store: this.sessionStore, todos: this.todoStore, teammate: this.teammate, receipts: this.operationReceipts, authMode: config.auth.mode, policy: this.policy, stream: this.eventStream });
     this.todo = new GatewayTodoService({ store: this.todoStore, sessions: this.sessionStore, authMode: config.auth.mode });
@@ -341,6 +367,10 @@ export class GatewayRuntime {
       skill: this.skill,
       maestroCli: this.maestroCli,
       browser: this.browser,
+      fabricDevice: this.fabricDevice,
+      fabricWorkspace: this.fabricWorkspace,
+      fabricEndpoint: this.fabricEndpoint,
+      fabricRoute: this.fabricRoute,
     });
   }
 
@@ -379,8 +409,12 @@ export class GatewayRuntime {
           if (!admittedBeforeQuiesce && !this.isQuiesceRead(action)) {
             throw new GatewayPolicyError("Gateway is quiescing; new mutations and subscriptions are refused", "gateway_quiescing");
           }
-          if (!principalHasGatewayAction(principal, tool.name, action)) {
-            throw new GatewayPolicyError(`Gateway principal lacks required capability: gateway.${tool.name}.${action}`, "capability_denied");
+          const fabricControl = this.isFabricControlRequest(tool.name, parsed);
+          if (fabricControl
+            ? !principalHasFabricControlPlane(principal, tool.name as FabricControlTool, action)
+            : !principalHasGatewayAction(principal, tool.name, action)) {
+            const capability = fabricControl ? `fabric.control.${tool.name}.${action}` : `gateway.${tool.name}.${action}`;
+            throw new GatewayPolicyError(`Gateway principal lacks required capability: ${capability}`, "capability_denied");
           }
           if (this.isOpenHttpMutation(principal, tool.name, tool.mutating === true, parsed)) {
             if (this.config.auth.allowOpenMutations === false) throw new GatewayPolicyError("HTTP mutations are disabled when auth.mode=open", "open_mutation_denied");
@@ -460,6 +494,11 @@ export class GatewayRuntime {
       };
     });
     return server;
+  }
+
+  private isFabricControlRequest(name: GatewayToolName, args: Record<string, unknown>): boolean {
+    return name === "device" || name === "endpoint" || name === "route"
+      || (name === "workspace" && args.version === "fabric.control.v1");
   }
 
   private isOpenHttpMutation(principal: GatewayPrincipal, name: GatewayToolName, mutating: boolean, args: Record<string, unknown>): boolean {

@@ -86,7 +86,7 @@ export const GATEWAY_DEFAULT_LIMITS = {
 } as const;
 
 /** Public order is part of the protocol. New surfaces are appended; existing names remain unchanged. */
-export const GATEWAY_TOOL_NAMES = ["workspace", "board", "host", "exec", "job", "file", "teammate", "session", "todo", "monitor", "handoff", "skill", "maestro_cli", "browser"] as const;
+export const GATEWAY_TOOL_NAMES = ["workspace", "board", "host", "exec", "job", "file", "teammate", "session", "todo", "monitor", "handoff", "skill", "maestro_cli", "browser", "device", "endpoint", "route"] as const;
 /** The pre-Board catalog remains readable at migration boundaries. */
 export const GATEWAY_LEGACY_TOOL_NAMES = ["host", "exec", "job", "file", "teammate", "session", "todo", "monitor"] as const;
 export type GatewayToolName = typeof GATEWAY_TOOL_NAMES[number];

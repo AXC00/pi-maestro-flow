@@ -39,7 +39,7 @@ test("shared catalog exposes workspace discovery and Session/Todo/Monitor collab
   const owner = createGatewayPrincipal("stdio", "owner", { authenticated: true });
   const observer = createGatewayPrincipal("http", "observer", { authenticated: true });
   const web = createGatewayPrincipal("http", "web", { authenticated: true });
-  assert.deepEqual(runtime.catalog.list().map((tool) => tool.name), ["workspace", "board", "host", "exec", "job", "file", "teammate", "session", "todo", "monitor", "handoff", "skill", "maestro_cli", "browser"]);
+  assert.deepEqual(runtime.catalog.list().map((tool) => tool.name), ["workspace", "board", "host", "exec", "job", "file", "teammate", "session", "todo", "monitor", "handoff", "skill", "maestro_cli", "browser", "device", "endpoint", "route"]);
   assert.equal((await runtime.call("session", { action: "list", memberId: "owner", extra: true }, owner)).error?.code, "invalid_arguments");
 
   const created = await runtime.call("session", { action: "create", sessionId: "collab", workspacePath: root, ownerId: "owner", expectedSessionRevision: 0, operationId: "create" }, owner);

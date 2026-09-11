@@ -332,6 +332,16 @@ export class FabricHttpChannelServer {
     this.#json(response, 200, result);
   }
 
+  /** Fence active operations for a Route after durable admission has closed it. */
+  async closeRoute(routeId: string, reason: string): Promise<void> {
+    for (const state of this.#active.values()) {
+      if (state.request.frame.routeId === routeId) {
+        state.controller.abort(new FabricContractError("cancelled", reason, "routeId"));
+      }
+    }
+    await this.#channels.closeRoute(routeId, reason);
+  }
+
   async #readJson(request: IncomingMessage): Promise<unknown> {
     const declared = Number(request.headers["content-length"]);
     if (Number.isFinite(declared) && declared > this.limits.maxRequestBytes) throw new FabricContractError("resource_exhausted", "Fabric HTTP request exceeds maxRequestBytes");
