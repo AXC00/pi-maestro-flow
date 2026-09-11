@@ -61,6 +61,10 @@
       "types": "./types/public/v1/events.d.ts",
       "default": "./src/public/v1/events.ts"
     },
+    "./v1/external-agent-projections": {
+      "types": "./types/public/v1/external-agent-projections.d.ts",
+      "default": "./src/public/v1/external-agent-projections.ts"
+    },
     "./v1/execution": {
       "types": "./types/public/v1/execution.d.ts",
       "default": "./src/public/v1/execution.ts"
