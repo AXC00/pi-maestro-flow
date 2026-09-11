@@ -27,7 +27,7 @@ test("13-tool runtime closes the workspace Board to Session/Todo collaboration l
   const web = createGatewayPrincipal("http", "web", { authenticated: true, workspaceId });
   const foreign = createGatewayPrincipal("http", "foreign", { authenticated: true, workspaceId: otherWorkspaceId });
 
-  assert.deepEqual(runtime.catalog.list().map((tool) => tool.name), ["workspace", "board", "host", "exec", "job", "file", "teammate", "session", "todo", "monitor", "handoff", "skill", "maestro_cli"]);
+  assert.deepEqual(runtime.catalog.list().map((tool) => tool.name), ["workspace", "board", "host", "exec", "job", "file", "teammate", "session", "todo", "monitor", "handoff", "skill", "maestro_cli", "browser"]);
   assert.equal((await runtime.call("board", { action: "list", workspaceId, extra: true }, web)).error?.code, "invalid_arguments");
   assert.equal((await runtime.call("teammate", { action: "start", workspaceId, params: { tasks: [{ prompt: "work", unknown: true }] } }, web)).error?.code, "invalid_arguments");
   assert.equal((await runtime.call("teammate", { action: "start", workspaceId, prompt: "work", options: { onProgress: "unsafe" } }, web)).error?.code, "invalid_arguments");

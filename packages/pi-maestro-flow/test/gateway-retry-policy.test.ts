@@ -104,6 +104,10 @@ test("Gateway operation policy classifies only canonical reads and durable opera
 
   assert.equal(classifyGatewayOperation("maestro_cli", { action: "stage", operationId: "stage-1" }).retryClass, "receipt-backed");
   assert.equal(classifyGatewayOperation("board", { action: "observe" }).retryClass, "read");
+  assert.equal(classifyGatewayOperation("browser", { action: "guide" }).retryClass, "read");
+  assert.equal(classifyGatewayOperation("browser", { action: "status" }).retryClass, "read");
+  assert.equal(classifyGatewayOperation("browser", { action: "pair" }).retryClass, "outcome-unknown");
+  assert.equal(classifyGatewayOperation("browser", { action: "run" }).retryClass, "outcome-unknown");
 });
 
 test("a read reinitializes once and replays after an HTTPS session-loss fault", async () => {

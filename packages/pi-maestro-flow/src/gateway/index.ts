@@ -138,3 +138,4 @@ export * from "./services/board-service.ts";
 export * from "./services/handoff-service.ts";
 export * from "./services/skill-service.ts";
 export * from "./services/maestro-cli-service.ts";
+export * from "./services/browser-service.ts";

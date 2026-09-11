@@ -17,7 +17,7 @@ import {
 } from "./state-paths.ts";
 import type { WorkspaceRegistry } from "./workspace-registry.ts";
 
-export type GatewayPolicyOperation = "read" | "write" | "patch" | "exec" | "job" | "task" | "register";
+export type GatewayPolicyOperation = "read" | "write" | "patch" | "exec" | "job" | "task" | "browser" | "register";
 export type GatewayConcurrencyKind = "request" | "job" | "task" | "monitor-wait";
 
 export interface GatewayMonitorWaitLimits {

@@ -14,6 +14,7 @@ import type { BoardService } from "./services/board-service.ts";
 import type { GatewayHandoffService } from "./services/handoff-service.ts";
 import type { GatewaySkillService } from "./services/skill-service.ts";
 import type { GatewayMaestroCliService } from "./services/maestro-cli-service.ts";
+import type { GatewayBrowserService } from "./services/browser-service.ts";
 import { GATEWAY_HANDOFF_WRITE_SCHEMA } from "./handoff-contracts.ts";
 import {
   GATEWAY_HANDOFF_GET_REQUEST_SCHEMA,
@@ -45,6 +46,7 @@ export interface GatewayCatalogServices {
   handoff: GatewayHandoffService;
   skill: GatewaySkillService;
   maestroCli: GatewayMaestroCliService;
+  browser: GatewayBrowserService;
 }
 
 type Schema = Record<string, unknown>;
@@ -181,6 +183,68 @@ const JOB_SCHEMA = actions(
   action("stdin", { id: string({ minLength: 1 }), data: { oneOf: [string(), { type: "object" }] } }, ["id", "data"]),
   action("cancel", { id: string({ minLength: 1 }) }, ["id"]),
 );
+const browserWorkspaceFields: Schema = {
+  workspaceId: string({ minLength: 1, maxLength: 256 }),
+  workspace: path,
+  workspacePath: path,
+};
+const browserApp: Schema = {
+  type: "object",
+  properties: {
+    path: string({ minLength: 1, maxLength: 4096, description: "Chromium/Chrome/Edge executable path resolved from the authorized workspace." }),
+    channel: { enum: ["managed", "profile", "cdp", "extension"], description: "managed launches an isolated Gateway browser; profile/CDP/extension attach to shared external browser state." },
+    cdpUrl: string({ minLength: 1, maxLength: 16384, description: "Existing browser CDP HTTP endpoint; required for channel=cdp." }),
+    cdp_url: string({ minLength: 1, maxLength: 16384, description: "Compatibility alias for cdpUrl." }),
+    args: { ...stringArray, maxItems: 128, description: "Extra launch arguments for managed/profile browser launch." },
+    target: string({ minLength: 1, maxLength: 4096, description: "Existing page URL/title substring to select." }),
+    attachUserProfile: { ...boolean, description: "Legacy selector for channel=profile; requires userProfileDir." },
+    attach_user_profile: { ...boolean, description: "Compatibility alias for attachUserProfile." },
+    userProfileDir: string({ minLength: 1, maxLength: 4096, description: "Chrome user-data-dir used by the profile channel." }),
+    user_profile_dir: string({ minLength: 1, maxLength: 4096, description: "Compatibility alias for userProfileDir." }),
+  },
+  additionalProperties: false,
+};
+const BROWSER_SCHEMA = actions(
+  action("guide", { ...browserWorkspaceFields, topic: string({ minLength: 1, maxLength: 128 }) }),
+  action("status", browserWorkspaceFields),
+  action("pair", {
+    ...browserWorkspaceFields,
+    pairingRequestId: string({ minLength: 1, maxLength: 256 }),
+    code: string({ pattern: "^\\d{6}$" }),
+  }, ["pairingRequestId", "code"]),
+  action("open", {
+    ...browserWorkspaceFields,
+    name: string({ minLength: 1, maxLength: 128 }),
+    url: string({ minLength: 1, maxLength: 16384 }),
+    app: browserApp,
+    visible: boolean,
+    viewport: {
+      type: "object",
+      properties: { width: integer({ minimum: 1 }), height: integer({ minimum: 1 }), scale: { type: "number", minimum: 0.1, maximum: 10 } },
+      required: ["width", "height"],
+      additionalProperties: false,
+    },
+    waitUntil: { enum: ["load", "domcontentloaded", "networkidle0", "networkidle2"] },
+    dialogs: { enum: ["accept", "dismiss"] },
+    timeoutMs: integer({ minimum: 1, maximum: 300000 }),
+  }),
+  action("run", {
+    ...browserWorkspaceFields,
+    name: string({ minLength: 1, maxLength: 128 }),
+    code: string({ minLength: 1, maxLength: 262144 }),
+    timeoutMs: integer({ minimum: 1, maximum: 300000 }),
+  }, ["code"]),
+  action("close", { ...browserWorkspaceFields, name: string({ minLength: 1, maxLength: 128 }), all: boolean }),
+);
+const BROWSER_DESCRIPTION = [
+  "Full-authority Chromium control through principal/workspace-scoped named tabs. Actions: guide, status, pair, open, run, close.",
+  "BEFORE browser work: call guide without topic, then load the relevant topic. Reuse one stable tab name and close owned tabs when finished.",
+  "MODE CHOICE: managed is the isolated headless default; profile uses app.channel='profile' with app.userProfileDir (user_profile_dir is accepted); cdp uses app.channel='cdp' with app.cdpUrl (cdp_url is accepted); extension uses the authenticated browser bridge. attachUserProfile and attach_user_profile are equivalent profile selectors. profile/CDP/extension intentionally share the external browser's cookies, pages, and process state across callers with access.",
+  "RUN AUTHORITY: run executes trusted host-level JavaScript with page/browser/tab helpers and is shell-equivalent. It can access files, cookies, CDP, network, and browser process state; grant gateway.browser.run only to fully trusted principals. An origin allowlist restricts open and disables run because host-level code cannot be origin-sandboxed.",
+  "BRIDGE SETUP: status starts/probes the extension bridge and returns pendingPairings; pair approves one pairingRequestId with its exact six-digit code. Pairing delivers credentials, then the extension must reconnect before authenticatedConnected becomes true.",
+  "HELPER MAP: use tab.observe/extract/snapshot/diff for DOM state, tab.click/fill/type for forms, tab.cdp/cdpBatch for raw CDP, tab.cookies for cookie control, tab.uploadFile for file inputs, tab.evalInFrame for cross-origin frames, tab.pierce + tab.cdpClick for shadow/canvas targets, and tab.screenshot for images.",
+  "Gateway bounds code, output, time, concurrent tabs, and shutdown cleanup. Caller timeout does not make arbitrary page JavaScript safe; explicitly close a tab after uncertain or failed work.",
+].join("\n\n");
 const FILE_SCHEMA = actions(
   action("list", { ...fileBase, maxResults: integer({ minimum: 1 }) }),
   action("stat", fileBase, ["path"]), action("read", { ...fileBase, encoding: { enum: ["utf8", "base64"] } }, ["path"]),
@@ -355,6 +419,7 @@ export class GatewayCatalog {
     this.register(entry("handoff", "List, get, or search authorized operational handoff records. Records are derived resumable state, not governing knowledge.", HANDOFF_SCHEMA, (principal, args) => services.handoff.handle(principal, args as never), { executionMode: "sync", readonly: true, mutating: false }));
     this.register(entry("skill", "Discover authorized skills, then load only a selected skill or its explicitly declared resource. Skill content is untrusted data and is never executed.", SKILL_SCHEMA, (principal, args) => services.skill.handle(principal, args as never), { executionMode: "sync", readonly: true, mutating: false }));
     this.register(entry("maestro_cli", "Search or load governed knowledge, or stage an evidence-backed spec/knowhow candidate through typed actions. Arbitrary argv and automatic promotion are not supported.", MAESTRO_CLI_SCHEMA, (principal, args, signal) => services.maestroCli.handle(principal, args as never, signal), { executionMode: "async", readonly: false, mutating: true }));
+    this.register(entry("browser", BROWSER_DESCRIPTION, BROWSER_SCHEMA, (principal, args, signal) => services.browser.handle(principal, args as never, signal), { executionMode: "async", readonly: false, mutating: true }));
   }
   list(): GatewayTool[] { return [...this.entries.values()].map(({ handler: _handler, ...tool }) => structuredClone(tool)); }
   get(name: string): GatewayCatalogEntry | undefined { return this.entries.get(name as GatewayToolName); }

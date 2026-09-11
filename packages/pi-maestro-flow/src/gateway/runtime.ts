@@ -37,6 +37,9 @@ import { GatewayHandoffService } from "./services/handoff-service.ts";
 import { GatewayMaestroReceiptStore } from "./maestro-cli-receipt-store.ts";
 import { GatewayOperationReceiptStore } from "./operation-receipt-store.ts";
 import { GatewayMaestroCliService, type GatewayMaestroStageBinding } from "./services/maestro-cli-service.ts";
+import { GatewayBrowserService } from "./services/browser-service.ts";
+import { browserManager, type BrowserManagerLike } from "../tools/browser/manager.ts";
+import { browserBridge } from "../tools/browser/bridge-server.ts";
 import type { RunCliRunner } from "../session/cli-adapter.ts";
 import { GATEWAY_MCP_INSTRUCTIONS } from "./prompt-guidance.ts";
 import { principalHasGatewayAction } from "./capabilities.ts";
@@ -53,6 +56,7 @@ export interface GatewayRuntimeOptions {
   maestroRunner?: RunCliRunner;
   maestroEnvironment?: NodeJS.ProcessEnv;
   resolveMaestroStageBinding?: (input: { workspacePath: string; workflowSessionId?: string; runId?: string }) => Promise<GatewayMaestroStageBinding | undefined>;
+  browserManager?: BrowserManagerLike;
 }
 
 const READ_ACTIONS: Partial<Record<GatewayToolName, ReadonlySet<string>>> = {
@@ -68,6 +72,7 @@ const READ_ACTIONS: Partial<Record<GatewayToolName, ReadonlySet<string>>> = {
   handoff: new Set(["list", "get", "search"]),
   skill: new Set(["list", "load"]),
   maestro_cli: new Set(["search", "load"]),
+  browser: new Set(["guide", "status"]),
 };
 
 export class GatewayRuntime {
@@ -81,6 +86,7 @@ export class GatewayRuntime {
   readonly exec: ExecService;
   readonly job: JobService;
   readonly file: FileService;
+  readonly browser: GatewayBrowserService;
   readonly teammate: GatewayTeammateService;
   readonly sessionStore: SessionStore;
   readonly todoStore: GatewayTodoStore;
@@ -156,6 +162,12 @@ export class GatewayRuntime {
       workspaceRoot: this.cwd,
       security: config.security.files,
       trustedFullAccess: config.security.trustedFullAccess?.enabled ?? false,
+    });
+    this.browser = new GatewayBrowserService({
+      policy: this.policy,
+      manager: options.browserManager ?? browserManager,
+      security: config.security.browser,
+      shutdownBridge: () => browserBridge.shutdown(),
     });
     this.teammate = new GatewayTeammateService({
       port: options.teammatePort,
@@ -250,6 +262,7 @@ export class GatewayRuntime {
       handoff: this.handoff,
       skill: this.skill,
       maestroCli: this.maestroCli,
+      browser: this.browser,
     });
   }
 
@@ -420,7 +433,7 @@ export class GatewayRuntime {
     this.phase = "closed";
     for (const resolve of this.drainWaiters) resolve();
     this.drainWaiters.clear();
-    await Promise.allSettled([this.job.shutdown(), this.teammate.shutdown()]);
+    await Promise.allSettled([this.job.shutdown(), this.teammate.shutdown(), this.browser.shutdown()]);
   }
 }
 

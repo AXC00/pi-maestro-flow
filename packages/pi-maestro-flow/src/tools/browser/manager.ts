@@ -50,6 +50,8 @@ export interface BrowserOpenOptions {
   dialogs?: "accept" | "dismiss";
   attachUserProfile?: boolean;
   userProfileDir?: string;
+  /** Optional caller-owned namespace for physically isolated managed browser profiles. */
+  isolationKey?: string;
   signal?: AbortSignal;
   timeoutMs: number;
 }
@@ -71,6 +73,65 @@ export interface BrowserRunOutput {
   url: string;
   navigated?: boolean;
   newTabs?: Array<{ url: string }>;
+}
+
+class BrowserOutputCollector {
+  private bytes = 0;
+  private failure?: Error;
+  constructor(private readonly maximum?: number) {}
+
+  pushDisplay(displays: BrowserRunOutput["displays"], item: BrowserRunOutput["displays"][number]): void {
+    this.reserve(item);
+    displays.push(item);
+  }
+
+  reserveScreenshot(metadata: BrowserRunOutput["screenshots"][number], imageBase64Bytes: number, silent: boolean): void {
+    this.reserve(metadata);
+    if (!silent) {
+      this.reserve({ type: "text", text: `Screenshot saved: ${metadata.path}` });
+      this.reserveBytes(imageBase64Bytes + 64);
+    }
+  }
+
+  commitScreenshot(
+    screenshots: BrowserRunOutput["screenshots"],
+    displays: BrowserRunOutput["displays"],
+    metadata: BrowserRunOutput["screenshots"][number],
+    imageData: string,
+    silent: boolean,
+  ): void {
+    screenshots.push(metadata);
+    if (!silent) {
+      displays.push({ type: "text", text: `Screenshot saved: ${metadata.path}` });
+      displays.push({ type: "image", data: imageData, mimeType: "image/png" });
+    }
+  }
+
+  maxCollectionItems(): number {
+    return this.maximum === undefined ? Number.MAX_SAFE_INTEGER : Math.max(1, Math.min(256, Math.floor(this.maximum / 128)));
+  }
+
+  fail(message: string): never {
+    this.failure ??= new Error(message);
+    throw this.failure;
+  }
+
+  reserve(value: unknown): void {
+    if (this.failure) throw this.failure;
+    if (this.maximum === undefined) return;
+    let serialized: string;
+    try { serialized = JSON.stringify(value) ?? ""; }
+    catch { return this.fail("Browser output is not JSON-serializable."); }
+    this.reserveBytes(Buffer.byteLength(serialized, "utf8"));
+  }
+
+  private reserveBytes(bytes: number): void {
+    if (this.failure) throw this.failure;
+    if (this.maximum === undefined) return;
+    const next = this.bytes + bytes;
+    if (next > this.maximum) this.fail(`Browser output exceeds ${this.maximum} UTF-8 bytes.`);
+    this.bytes = next;
+  }
 }
 
 export interface BrowserNamedTabStatus {
@@ -98,7 +159,7 @@ export interface BrowserManagerStatus {
 
 export interface BrowserManagerLike {
   open(options: BrowserOpenOptions): Promise<BrowserTabInfo>;
-  run(name: string, code: string, cwd: string, signal: AbortSignal | undefined, timeoutMs: number): Promise<BrowserRunOutput>;
+  run(name: string, code: string, cwd: string, signal: AbortSignal | undefined, timeoutMs: number, maxOutputBytes?: number): Promise<BrowserRunOutput>;
   status(signal?: AbortSignal): Promise<BrowserManagerStatus>;
   pair(requestId: string, code: string, signal?: AbortSignal): Promise<PairingApproval>;
   close(name: string): Promise<boolean>;
@@ -400,17 +461,18 @@ export class BrowserManager implements BrowserManagerLike {
     }
   }
 
-  async run(name: string, code: string, cwd: string, signal: AbortSignal | undefined, timeoutMs: number): Promise<BrowserRunOutput> {
+  async run(name: string, code: string, cwd: string, signal: AbortSignal | undefined, timeoutMs: number, maxOutputBytes?: number): Promise<BrowserRunOutput> {
     const entry = this.#tabs.get(name);
     if (!entry) throw new Error(`No tab named "${name}". Open it first.`);
     if (entry.busy) throw new Error(`Tab "${name}" is busy.`);
     if (!code.trim()) throw new Error("Browser run requires non-empty code.");
     throwIfAborted(signal);
+    if (maxOutputBytes !== undefined && (!Number.isSafeInteger(maxOutputBytes) || maxOutputBytes < 1)) throw new Error("Browser maxOutputBytes must be a positive integer.");
     if (entry.backend === "extension") {
       assertExtensionEntryAcceptingCommands(entry);
-      return this.#runTrackedExtension(entry, code, cwd, signal, timeoutMs);
+      return this.#runTrackedExtension(entry, code, cwd, signal, timeoutMs, maxOutputBytes);
     }
-    return this.#runPuppeteer(entry, code, cwd, signal, timeoutMs);
+    return this.#runPuppeteer(entry, code, cwd, signal, timeoutMs, maxOutputBytes);
   }
 
   async #runTrackedExtension(
@@ -419,11 +481,12 @@ export class BrowserManager implements BrowserManagerLike {
     cwd: string,
     signal: AbortSignal | undefined,
     timeoutMs: number,
+    maxOutputBytes?: number,
   ): Promise<BrowserRunOutput> {
     assertExtensionEntryActive(entry, signal);
     const controller = new AbortController();
     const combined = combineSignals(signal, controller.signal);
-    const promise = this.#runExtension(entry, code, cwd, combined.signal, timeoutMs);
+    const promise = this.#runExtension(entry, code, cwd, combined.signal, timeoutMs, maxOutputBytes);
     entry.activeRun = { controller, promise };
     try {
       return await promise;
@@ -442,11 +505,12 @@ export class BrowserManager implements BrowserManagerLike {
     }
   }
 
-  async #runPuppeteer(entry: PuppeteerEntry, code: string, cwd: string, signal: AbortSignal | undefined, timeoutMs: number): Promise<BrowserRunOutput> {
+  async #runPuppeteer(entry: PuppeteerEntry, code: string, cwd: string, signal: AbortSignal | undefined, timeoutMs: number, maxOutputBytes?: number): Promise<BrowserRunOutput> {
     const name = entry.name;
     entry.busy = true;
     const displays: BrowserRunOutput["displays"] = [];
     const screenshots: BrowserRunOutput["screenshots"] = [];
+    const output = new BrowserOutputCollector(maxOutputBytes);
     const beforeUrl = entry.page.isClosed() ? "" : entry.page.url();
     // Capture new tabs via the targetcreated event instead of a before/after
     // browser.pages() diff: window.open mid-run can race the after-snapshot and
@@ -455,8 +519,16 @@ export class BrowserManager implements BrowserManagerLike {
     // entry page itself is excluded so a same-tab reload is not reported.
     const ownTarget = entry.page.target();
     const createdTargets = new Set<Target>();
+    const maxNewTabs = output.maxCollectionItems();
+    let targetOverflow = false;
     const onTargetCreated = (target: Target) => {
-      if (target.type() === "page" && target !== ownTarget) createdTargets.add(target);
+      if (target.type() !== "page" || target === ownTarget) return;
+      if (createdTargets.size >= maxNewTabs) {
+        targetOverflow = true;
+        void target.page().then((page) => page?.close()).catch(() => undefined);
+        return;
+      }
+      createdTargets.add(target);
     };
     // A tab spawned and closed within the same run must not be reported (same
     // semantics as the old before/after pages diff, which only saw survivors).
@@ -479,28 +551,33 @@ export class BrowserManager implements BrowserManagerLike {
       await disablePageRequestInterception(entry.page);
       requestScope = installRequestListenerScope(entry.page);
       entry.requestScope = requestScope;
-      const tab = createTabApi(entry, cwd, displays, screenshots, signal, timeoutMs);
+      const tab = createTabApi(entry, cwd, displays, screenshots, signal, timeoutMs, output);
       const runApis = observeBrowserRunApis(name, entry.page, entry.browser, tab);
       const assert = (condition: unknown, message = "Browser assertion failed") => { if (!condition) throw new Error(message); };
       const wait = (ms: number) => abortableDelay(ms, signal);
-      const display = (value: unknown) => displays.push({ type: "text", text: formatDisplay(value) });
-      const print = (...values: unknown[]) => displays.push({ type: "text", text: values.map(formatDisplay).join(" ") });
+      const display = (value: unknown) => output.pushDisplay(displays, { type: "text", text: formatDisplay(value) });
+      const print = (...values: unknown[]) => output.pushDisplay(displays, { type: "text", text: values.map(formatDisplay).join(" ") });
       const capturedConsole = { log: print, info: print, warn: print, error: print, debug: print };
       const execute = compileRunCode(code);
       const returnValue = await raceAbort(execute(runApis.page, runApis.browser, runApis.tab, assert, wait, display, print, signal, capturedConsole), signal, timeoutMs);
+      output.reserve(returnValue);
       const afterUrl = entry.page.isClosed() ? "" : entry.page.url();
       const navigated = Boolean(beforeUrl && afterUrl && beforeUrl !== afterUrl);
+      if (targetOverflow) output.fail(`Browser opened more than ${maxNewTabs} new tabs in one run.`);
       let newTabs: Array<{ url: string }> | undefined;
-      try {
-        if (createdTargets.size > 0) {
-          const settled = await Promise.all([...createdTargets].map(async (target) => {
-            try { const page = await raceAbort(target.page(), signal, Math.min(2_000, timeoutMs)); return { url: page?.url() ?? target.url() }; }
-            catch { return { url: target.url() }; }
-          }));
-          const added = settled.filter((item) => Boolean(item.url));
-          if (added.length > 0) newTabs = added;
+      if (createdTargets.size > 0) {
+        const added: Array<{ url: string }> = [];
+        for (const target of createdTargets) {
+          let item: { url: string };
+          try { const page = await raceAbort(target.page(), signal, Math.min(2_000, timeoutMs)); item = { url: page?.url() ?? target.url() }; }
+          catch { item = { url: target.url() }; }
+          if (!item.url) continue;
+          output.reserve(item);
+          added.push(item);
         }
-      } catch { /* best-effort */ }
+        if (added.length > 0) newTabs = added;
+      }
+      output.reserve({ url: afterUrl, navigated: navigated || undefined });
       return { displays, returnValue, screenshots, url: afterUrl, navigated: navigated || undefined, newTabs };
     } catch (error) {
       runFailed = true;
@@ -526,23 +603,25 @@ export class BrowserManager implements BrowserManagerLike {
     }
   }
 
-  async #runExtension(entry: ExtensionEntry, code: string, cwd: string, signal: AbortSignal | undefined, timeoutMs: number): Promise<BrowserRunOutput> {
+  async #runExtension(entry: ExtensionEntry, code: string, cwd: string, signal: AbortSignal | undefined, timeoutMs: number, maxOutputBytes?: number): Promise<BrowserRunOutput> {
     assertExtensionEntryActive(entry, signal);
     entry.busy = true;
     const displays: BrowserRunOutput["displays"] = [];
     const screenshots: BrowserRunOutput["screenshots"] = [];
     const createdTabs: Array<{ id?: number; url: string }> = [];
+    const output = new BrowserOutputCollector(maxOutputBytes);
     const beforeUrl = entry.url;
     try {
-      const adapters = createExtensionAdapters(entry, cwd, displays, screenshots, createdTabs, signal, timeoutMs);
+      const adapters = createExtensionAdapters(entry, cwd, displays, screenshots, createdTabs, signal, timeoutMs, output);
       const runApis = observeBrowserRunApis(entry.name, adapters.page, adapters.browser, adapters.tab);
       const assert = (condition: unknown, message = "Browser assertion failed") => { if (!condition) throw new Error(message); };
       const wait = (ms: number) => abortableDelay(ms, signal);
-      const display = (value: unknown) => displays.push({ type: "text", text: formatDisplay(value) });
-      const print = (...values: unknown[]) => displays.push({ type: "text", text: values.map(formatDisplay).join(" ") });
+      const display = (value: unknown) => output.pushDisplay(displays, { type: "text", text: formatDisplay(value) });
+      const print = (...values: unknown[]) => output.pushDisplay(displays, { type: "text", text: values.map(formatDisplay).join(" ") });
       const capturedConsole = { log: print, info: print, warn: print, error: print, debug: print };
       const execute = compileRunCode(code);
       const returnValue = await raceAbort(execute(runApis.page, runApis.browser, runApis.tab, assert, wait, display, print, signal, capturedConsole), signal, timeoutMs);
+      output.reserve(returnValue);
       assertExtensionEntryActive(entry, signal);
       const current = await getExtensionTab(entry.tabId, entry.bridgeIdentity, signal, timeoutMs, entry);
       assertExtensionEntryActive(entry, signal);
@@ -552,13 +631,15 @@ export class BrowserManager implements BrowserManagerLike {
       for (const item of createdTabs) {
         if (item.url) uniqueTabs.set(item.id === undefined ? item.url : String(item.id), { url: item.url });
       }
+      const newTabs = uniqueTabs.size > 0 ? [...uniqueTabs.values()] : undefined;
+      output.reserve({ url: entry.url, navigated: beforeUrl !== entry.url || undefined });
       return {
         displays,
         returnValue,
         screenshots,
         url: entry.url,
         navigated: beforeUrl !== entry.url || undefined,
-        newTabs: uniqueTabs.size > 0 ? [...uniqueTabs.values()] : undefined,
+        newTabs,
       };
     } catch (error) {
       throw browserRunErrorHint(error);
@@ -1064,9 +1145,16 @@ function createExtensionAdapters(
   createdTabs: Array<{ id?: number; url: string }>,
   signal: AbortSignal | undefined,
   timeoutMs: number,
+  output: BrowserOutputCollector,
 ): { page: object; browser: object; tab: object } {
   const recordNewTabs = (items: Array<{ id?: number; url?: string }> | undefined) => {
-    for (const item of items ?? []) if (item.url) createdTabs.push({ id: item.id, url: item.url });
+    for (const item of items ?? []) {
+      if (!item.url) continue;
+      if (createdTabs.length >= output.maxCollectionItems()) output.fail(`Browser opened more than ${output.maxCollectionItems()} new tabs in one run.`);
+      const tab = { id: item.id, url: item.url };
+      output.reserve(tab);
+      createdTabs.push(tab);
+    }
   };
 
   const createPage = (state: ExtensionTabState): object => {
@@ -1164,6 +1252,8 @@ function createExtensionAdapters(
     const destination = options?.save
       ? path.resolve(cwd, options.save)
       : path.join(os.tmpdir(), `pi-maestro-browser-extension-${Date.now()}-${Math.random().toString(36).slice(2)}.png`);
+    const metadata = { path: destination, mimeType: "image/png", bytes: buffer.length };
+    output.reserveScreenshot(metadata, Buffer.byteLength(result.data, "utf8"), options?.silent === true);
     await fs.mkdir(path.dirname(destination), { recursive: true });
     assertExtensionEntryActive(entry, signal);
     await fs.writeFile(destination, buffer, { flag: options?.save ? "w" : "wx", mode: options?.save ? 0o666 : 0o600 });
@@ -1174,12 +1264,7 @@ function createExtensionAdapters(
       throw error;
     }
     if (!options?.save) entry.ownedTempFiles.add(destination);
-    const metadata = { path: destination, mimeType: "image/png", bytes: buffer.length };
-    screenshots.push(metadata);
-    if (!options?.silent) {
-      displays.push({ type: "text", text: `Screenshot saved: ${destination}` });
-      displays.push({ type: "image", data: result.data, mimeType: "image/png" });
-    }
+    output.commitScreenshot(screenshots, displays, metadata, result.data, options?.silent === true);
     return metadata;
   })());
   const cookieApi = limitedExtensionAdapter("tab.cookies", {
@@ -1251,6 +1336,7 @@ function createTabApi(
   screenshots: BrowserRunOutput["screenshots"],
   signal: AbortSignal | undefined,
   timeoutMs: number,
+  output: BrowserOutputCollector,
 ) {
   const page = entry.page;
   const deadline = () => Math.max(1, timeoutMs);
@@ -1333,18 +1419,16 @@ function createTabApi(
       const destination = options?.save
         ? path.resolve(cwd, options.save)
         : path.join(os.tmpdir(), `pi-maestro-browser-${Date.now()}-${Math.random().toString(36).slice(2)}.png`);
+      const metadata = { path: destination, mimeType: "image/png", bytes: buffer.length };
+      const imageBase64Bytes = Math.ceil(buffer.length / 3) * 4;
+      output.reserveScreenshot(metadata, imageBase64Bytes, options?.silent === true);
       await fs.mkdir(path.dirname(destination), { recursive: true });
       await fs.writeFile(destination, buffer, {
         flag: options?.save ? "w" : "wx",
         mode: options?.save ? 0o666 : 0o600,
       });
       if (!options?.save) entry.ownedTempFiles.add(destination);
-      const metadata = { path: destination, mimeType: "image/png", bytes: buffer.length };
-      screenshots.push(metadata);
-      if (!options?.silent) {
-        displays.push({ type: "text", text: `Screenshot saved: ${destination}` });
-        displays.push({ type: "image", data: buffer.toString("base64"), mimeType: "image/png" });
-      }
+      output.commitScreenshot(screenshots, displays, metadata, buffer.toString("base64"), options?.silent === true);
       return metadata;
     },
     async extract(format: "text" | "html" | "markdown" | "probe" | "list" = "markdown", options?: { fold?: string }) {
@@ -1945,7 +2029,7 @@ function browserKey(options: CanonicalBrowserOpenOptions): string {
     return `cdp:${options.cdpUrl.replace(/\/$/, "")}`;
   }
   if (options.channel === "extension") return "extension";
-  return `launched:${options.visible ? "headed" : "headless"}:${path.resolve(options.cwd, options.executablePath ?? "auto")}:${JSON.stringify(options.args ?? [])}`;
+  return `launched:${options.visible ? "headed" : "headless"}:${path.resolve(options.cwd, options.executablePath ?? "auto")}:${JSON.stringify(options.args ?? [])}:${options.isolationKey ?? ""}`;
 }
 
 function browserOpenRequestKey(options: CanonicalBrowserOpenOptions, browser: string): string {

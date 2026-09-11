@@ -436,6 +436,10 @@ test("browser manager drives a real local Chromium tab when an executable is ava
     `, process.cwd(), undefined, 15_000);
     assert.equal((output.returnValue as { value: string }).value, "Ada");
     assert.equal(output.screenshots.length, 1);
+    await assert.rejects(
+      manager.run("live", "display('x'.repeat(128)); return true;", process.cwd(), undefined, 15_000, 64),
+      /Browser output exceeds 64 UTF-8 bytes/,
+    );
     const collision = await manager.run("live", `
       const wait = "w"; const page = "p"; const assert = "a"; const display = "d";
       const print = "pr"; const signal = "s"; const console = "c"; const browser = "b";
