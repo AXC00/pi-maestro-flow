@@ -23,10 +23,11 @@ const READ_ACTIONS = new Map<string, ReadonlySet<string>>([
   ["teammate", new Set(["list", "observe", "wait", "result"])],
   ["session", new Set(["get", "list"])],
   ["todo", new Set(["list", "get"])],
-  ["monitor", new Set(["list", "observe", "wait", "result"])],
+  ["monitor", new Set(["list", "observe", "wait", "result", "subscribe", "unsubscribe"])],
   ["handoff", new Set(["list", "get", "search"])],
   ["skill", new Set(["list", "load"])],
   ["maestro_cli", new Set(["search", "load"])],
+  ["browser", new Set(["guide", "status"])],
 ]);
 
 const RECEIPT_BACKED_ACTIONS = new Map<string, ReadonlySet<string>>([

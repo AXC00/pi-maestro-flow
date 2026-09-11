@@ -57,8 +57,7 @@ export interface SshGatewayBinding {
 }
 
 /** Non-secret client-side receipt for restoring observation after a plugin restart. */
-export interface SshGatewayLaunchBinding {
-  version: 1;
+interface SshGatewayLaunchBindingBase {
   bindingId: string;
   hostId: string;
   effectiveHostDigest: string;
@@ -73,8 +72,46 @@ export interface SshGatewayLaunchBinding {
   operationId: string;
   executionHandle: string;
   generation: number;
+  /** Compatibility alias for eventCursor. */
   cursor: number;
 }
+
+/** Legacy receipts remain readable for manual Monitor recovery but cannot wake an original Pi session. */
+export interface SshGatewayLaunchBindingV1 extends SshGatewayLaunchBindingBase {
+  version: 1;
+}
+
+export type SshGatewayRemoteTaskStatus = "queued" | "running" | "completed" | "failed" | "cancelled" | "lost" | "reconnecting";
+
+export interface SshGatewayMonitorState {
+  status: SshGatewayRemoteTaskStatus;
+  updatedAt: number;
+  activeTool?: string;
+  activeToolArgs?: string;
+  toolCount?: number;
+  tokens?: number;
+}
+
+export interface SshGatewayCompletionDelivery {
+  deliveryId: string;
+  eventId: string;
+  status: Extract<SshGatewayRemoteTaskStatus, "completed" | "failed" | "cancelled" | "lost">;
+  content: string;
+  queuedAt: number;
+  acceptedAt?: number;
+}
+
+/** Durable receipt used by automatic Monitor subscriptions and completion routing. */
+export interface SshGatewayLaunchBindingV2 extends SshGatewayLaunchBindingBase {
+  version: 2;
+  piSessionRef: string;
+  eventCursor: number;
+  resultCursor: number;
+  monitorState?: SshGatewayMonitorState;
+  completion?: SshGatewayCompletionDelivery;
+}
+
+export type SshGatewayLaunchBinding = SshGatewayLaunchBindingV1 | SshGatewayLaunchBindingV2;
 
 export interface SshManagerData {
   version: typeof SSH_MANAGER_DATA_VERSION;
@@ -120,11 +157,22 @@ const V3_DATA_KEYS = new Set(["version", "revision", "keys", "hosts", "gatewayBi
 const V2_DATA_KEYS = new Set(["version", "revision", "keys", "hosts"]);
 const LEGACY_DATA_KEYS = new Set(["version", "revision", "hosts"]);
 const GATEWAY_BINDING_KEYS = new Set(["hostId", "endpoint", "token", "pairingId", "expiresAt", "effectiveHostDigest"]);
-const GATEWAY_LAUNCH_BINDING_KEYS = new Set([
+const GATEWAY_LAUNCH_BINDING_V1_KEYS = new Set([
   "version", "bindingId", "hostId", "effectiveHostDigest", "endpointIdentity", "gatewayPrincipalId",
   "gatewaySessionId", "gatewayMemberId", "sessionRevision", "memberGeneration", "leaseExpiresAt",
   "leaseTtlMs", "operationId", "executionHandle", "generation", "cursor",
 ]);
+const GATEWAY_LAUNCH_BINDING_V2_KEYS = new Set([
+  ...GATEWAY_LAUNCH_BINDING_V1_KEYS,
+  "piSessionRef", "eventCursor", "resultCursor", "monitorState", "completion",
+]);
+const GATEWAY_LAUNCH_BINDING_V2_OPTIONAL_KEYS = new Set(["monitorState", "completion"]);
+const GATEWAY_MONITOR_STATE_KEYS = new Set(["status", "updatedAt", "activeTool", "activeToolArgs", "toolCount", "tokens"]);
+const GATEWAY_MONITOR_STATE_OPTIONAL_KEYS = new Set(["activeTool", "activeToolArgs", "toolCount", "tokens"]);
+const GATEWAY_COMPLETION_KEYS = new Set(["deliveryId", "eventId", "status", "content", "queuedAt", "acceptedAt"]);
+const GATEWAY_COMPLETION_OPTIONAL_KEYS = new Set(["acceptedAt"]);
+const GATEWAY_REMOTE_TASK_STATUSES = new Set<SshGatewayRemoteTaskStatus>(["queued", "running", "completed", "failed", "cancelled", "lost", "reconnecting"]);
+const GATEWAY_TERMINAL_TASK_STATUSES = new Set<SshGatewayCompletionDelivery["status"]>(["completed", "failed", "cancelled", "lost"]);
 
 export function createSshHostId(): string { return randomUUID(); }
 export function createSshKeyId(): string { return randomUUID(); }
@@ -290,8 +338,13 @@ export function validateSshGatewayBindings(value: unknown, hosts: readonly SshHo
 
 export function validateSshGatewayLaunchBinding(value: unknown): SshGatewayLaunchBinding {
   const binding = requireRecord(value, "SSH Gateway launch binding");
-  requireExactKeys(binding, GATEWAY_LAUNCH_BINDING_KEYS, "SSH Gateway launch binding");
-  if (binding.version !== 1) throw new Error("Unsupported SSH Gateway launch binding version");
+  if (binding.version !== 1 && binding.version !== 2) throw new Error("Unsupported SSH Gateway launch binding version");
+  requireExactKeys(
+    binding,
+    binding.version === 1 ? GATEWAY_LAUNCH_BINDING_V1_KEYS : GATEWAY_LAUNCH_BINDING_V2_KEYS,
+    "SSH Gateway launch binding",
+    binding.version === 1 ? undefined : GATEWAY_LAUNCH_BINDING_V2_OPTIONAL_KEYS,
+  );
   const bindingId = requireSafeGatewayId(binding.bindingId, "launch binding id");
   const hostId = requireId(binding.hostId, "host");
   const effectiveHostDigest = requireDigest(binding.effectiveHostDigest, "effective host digest");
@@ -301,8 +354,9 @@ export function validateSshGatewayLaunchBinding(value: unknown): SshGatewayLaunc
   const gatewayMemberId = requireSafeGatewayId(binding.gatewayMemberId, "Gateway member id");
   const operationId = requireSafeGatewayId(binding.operationId, "Gateway operation id");
   const executionHandle = requireSafeGatewayId(binding.executionHandle, "Gateway execution handle");
-  return {
-    version: 1, bindingId, hostId, effectiveHostDigest, endpointIdentity, gatewayPrincipalId,
+  const cursor = nonNegativeSafeInteger(binding.cursor, "Monitor cursor");
+  const common = {
+    bindingId, hostId, effectiveHostDigest, endpointIdentity, gatewayPrincipalId,
     gatewaySessionId, gatewayMemberId,
     sessionRevision: validateRevision(binding.sessionRevision),
     memberGeneration: positiveSafeInteger(binding.memberGeneration, "Gateway member generation"),
@@ -310,7 +364,55 @@ export function validateSshGatewayLaunchBinding(value: unknown): SshGatewayLaunc
     leaseTtlMs: positiveSafeInteger(binding.leaseTtlMs, "Gateway lease TTL"),
     operationId, executionHandle,
     generation: positiveSafeInteger(binding.generation, "launch generation"),
-    cursor: nonNegativeSafeInteger(binding.cursor, "Monitor cursor"),
+    cursor,
+  };
+  if (binding.version === 1) return { version: 1, ...common };
+  const eventCursor = nonNegativeSafeInteger(binding.eventCursor, "Monitor event cursor");
+  if (cursor !== eventCursor) throw new Error("Monitor cursor must match eventCursor");
+  const monitorState = binding.monitorState === undefined ? undefined : validateGatewayMonitorState(binding.monitorState);
+  const completion = binding.completion === undefined ? undefined : validateGatewayCompletion(binding.completion);
+  return {
+    version: 2,
+    ...common,
+    piSessionRef: requireBoundedString(binding.piSessionRef, "Pi session reference", 1, 256),
+    eventCursor,
+    resultCursor: nonNegativeSafeInteger(binding.resultCursor, "Monitor result cursor"),
+    ...(monitorState === undefined ? {} : { monitorState }),
+    ...(completion === undefined ? {} : { completion }),
+  };
+}
+
+function validateGatewayMonitorState(value: unknown): SshGatewayMonitorState {
+  const state = requireRecord(value, "SSH Gateway Monitor state");
+  requireExactKeys(state, GATEWAY_MONITOR_STATE_KEYS, "SSH Gateway Monitor state", GATEWAY_MONITOR_STATE_OPTIONAL_KEYS);
+  if (typeof state.status !== "string" || !GATEWAY_REMOTE_TASK_STATUSES.has(state.status as SshGatewayRemoteTaskStatus)) {
+    throw new Error("SSH Gateway Monitor status is invalid");
+  }
+  return {
+    status: state.status as SshGatewayRemoteTaskStatus,
+    updatedAt: nonNegativeSafeInteger(state.updatedAt, "Gateway Monitor updatedAt"),
+    ...(state.activeTool === undefined ? {} : { activeTool: requireCleanString(state.activeTool, "Gateway active tool", 1, 96) }),
+    ...(state.activeToolArgs === undefined ? {} : { activeToolArgs: requireCleanString(state.activeToolArgs, "Gateway active tool args", 1, 256) }),
+    ...(state.toolCount === undefined ? {} : { toolCount: nonNegativeSafeInteger(state.toolCount, "Gateway tool count") }),
+    ...(state.tokens === undefined ? {} : { tokens: nonNegativeSafeInteger(state.tokens, "Gateway token count") }),
+  };
+}
+
+function validateGatewayCompletion(value: unknown): SshGatewayCompletionDelivery {
+  const completion = requireRecord(value, "SSH Gateway completion delivery");
+  requireExactKeys(completion, GATEWAY_COMPLETION_KEYS, "SSH Gateway completion delivery", GATEWAY_COMPLETION_OPTIONAL_KEYS);
+  if (typeof completion.status !== "string" || !GATEWAY_TERMINAL_TASK_STATUSES.has(completion.status as SshGatewayCompletionDelivery["status"])) {
+    throw new Error("SSH Gateway completion status is invalid");
+  }
+  const content = requireBoundedUtf8(completion.content, "Gateway completion content", 1, 16 * 1024);
+  rejectControlExceptNewlines(content, "Gateway completion content");
+  return {
+    deliveryId: requireSafeGatewayId(completion.deliveryId, "completion delivery id"),
+    eventId: requireCleanString(completion.eventId, "Gateway completion event id", 1, 256),
+    status: completion.status as SshGatewayCompletionDelivery["status"],
+    content,
+    queuedAt: nonNegativeSafeInteger(completion.queuedAt, "Gateway completion queuedAt"),
+    ...(completion.acceptedAt === undefined ? {} : { acceptedAt: nonNegativeSafeInteger(completion.acceptedAt, "Gateway completion acceptedAt") }),
   };
 }
 
@@ -324,7 +426,7 @@ export function validateSshGatewayLaunchBindings(value: unknown, hosts: readonly
 }
 
 export function cloneSshGatewayBinding(binding: SshGatewayBinding): SshGatewayBinding { return { ...binding }; }
-export function cloneSshGatewayLaunchBinding(binding: SshGatewayLaunchBinding): SshGatewayLaunchBinding { return { ...binding }; }
+export function cloneSshGatewayLaunchBinding(binding: SshGatewayLaunchBinding): SshGatewayLaunchBinding { return structuredClone(binding); }
 
 export function replaceSshHost(hosts: readonly SshHost[], id: string, replacement: unknown): SshHost[] {
   const index = hosts.findIndex((host) => host.id === id);

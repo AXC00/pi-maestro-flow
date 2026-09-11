@@ -3,6 +3,7 @@ import type { SshExecutor } from "./executor.ts";
 import { validateSshGatewayBinding } from "./model.ts";
 
 export const SSH_GATEWAY_COMMAND = "pi-maestro-gateway connect --stdio";
+export const SSH_GATEWAY_SESSION_COMMAND = "pi-maestro-gateway serve --no-http --json";
 export const SSH_GATEWAY_BOOTSTRAP_COMMAND = "pi-maestro-gateway pair bootstrap --ttl 2592000 --label pi-maestro-flow-ssh";
 const SSH_GATEWAY_REVOKE_PREFIX = "pi-maestro-gateway pair revoke ";
 
@@ -67,12 +68,12 @@ export function sshGatewayGuide(): string {
     "Pi Maestro Gateway runs on the selected SSH server and must be installed and started there.",
     "",
     "1. Install the package that provides `pi-maestro-gateway` on the remote server.",
-    "2. Start the daemon with `pi-maestro-gateway serve`.",
+    "2. Start the daemon with `pi-maestro-gateway serve`, or use ssh action=ensure_gateway for a non-persistent daemon tied to the current local Pi session.",
     "3. Verify the installation with `pi-maestro-gateway version --json`.",
-    "4. Send `#ssh` (or `#ssh:<id>`) to select that server, then use the ssh tool's status, list, describe, call, or start_pi action.",
+    "4. Send `#ssh` (or `#ssh:<id>`) to select that server, then use the ssh tool's ensure_gateway, status, list, describe, call, or start_pi action.",
     "",
     "start_pi accepts existing local Pi todoIds plus an optional objective/agent/timeout and a required requestId. The host constructs a bounded read-only prompt snapshot; local Pi Todo and remote Gateway Todo remain independent and are never updated from remote lifecycle events.",
-    "Use the returned non-secret launch receipt with the general call action for remote Monitor observe/message/cancel/result operations. Disconnecting SSH does not cancel the remote execution.",
+    "Use the returned non-secret launch receipt with the general call action for remote Monitor observe/message/cancel/result operations. Disconnecting an ordinary SSH command does not cancel a remotely resident Gateway execution; an ensure_gateway-owned daemon intentionally ends with the local Pi session.",
     "sync_pi_config accepts only a provider-owned targetId and fixed models/auth/teammate categories. The host resolves current-user files internally, transfers bounded bytes over stdin, and returns only sizes, digests, and backup receipts.",
     "",
     `Gateway actions always use the fixed remote command \`${SSH_GATEWAY_COMMAND}\`; host, authentication, command, remote cwd, raw snapshots, session ids, and callbacks are not accepted by start_pi.`,

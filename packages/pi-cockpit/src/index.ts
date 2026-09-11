@@ -132,6 +132,7 @@ import {
 	type CockpitConfig,
 } from "./types.ts";
 import type { MailboxHostRegistry } from "pi-maestro-teammate/v1/mailbox";
+import type * as ExternalAgentProjectionApi from "pi-maestro-teammate/v1/external-agent-projections";
 import {
 	buildCockpitTargetCatalogue,
 	createTargetAutocompleteProvider,
@@ -355,6 +356,8 @@ export default function (pi: ExtensionAPI): void {
 	// torn down at session_shutdown (start/dispose are idempotent), so a host
 	// reload cannot accumulate stale shared-bus listeners from old instances.
 	let settingsProviderDisposer: (() => void) | undefined;
+	let externalAgentProjectionDisposer: (() => void) | undefined;
+	let externalAgentProjectionGeneration = 0;
 	const registerSettingsProvider = (): void => {
 		if (settingsProviderDisposer) return;
 		const eventBus = {
@@ -806,6 +809,29 @@ export default function (pi: ExtensionAPI): void {
 		const globals = globalThis as typeof globalThis & Record<symbol, unknown>;
 		const candidate = globals[SESSION_HOST_REGISTRY_KEY];
 		return isSessionHostRegistryLike(candidate) ? candidate : undefined;
+	};
+
+	const disconnectExternalAgentProjections = (): void => {
+		externalAgentProjectionGeneration += 1;
+		try { externalAgentProjectionDisposer?.(); } catch { /* best effort */ }
+		externalAgentProjectionDisposer = undefined;
+		endpoints.setExternalAgents([]);
+	};
+
+	const connectExternalAgentProjections = (sessionId: string): void => {
+		disconnectExternalAgentProjections();
+		const generation = externalAgentProjectionGeneration;
+		void import("pi-maestro-teammate/v1/external-agent-projections").then((api: typeof ExternalAgentProjectionApi) => {
+			if (generation !== externalAgentProjectionGeneration) return;
+			const refresh = (): void => {
+				if (generation !== externalAgentProjectionGeneration) return;
+				endpoints.setExternalAgents(api.collectExternalAgentProjections(sessionId));
+			};
+			externalAgentProjectionDisposer = api.registerExternalAgentProjectionDirtyListener(refresh);
+			refresh();
+		}).catch(() => {
+			// Teammate is an optional peer; Cockpit remains fully functional without it.
+		});
 	};
 
 	const selectedEndpoint = (): CockpitEndpoint | undefined => {
@@ -1861,6 +1887,7 @@ export default function (pi: ExtensionAPI): void {
 			events: { on: (event, handler) => pi.events.on(event, handler) },
 			sessionId: ctx.sessionManager.getSessionId(),
 		});
+		connectExternalAgentProjections(ctx.sessionManager.getSessionId());
 		subscribeBusEvents();
 		settingsRegistry.start();
 		registerSettingsProvider();
@@ -1987,6 +2014,7 @@ export default function (pi: ExtensionAPI): void {
 			// best effort
 		}
 		settingsProviderDisposer = undefined;
+		disconnectExternalAgentProjections();
 		endpoints.disconnect();
 		compactionStylePatch?.detach();
 		compactionStylePatch = undefined;
@@ -2227,6 +2255,16 @@ export default function (pi: ExtensionAPI): void {
 			} else {
 				sessionUi.setDraft(target.id, "");
 			}
+			return { action: "handled" as const };
+		}
+
+		const selectedReadOnlyAgent = sessionUi.mode === "agent" && selectedEndpoint()?.readOnly === true
+			? selectedEndpoint()
+			: undefined;
+		if (selectedReadOnlyAgent && (interactiveText || hasImages) && !isSynthetic) {
+			sessionUi.setDraft(selectedReadOnlyAgent.id, e.text);
+			ctx.ui.notify(tuiT("notice.externalAgentReadOnly", { label: selectedReadOnlyAgent.label }), "warning");
+			ctx.ui.setEditorText(e.text);
 			return { action: "handled" as const };
 		}
 

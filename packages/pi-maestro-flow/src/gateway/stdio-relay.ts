@@ -1,7 +1,7 @@
 /** SSH-friendly stdio relay into the one local Gateway daemon. */
+import { existsSync } from "node:fs";
 import type { Readable, Writable } from "node:stream";
-import { GatewayOwnerStore } from "./owner-store.ts";
-import { connectGatewayIpc, gatewayIpcAddress } from "./ipc.ts";
+import type { GatewayOwnerStore } from "./owner-store.ts";
 import { gatewayOwnerPath } from "./state-paths.ts";
 
 export const GATEWAY_OFFLINE_MESSAGE = "Pi Maestro Gateway is offline. Start it with `pi-maestro-gateway serve`.";
@@ -27,11 +27,13 @@ export async function relayGatewayStdio(options: GatewayStdioRelayOptions = {}):
   const input = options.input ?? process.stdin;
   const output = options.output ?? process.stdout;
   const ownerPath = options.ownerPath ?? gatewayOwnerPath();
-  const store = options.ownerStore ?? new GatewayOwnerStore({ ownerPath });
+  if (!options.ownerStore && !existsSync(ownerPath)) throw new GatewayOfflineError();
+  const store = options.ownerStore ?? new (await import("./owner-store.ts")).GatewayOwnerStore({ ownerPath });
   const owner = await store.read().catch((error) => {
     throw new GatewayOfflineError(GATEWAY_OFFLINE_MESSAGE, { cause: error });
   });
   if (!owner) throw new GatewayOfflineError();
+  const { connectGatewayIpc, gatewayIpcAddress } = await import("./ipc.ts");
   const address = options.address ?? owner.socket ?? gatewayIpcAddress(undefined, ownerPath);
   let socket;
   try {

@@ -408,6 +408,45 @@ test("Agent Bar appends selected-session tool/token metrics when width allows", 
 	assert.match(plain, /1\.2k/);
 });
 
+test("Agent Bar preserves status, active tool, and metrics for a read-only external chip", () => {
+	const external: CockpitEndpoint = {
+		id: "external",
+		logicalKey: "external:ssh-gateway:remote-1",
+		kind: "agent",
+		label: "remote-builder",
+		ordinal: 1,
+		status: "running",
+		contentRevision: "external-r1",
+		routeSelector: "",
+		source: "external",
+		readOnly: true,
+		externalAgent: {
+			version: 1,
+			source: "ssh-gateway",
+			sessionId: "session",
+			id: "remote-1",
+			label: "remote-builder",
+			status: "stalled",
+			activeTool: "bash",
+			activeToolArgs: "command=git status",
+			metrics: { toolCount: 4, tokens: 2_500 },
+			updatedAt: 1,
+		},
+	};
+	const projected = [endpoints[0]!, external];
+	const state = new SessionUiState();
+	state.reconcile("agent", projected, "external");
+	const plain = stripAnsi(renderAgentBar(projected, state, 160, theme as Theme, { now: 10_000 })[0]);
+	assert.match(plain, /!▸ @remote-builder/);
+	assert.doesNotMatch(plain, /command=git status/, "stalled agents do not advertise a live tool");
+	assert.match(plain, /4 .*tools|4 .*工具/);
+	assert.match(plain, /2\.5k/);
+
+	const running = [{ ...external, externalAgent: { ...external.externalAgent!, status: "running" as const } }];
+	state.reconcile("agent", running, "external");
+	assert.match(stripAnsi(renderAgentBar(running, state, 160, theme as Theme, { now: 10_000 })[0]), /@remote-builder · bash command=git status/);
+});
+
 test("Agent Bar drops the metrics summary before the chips when width is tight", () => {
 	const withMetrics = endpoints.map((endpoint) => endpoint.kind === "agent"
 		? { ...endpoint, agentRow: { ...row, toolCount: 3, tokens: 1_200 } }

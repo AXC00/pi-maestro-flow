@@ -95,6 +95,16 @@ class FakeGatewayChannel extends Duplex {
             description: "Run bounded argv commands.",
             inputSchema: { type: "object", properties: {}, additionalProperties: true },
           },
+          {
+            name: "browser",
+            description: "Control isolated browser tabs.",
+            inputSchema: {
+              type: "object",
+              properties: { action: { type: "string", enum: ["guide", "status", "pair", "open", "run", "close"] } },
+              required: ["action"],
+              additionalProperties: false,
+            },
+          },
         ],
       });
       return;
@@ -170,6 +180,9 @@ test("ssh tool schema is a strict legacy-or-Gateway union with an object root", 
   assert.equal(SshToolParams.type, "object");
   assert.equal(Value.Check(SshToolParams, { command: "uname -a", cwd: "/srv", timeout: 5 }), true);
   assert.equal(Value.Check(SshToolParams, { action: "guide" }), true);
+  assert.equal(Value.Check(SshToolParams, { action: "ensure_gateway", timeout: 30 }), true);
+  assert.equal(Value.Check(SshToolParams, { action: "ensure_gateway", timeout: 0 }), false);
+  assert.equal(Value.Check(SshToolParams, { action: "ensure_gateway", command: "evil" }), false);
   assert.equal(Value.Check(SshToolParams, { action: "status" }), true);
   assert.equal(Value.Check(SshToolParams, { action: "list" }), true);
   assert.equal(Value.Check(SshToolParams, { action: "describe", tool: "host" }), true);
@@ -185,17 +198,17 @@ test("Gateway MCP uses the fixed command, frames list/describe/call, and reuses 
   const pool = new SshGatewayClientPool(asExecutor(executor));
   try {
     const status = await pool.execute(host, "digest-a", { action: "status" });
-    assert.equal(status.summary, "gateway connected · 2 tools");
-    assert.deepEqual((status.data as { tools: string[] }).tools, ["host", "exec"]);
+    assert.equal(status.summary, "gateway connected · 3 tools");
+    assert.deepEqual((status.data as { tools: string[] }).tools, ["host", "exec", "browser"]);
 
     const listed = await pool.execute(host, "digest-a", { action: "list" });
-    assert.equal((listed.data as { tools: unknown[] }).tools.length, 2);
-    const described = await pool.execute(host, "digest-a", { action: "describe", tool: "host" });
-    assert.equal((described.data as { name: string }).name, "host");
+    assert.equal((listed.data as { tools: unknown[] }).tools.length, 3);
+    const described = await pool.execute(host, "digest-a", { action: "describe", tool: "browser" });
+    assert.equal((described.data as { name: string }).name, "browser");
 
     const called = await pool.execute(host, "digest-a", {
       action: "call",
-      tool: "host",
+      tool: "browser",
       args: { action: "status", command: "must-not-become-ssh-command" },
       timeout: 7,
     });
@@ -204,7 +217,7 @@ test("Gateway MCP uses the fixed command, frames list/describe/call, and reuses 
     assert.deepEqual(executor.requests[0], { command: SSH_GATEWAY_COMMAND, timeout: 30 });
     const rpcCall = executor.channels[0]!.calls.find((request) => request.method === "tools/call");
     assert.deepEqual(rpcCall?.params, {
-      name: "host",
+      name: "browser",
       arguments: { action: "status", command: "must-not-become-ssh-command" },
     });
   } finally {

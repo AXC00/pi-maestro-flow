@@ -145,6 +145,7 @@ interface AgentBarTab extends SessionTab {
 function endpointStatus(endpoint: CockpitEndpoint, now: number, mainRunning: boolean): AgentBarStatus {
 	if (endpoint.kind === "root") return mainRunning ? "running" : "idle";
 	if (endpoint.agentRow) return effectiveAgentStatus(endpoint.agentRow, now);
+	if (endpoint.externalAgent) return endpoint.externalAgent.status;
 	if (endpoint.status === "sleeping") return "sleeping";
 	if (endpoint.status === "settled") return "done";
 	return "running";
@@ -289,11 +290,15 @@ export function renderAgentBar(
 			endpoint,
 			status,
 			color: endpointColor(endpoint, status, now, selected),
-			...(live && endpoint.agentRow?.activeTool
+			...(live && (endpoint.agentRow?.activeTool || endpoint.externalAgent?.activeTool)
 				? {
-					activity: endpoint.agentRow.activeToolArgs
-						? `${endpoint.agentRow.activeTool} ${endpoint.agentRow.activeToolArgs}`
-						: endpoint.agentRow.activeTool,
+					activity: endpoint.agentRow?.activeTool
+						? endpoint.agentRow.activeToolArgs
+							? `${endpoint.agentRow.activeTool} ${endpoint.agentRow.activeToolArgs}`
+							: endpoint.agentRow.activeTool
+						: endpoint.externalAgent!.activeToolArgs
+							? `${endpoint.externalAgent!.activeTool} ${endpoint.externalAgent!.activeToolArgs}`
+							: endpoint.externalAgent!.activeTool,
 				}
 				: {}),
 			...(status === "stalled" ? { attention: true } : {}),
@@ -303,10 +308,11 @@ export function renderAgentBar(
 	});
 	// Selected-session metrics summary, appended only when the chip line leaves
 	// room for it: telemetry must never squeeze the chips that carry identity.
-	const selectedRow = tabs.find((tab) => tab.id === selectedId)?.endpoint.agentRow;
+	const selectedEndpoint = tabs.find((tab) => tab.id === selectedId)?.endpoint;
+	const selectedMetrics = selectedEndpoint?.agentRow ?? selectedEndpoint?.externalAgent?.metrics;
 	const metricParts: string[] = [];
-	if (selectedRow?.toolCount !== undefined) metricParts.push(tuiT("common.tools", { count: selectedRow.toolCount }));
-	if (selectedRow?.tokens !== undefined) metricParts.push(tuiT("widget.agent.tokens", { count: formatAgentMetric(selectedRow.tokens) }));
+	if (selectedMetrics?.toolCount !== undefined) metricParts.push(tuiT("common.tools", { count: selectedMetrics.toolCount }));
+	if (selectedMetrics?.tokens !== undefined) metricParts.push(tuiT("widget.agent.tokens", { count: formatAgentMetric(selectedMetrics.tokens) }));
 	const metrics = metricParts.length > 0 ? theme.fg("muted", ` · ${metricParts.join(" · ")}`) : "";
 	return [renderSessionBarLine(
 		(availableWidth) => {

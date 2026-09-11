@@ -164,11 +164,35 @@ test("encrypted store migrates v3 at the read boundary and persists only allow-l
   assert.deepEqual(await readFile(`${path}.v3.bak`), original);
   const digest = store.getEffectiveHostDigest("host-a");
   const binding = storedBinding({ effectiveHostDigest: digest });
+  const durableBinding: SshGatewayLaunchBinding = {
+    ...storedBinding({
+      bindingId: "launch-binding-2",
+      effectiveHostDigest: digest,
+      executionHandle: "execution-2",
+      operationId: "ssh-start-operation-2",
+    }),
+    version: 2,
+    piSessionRef: "local-session-2",
+    eventCursor: 7,
+    resultCursor: 1,
+    monitorState: { status: "completed", updatedAt: NOW, toolCount: 3, tokens: 120 },
+    completion: {
+      deliveryId: "delivery-2",
+      eventId: "execution-2:7",
+      status: "completed",
+      content: "remote completed\nverified",
+      queuedAt: NOW,
+    },
+  };
   await store.saveGatewayLaunchBinding(binding);
+  await store.saveGatewayLaunchBinding(durableBinding);
   store.lock(); await store.unlock("password");
   assert.deepEqual(store.getGatewayLaunchBinding("host-a", binding.bindingId), binding);
+  assert.deepEqual(store.getGatewayLaunchBinding("host-a", durableBinding.bindingId), durableBinding);
+  assert.deepEqual(store.getGatewayLaunchBindings("local-session-2"), [durableBinding]);
   for (const secretField of ["token", "prompt", "message", "rawCommand"] as const) {
     assert.throws(() => validateSshGatewayLaunchBinding({ ...binding, [secretField]: "secret" }), /unsupported field/);
+    assert.throws(() => validateSshGatewayLaunchBinding({ ...durableBinding, [secretField]: "secret" }), /unsupported field/);
   }
   assert.doesNotMatch(await readFile(path, "utf8"), /execution-1|ssh-start-operation-1|secret/);
   store.lock();

@@ -41,12 +41,21 @@ const SshTargetedCommandToolParams = Type.Object({
 }, { additionalProperties: false });
 
 const gatewayToolName = Type.String({ minLength: 1, maxLength: 128 });
-const sshAction = <T extends "guide" | "targets" | "status" | "list" | "describe" | "call" | "start_pi" | "sync_pi_config">(action: T) => Type.Literal(action);
+const sshAction = <T extends "guide" | "targets" | "ensure_gateway" | "status" | "list" | "describe" | "call" | "start_pi" | "sync_pi_config">(action: T) => Type.Literal(action);
 
 export const SshToolParams = Type.Union([
   SshTargetedCommandToolParams,
   Type.Object({ action: sshAction("guide") }, { additionalProperties: false }),
   Type.Object({ action: sshAction("targets") }, { additionalProperties: false }),
+  Type.Object({
+    action: sshAction("ensure_gateway"),
+    targetId: sshTargetId(),
+    timeout: Type.Optional(Type.Integer({
+      minimum: 1,
+      maximum: MAX_SSH_TIMEOUT_SECONDS,
+      description: "Seconds to wait for the session-scoped remote Gateway to become ready (default 30, maximum 300)",
+    })),
+  }, { additionalProperties: false }),
   Type.Object({ action: sshAction("status"), targetId: sshTargetId() }, { additionalProperties: false }),
   Type.Object({ action: sshAction("list"), targetId: sshTargetId() }, { additionalProperties: false }),
   Type.Object({
@@ -92,7 +101,7 @@ export const SshToolParams = Type.Union([
   }, { additionalProperties: false }),
 ], {
   type: "object",
-  description: "List unlocked SSH targets, execute a legacy command, or use the built-in Gateway. targetId selects a provider-owned configured server; omission works only when exactly one #ssh server is attached and errors for none or multiple. Host, authentication, and Gateway command parameters are never accepted. For dynamic Gateway calls, use action=describe tool=<name> to retrieve the authoritative inputSchema before action=call. session.start-pi returns taskId and monitorHandle; pass either value as monitor.handle."
+  description: "List unlocked SSH targets, execute a legacy command, or use the built-in Gateway. ensure_gateway may start a non-persistent remote daemon tied to the current local Pi session. targetId selects a provider-owned configured server; omission works only when exactly one #ssh server is attached and errors for none or multiple. Host, authentication, and Gateway command parameters are never accepted. For dynamic Gateway calls, use action=describe tool=<name> to retrieve the authoritative inputSchema before action=call. session.start-pi returns taskId and monitorHandle; pass either value as monitor.handle."
 });
 
 export type SshCommandToolInput = Static<typeof SshCommandToolParams>;

@@ -23,6 +23,7 @@ import {
   testAndTrustSshHost,
 } from "../src/ssh-manager/extension.ts";
 import type { SshExecutionResult, SshExecutor } from "../src/ssh-manager/executor.ts";
+import type { SshGatewayBootstrapManager } from "../src/ssh-manager/gateway-bootstrap.ts";
 import type { SshGatewayClientPool, SshGatewayInput } from "../src/ssh-manager/gateway-client.ts";
 import type { SshStatusMonitor } from "../src/ssh-manager/status-monitor.ts";
 import type { SshHost } from "../src/ssh-manager/model.ts";
@@ -271,6 +272,23 @@ test("independent SSH extension binds #ssh selection to a hostless tool without 
   const gatewayExecutions: Array<{ hostId: string; input: SshGatewayInput }> = [];
   const invalidatedGatewayHosts: string[] = [];
   let gatewayCloseCount = 0;
+  const bootstrapEnsures: Array<{ hostId: string; digest: string; fence: string; timeout?: number }> = [];
+  const bootstrapInvalidatedHosts: string[] = [];
+  let bootstrapClosed = false;
+  let bootstrapCloseCount = 0;
+  const gatewayBootstrap = {
+    async ensure(selectedHost: SshHost, digest: string, fence: string, _probe: unknown, input: { timeoutSeconds?: number }) {
+      bootstrapEnsures.push({ hostId: selectedHost.id, digest, fence, timeout: input.timeoutSeconds });
+      return { ready: true, started: true, ownership: "local-session" as const };
+    },
+    async invalidateHost(hostId: string) { bootstrapInvalidatedHosts.push(hostId); },
+    async invalidateAll() {},
+    async close() {
+      if (bootstrapClosed) return;
+      bootstrapClosed = true;
+      bootstrapCloseCount += 1;
+    },
+  } as unknown as SshGatewayBootstrapManager;
   const gatewayPool = {
     async execute(selectedHost: SshHost, _digest: string, input: SshGatewayInput) {
       gatewayExecutions.push({ hostId: selectedHost.id, input });
@@ -282,6 +300,9 @@ test("independent SSH extension binds #ssh selection to a hostless tool without 
         durationMs: 2,
       };
     },
+    setMonitorSink() {},
+    async resumeMonitorSession() {},
+    async pauseMonitorSession() {},
     async invalidateHost(hostId: string) { invalidatedGatewayHosts.push(hostId); },
     async close() { gatewayCloseCount += 1; },
   } as unknown as SshGatewayClientPool;
@@ -329,7 +350,7 @@ test("independent SSH extension binds #ssh selection to a hostless tool without 
   } as unknown as ExtensionContext;
 
   try {
-    registerSshManager(api, { store, executor, gatewayPool, configSource, configSyncTransport, configSyncAudit: { record(event) { syncAudit.push(event); } } });
+    registerSshManager(api, { store, executor, gatewayPool, gatewayBootstrap, configSource, configSyncTransport, configSyncAudit: { record(event) { syncAudit.push(event); } } });
     assert.ok(getSshHostProvider());
     assert.equal(typeof getSshHostProvider()?.openTeammateRemoteChannel, "function");
     assert.deepEqual(await listSshHostRefs(), [{
@@ -364,6 +385,9 @@ test("independent SSH extension binds #ssh selection to a hostless tool without 
     assert.equal(Value.Check(tool.parameters, { command: "id", cwd: "/srv", timeout: 5 }), true);
     assert.equal(Value.Check(tool.parameters, { command: "id", targetId: "server-1" }), true);
     assert.equal(Value.Check(tool.parameters, { action: "targets" }), true);
+    assert.equal(Value.Check(tool.parameters, { action: "ensure_gateway", targetId: "server-1", timeout: 30 }), true);
+    assert.equal(Value.Check(tool.parameters, { action: "ensure_gateway", targetId: "server-1", command: "evil" }), false);
+    assert.equal(Value.Check(tool.parameters, { action: "ensure_gateway", timeout: 0 }), false);
     assert.equal(Value.Check(tool.parameters, { action: "status" }), true);
     assert.equal(Value.Check(tool.parameters, { action: "status", targetId: "server-1" }), true);
     assert.equal(Value.Check(tool.parameters, { action: "sync_pi_config", targetId: "server-1", categories: ["models", "auth"] }), true);
@@ -375,6 +399,7 @@ test("independent SSH extension binds #ssh selection to a hostless tool without 
     const guide = await tool.execute("ssh-guide", { action: "guide" }, new AbortController().signal);
     assert.equal(guide.isError, undefined);
     assert.match((guide.content[0] as { text: string }).text, /pi-maestro-gateway serve/);
+    assert.match((guide.content[0] as { text: string }).text, /ensure_gateway.*non-persistent/u);
     assert.deepEqual(gatewayExecutions, [], "the local guide does not contact SSH");
 
     const input = handlers.get("input")![0]!;
@@ -405,6 +430,7 @@ test("independent SSH extension binds #ssh selection to a hostless tool without 
     const context = await before({ systemPrompt: "base" }, ctx);
     assert.match(context.systemPrompt, /"id":"server-1","label":"Production","shell":"bash"/);
     assert.match(context.systemPrompt, /attachments do not select or configure teammate routing/);
+    assert.match(context.systemPrompt, /ensure_gateway can start a non-persistent remote Gateway/u);
     assert.match(context.systemPrompt, /Remote Monitor calls use the returned launch receipt/);
     assert.match(context.systemPrompt, /Never use remote-worker/);
     assert.doesNotMatch(context.systemPrompt, /192\.0\.2\.10|deploy|encrypted-secret|SHA256/);
@@ -434,6 +460,20 @@ test("independent SSH extension binds #ssh selection to a hostless tool without 
     assert.equal(syncFailure.isError, true);
     assert.doesNotMatch(JSON.stringify(syncFailure), new RegExp(syncSentinel));
     failSync = false;
+
+    const ensured = await tool.execute("ssh-gateway-ensure", { action: "ensure_gateway", targetId: "server-1", timeout: 12 }, new AbortController().signal);
+    assert.equal(ensured.isError, undefined);
+    assert.deepEqual(JSON.parse((ensured.content[0] as { text: string }).text), {
+      ready: true,
+      started: true,
+      ownership: "local-session",
+    });
+    assert.equal((ensured.details as { summary?: string }).summary, "gateway started · local-session");
+    assert.equal(bootstrapEnsures.length, 1);
+    assert.equal(bootstrapEnsures[0]!.hostId, "server-1");
+    assert.equal(bootstrapEnsures[0]!.timeout, 12);
+    assert.match(bootstrapEnsures[0]!.digest, /^[a-f0-9]{64}$/u);
+    assert.match(bootstrapEnsures[0]!.fence, /^[a-f0-9]{64}$/u);
 
     const gatewayStatus = await tool.execute("ssh-gateway", { action: "status" }, new AbortController().signal);
     assert.equal(gatewayStatus.isError, undefined);
@@ -488,6 +528,8 @@ test("independent SSH extension binds #ssh selection to a hostless tool without 
     await shutdown({}, ctx);
     assert.equal(getSshHostProvider(), undefined);
     assert.equal(gatewayCloseCount, 1);
+    assert.equal(bootstrapCloseCount, 1);
+    assert.ok(bootstrapInvalidatedHosts.includes("server-1"), "session reset retires the selected host bootstrap channel");
   } finally {
     await handlers.get("session_shutdown")?.[0]?.({}, ctx);
     store.lock();
@@ -536,6 +578,9 @@ test("unlocked SSH manager exposes all provider-owned targets without requiring 
         durationMs: 1,
       };
     },
+    setMonitorSink() {},
+    async resumeMonitorSession() {},
+    async pauseMonitorSession() {},
     async invalidateHost() {},
     async close() {},
   } as unknown as SshGatewayClientPool;
@@ -703,6 +748,9 @@ test("SSH lock and shutdown fence new target access before asynchronous Gateway 
     const closeGate = new Promise<void>((resolve) => { releaseClose = resolve; });
     const closeStarted = new Promise<void>((resolve) => { markCloseStarted = resolve; });
     const gatewayPool = {
+      setMonitorSink() {},
+      async resumeMonitorSession() {},
+      async pauseMonitorSession() {},
       async execute() { throw new Error("unexpected Gateway execution"); },
       async invalidateHost() {},
       async close() {
@@ -741,6 +789,7 @@ test("SSH lock and shutdown fence new target access before asynchronous Gateway 
       assert.match((targets.content[0] as { text: string }).text, /SSH manager is locked/u);
       releaseClose();
       await pending;
+      assert.equal(store.locked, true, `${mode} must finish with the store locked`);
     } finally {
       releaseClose();
       await handlers.get("session_shutdown")?.[0]?.({}, ctx);

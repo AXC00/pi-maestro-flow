@@ -24,10 +24,20 @@ import {
   gatewayOperationMayReplay,
   type GatewayOperationPolicy,
 } from "../gateway/operation-policy.ts";
+import {
+  GATEWAY_EVENT_NOTIFICATION_METHOD,
+  type GatewayEventGap,
+  type GatewayEventNotification,
+} from "../gateway/event-contracts.ts";
 
 const DEFAULT_POOL_SIZE = 4;
 const MAX_STDIO_BUFFER_BYTES = 4 * 1024 * 1024;
 const MAX_STDERR_BYTES = 8 * 1024;
+const MONITOR_STREAM_FEATURE = "monitor-stream-v1";
+const MONITOR_RECONNECT_MIN_MS = 250;
+const MONITOR_RECONNECT_MAX_MS = 5_000;
+const MONITOR_RENEW_WINDOW_MS = 30_000;
+const MAX_BUFFERED_MONITOR_NOTIFICATIONS = 128;
 
 export type SshGatewayInput =
   | { action: "guide" }
@@ -78,15 +88,64 @@ const MCP_LIST_OPERATION: GatewayOperationPolicy = { retryClass: "read", tool: "
 interface GatewayPoolEntry {
   readonly key: string;
   readonly hostId: string;
+  readonly hostDigest: string;
   readonly client: Client;
   readonly transport: Transport;
   readonly mode: "https" | "stdio";
   readonly endpointIdentity: string;
 }
 
+export interface SshGatewayMonitorEvent {
+  readonly binding: Extract<SshGatewayLaunchBinding, { version: 2 }>;
+  readonly notification: GatewayEventNotification["params"];
+}
+
+export interface SshGatewayMonitorGap {
+  readonly binding: Extract<SshGatewayLaunchBinding, { version: 2 }>;
+  readonly gap: GatewayEventGap;
+}
+
+export interface SshGatewayMonitorStatus {
+  readonly binding: Extract<SshGatewayLaunchBinding, { version: 2 }>;
+  readonly status: "connected" | "reconnecting" | "unsupported" | "error";
+  readonly error?: string;
+}
+
+export interface SshGatewayMonitorSink {
+  onEvent(event: SshGatewayMonitorEvent): void | Promise<void>;
+  onGap?(event: SshGatewayMonitorGap): void | Promise<void>;
+  onStatus?(event: SshGatewayMonitorStatus): void | Promise<void>;
+}
+
+export interface SshGatewayResumeTarget {
+  readonly host: SshHost;
+  readonly effectiveDigest: string;
+  readonly cacheFence?: string;
+}
+
+interface DesiredMonitor {
+  readonly bindingId: string;
+  readonly generation: number;
+  readonly piSessionRef: string;
+  readonly host: SshHost;
+  readonly effectiveDigest: string;
+  readonly cacheFence: string;
+  readonly timeoutSeconds: number;
+}
+
+interface ActiveMonitorSubscription {
+  readonly subscriptionId: string;
+  readonly bindingId: string;
+  readonly generation: number;
+  readonly handle: string;
+  readonly entry: GatewayPoolEntry;
+  tail: Promise<void>;
+}
+
 export interface SshGatewayBindingSource extends Partial<GatewayLaunchBindingPersistence> {
   getGatewayBinding(hostId: string): SshGatewayBinding | undefined;
   getGatewayLaunchBinding?(hostId: string, bindingId: string): SshGatewayLaunchBinding | undefined;
+  getGatewayLaunchBindings?(piSessionRef?: string): SshGatewayLaunchBinding[];
 }
 
 export interface SshGatewayClientPoolOptions {
@@ -95,6 +154,7 @@ export interface SshGatewayClientPoolOptions {
   fetch?: typeof fetch;
   now?: () => number;
   observer?: GatewayObservationSink;
+  monitorSink?: SshGatewayMonitorSink;
 }
 
 /** A bounded pool of initialized MCP clients, isolated by SSH host id and full host digest. */
@@ -108,6 +168,15 @@ export class SshGatewayClientPool {
   private readonly bindingSource?: SshGatewayBindingSource;
   private readonly fetchImpl: typeof fetch;
   private readonly now: () => number;
+  private monitorSink?: SshGatewayMonitorSink;
+  private readonly desiredMonitors = new Map<string, DesiredMonitor>();
+  private readonly monitorSubscriptions = new Map<string, ActiveMonitorSubscription>();
+  private readonly monitorSubscriptionByBinding = new Map<string, string>();
+  private readonly bufferedMonitorNotifications = new Map<string, GatewayEventNotification["params"][]>();
+  private readonly reconnectTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  private readonly reconnectAttempts = new Map<string, number>();
+  private readonly renewalTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  private pendingMonitorSubscriptions = 0;
   readonly observer: GatewayObservationSink;
 
   constructor(
@@ -123,6 +192,7 @@ export class SshGatewayClientPool {
     this.fetchImpl = options.fetch ?? fetch;
     this.now = options.now ?? (() => Date.now());
     this.observer = options.observer ?? new GatewayObserver();
+    this.monitorSink = options.monitorSink;
     const persistence = options.bindingSource
       && options.bindingSource.getGatewayLaunchBinding
       && options.bindingSource.saveGatewayLaunchBinding
@@ -133,6 +203,41 @@ export class SshGatewayClientPool {
 
   get size(): number {
     return this.entries.size;
+  }
+
+  setMonitorSink(sink: SshGatewayMonitorSink | undefined): void {
+    this.monitorSink = sink;
+  }
+
+  async resumeMonitorSession(piSessionRef: string, targets: readonly SshGatewayResumeTarget[]): Promise<void> {
+    if (!this.monitorSink || !this.bindingSource?.getGatewayLaunchBindings) return;
+    const byHost = new Map(targets.map((target) => [target.host.id, target]));
+    const bindings = this.bindingSource.getGatewayLaunchBindings(piSessionRef)
+      .filter((binding): binding is Extract<SshGatewayLaunchBinding, { version: 2 }> => binding.version === 2);
+    for (const binding of bindings) {
+      const target = byHost.get(binding.hostId);
+      if (!target || target.effectiveDigest !== binding.effectiveHostDigest) continue;
+      const desired = this.desiredFor(binding, target.host, target.effectiveDigest, target.cacheFence ?? target.effectiveDigest, DEFAULT_SSH_TIMEOUT_SECONDS);
+      this.desiredMonitors.set(binding.bindingId, desired);
+      await this.ensureMonitorSubscription(desired).catch((error) => {
+        void this.publishMonitorStatus(binding, "error", error);
+        this.scheduleMonitorReconnect(binding.hostId);
+      });
+    }
+  }
+
+  async pauseMonitorSession(piSessionRef: string): Promise<void> {
+    const bindingIds = [...this.desiredMonitors.values()]
+      .filter((desired) => desired.piSessionRef === piSessionRef)
+      .map((desired) => desired.bindingId);
+    await Promise.all(bindingIds.map((bindingId) => this.unsubscribeBinding(bindingId)));
+    for (const bindingId of bindingIds) this.desiredMonitors.delete(bindingId);
+    for (const [hostId, timer] of this.reconnectTimers) {
+      if ([...this.desiredMonitors.values()].some((desired) => desired.host.id === hostId)) continue;
+      clearTimeout(timer);
+      this.reconnectTimers.delete(hostId);
+      this.reconnectAttempts.delete(hostId);
+    }
   }
 
   async execute(
@@ -192,7 +297,17 @@ export class SshGatewayClientPool {
         async (tool, args, timeout, requestSignal) => decodeGatewayEnvelope(await callGateway(tool, args, timeout, requestSignal)),
         host.id, effectiveDigest, startPiContext.piSessionRef, startPiContext.todos, input, signal, entry.endpointIdentity,
       );
-      summary = `Pi execution ${(data as { executionHandle: string }).executionHandle} · monitor ready`;
+      const launch = data as { binding: { bindingId: string; generation: number; piSessionRef: string }; executionHandle: string };
+      const stored = this.bindingSource?.getGatewayLaunchBinding?.(host.id, launch.binding.bindingId);
+      if (this.monitorSink && stored?.version === 2) {
+        const desired = this.desiredFor(stored, host, effectiveDigest, cacheFence, timeoutSeconds);
+        this.desiredMonitors.set(stored.bindingId, desired);
+        await this.subscribeMonitor(entry, desired).catch((error) => {
+          void this.publishMonitorStatus(stored, "error", error);
+          this.scheduleMonitorReconnect(host.id);
+        });
+      }
+      summary = `Pi execution ${launch.executionHandle} · monitor ready`;
     } else if (input.action === "status") {
       const listed = await invoke((client) => client.listTools({}, requestOptions), MCP_LIST_OPERATION);
       data = { connected: true, command: SSH_GATEWAY_COMMAND, server: entry.client.getServerVersion(), tools: listed.tools.map((tool) => tool.name) };
@@ -224,7 +339,9 @@ export class SshGatewayClientPool {
       );
       data = result;
       isError = result.isError === true;
-      if (!isError && input.tool === "monitor") await this.launches.updateMonitorCursor(prepared.record, decodeGatewayEnvelope(result));
+      if (!isError && input.tool === "monitor" && (prepared.args.action === "observe" || prepared.args.action === "result")) {
+        await this.launches.updateMonitorCursor(prepared.record, decodeGatewayEnvelope(result), prepared.args.action);
+      }
       summary = `${input.tool} · ${isError ? "failed" : "completed"}`;
     }
 
@@ -243,6 +360,11 @@ export class SshGatewayClientPool {
     this.hostEpochs.set(hostId, (this.hostEpochs.get(hostId) ?? 0) + 1);
     this.launches.invalidateHost(hostId);
     this.hostFences.delete(hostId);
+    for (const [bindingId, desired] of this.desiredMonitors) if (desired.host.id === hostId) this.desiredMonitors.delete(bindingId);
+    const reconnectTimer = this.reconnectTimers.get(hostId);
+    if (reconnectTimer) clearTimeout(reconnectTimer);
+    this.reconnectTimers.delete(hostId);
+    this.reconnectAttempts.delete(hostId);
     const prefix = `${hostId}\0`;
     const matches = [...this.entries.entries()].filter(([key]) => key.startsWith(prefix));
     for (const [key] of matches) this.entries.delete(key);
@@ -251,6 +373,15 @@ export class SshGatewayClientPool {
 
   async close(): Promise<void> {
     this.poolEpoch += 1;
+    for (const timer of this.reconnectTimers.values()) clearTimeout(timer);
+    for (const timer of this.renewalTimers.values()) clearTimeout(timer);
+    this.reconnectTimers.clear();
+    this.reconnectAttempts.clear();
+    this.renewalTimers.clear();
+    this.desiredMonitors.clear();
+    this.monitorSubscriptions.clear();
+    this.monitorSubscriptionByBinding.clear();
+    this.bufferedMonitorNotifications.clear();
     const pending = [...this.entries.values()];
     this.entries.clear();
     this.launches.clear();
@@ -376,11 +507,16 @@ export class SshGatewayClientPool {
     });
     this.bindDisconnect(key, transport);
     const client = new Client({ name: "pi-maestro-flow-ssh", version: "1" });
+    let entry: GatewayPoolEntry | undefined;
+    client.fallbackNotificationHandler = async (notification) => {
+      if (entry) await this.handleMonitorNotification(entry, notification);
+    };
     try {
       await client.connect(transport, { signal: requestController.signal, timeout: timeoutSeconds * 1000, maxTotalTimeout: timeoutSeconds * 1000 });
       await verifyGatewayIdentity(client, { signal: requestController.signal, timeout: timeoutSeconds * 1000, maxTotalTimeout: timeoutSeconds * 1000 });
       this.observer.observe({ category: "transport", event: "connect", transport: "https" });
-      return { key, hostId, client, transport, mode: "https", endpointIdentity: gatewayEndpointIdentity(binding) };
+      entry = { key, hostId, hostDigest: binding.effectiveHostDigest, client, transport, mode: "https", endpointIdentity: gatewayEndpointIdentity(binding) };
+      return entry;
     } catch (error) {
       await client.close().catch(() => transport.close());
       throw error;
@@ -398,11 +534,16 @@ export class SshGatewayClientPool {
     }
     const transport = new SshGatewayTransport(handle, () => this.dropDisconnected(key, transport));
     const client = new Client({ name: "pi-maestro-flow-ssh", version: "1" });
+    let entry: GatewayPoolEntry | undefined;
+    client.fallbackNotificationHandler = async (notification) => {
+      if (entry) await this.handleMonitorNotification(entry, notification);
+    };
     try {
       await client.connect(transport, { signal, timeout: timeoutSeconds * 1000, maxTotalTimeout: timeoutSeconds * 1000 });
       await verifyGatewayIdentity(client, { signal, timeout: timeoutSeconds * 1000, maxTotalTimeout: timeoutSeconds * 1000 });
       this.observer.observe({ category: "transport", event: "connect", transport: "stdio" });
-      return { key, hostId: host.id, client, transport, mode: "stdio", endpointIdentity: gatewayEndpointIdentity() };
+      entry = { key, hostId: host.id, hostDigest: effectiveDigest, client, transport, mode: "stdio", endpointIdentity: gatewayEndpointIdentity() };
+      return entry;
     } catch (error) {
       await client.close().catch(() => transport.close());
       throw error;
@@ -418,13 +559,18 @@ export class SshGatewayClientPool {
     const current = this.entries.get(key);
     if (!current) return;
     void current.then((entry) => {
-      if (entry.transport === transport && this.entries.get(key) === current) this.entries.delete(key);
+      if (entry.transport !== transport || this.entries.get(key) !== current) return;
+      this.entries.delete(key);
+      this.retireMonitorSubscriptions(entry);
+      this.scheduleMonitorReconnect(entry.hostId);
     }, () => { if (this.entries.get(key) === current) this.entries.delete(key); });
   }
 
   private async retireEntry(entry: GatewayPoolEntry): Promise<void> {
     const pending = this.entries.get(entry.key);
     if (pending) this.entries.delete(entry.key);
+    this.retireMonitorSubscriptions(entry);
+    this.scheduleMonitorReconnect(entry.hostId);
     await entry.client.close().catch(() => entry.transport.close());
   }
 
@@ -441,10 +587,332 @@ export class SshGatewayClientPool {
     return entry;
   }
 
+  private desiredFor(
+    binding: Extract<SshGatewayLaunchBinding, { version: 2 }>,
+    host: SshHost,
+    effectiveDigest: string,
+    cacheFence: string,
+    timeoutSeconds: number,
+  ): DesiredMonitor {
+    return {
+      bindingId: binding.bindingId,
+      generation: binding.generation,
+      piSessionRef: binding.piSessionRef,
+      host: structuredClone(host),
+      effectiveDigest,
+      cacheFence,
+      timeoutSeconds,
+    };
+  }
+
+  private async ensureMonitorSubscription(desired: DesiredMonitor): Promise<void> {
+    const entry = await this.acquire(desired.host, desired.effectiveDigest, desired.cacheFence, desired.timeoutSeconds);
+    await this.subscribeMonitor(entry, desired);
+  }
+
+  private async subscribeMonitor(entry: GatewayPoolEntry, desired: DesiredMonitor): Promise<void> {
+    const currentSubscriptionId = this.monitorSubscriptionByBinding.get(desired.bindingId);
+    const currentSubscription = currentSubscriptionId ? this.monitorSubscriptions.get(currentSubscriptionId) : undefined;
+    if (currentSubscription?.entry === entry) return;
+    if (!this.monitorSink) return;
+    const capabilities = entry.client.getServerCapabilities();
+    const experimental = capabilities?.experimental as Record<string, unknown> | undefined;
+    const binding = this.bindingSource?.getGatewayLaunchBinding?.(entry.hostId, desired.bindingId);
+    if (!binding || binding.version !== 2 || binding.generation !== desired.generation) {
+      throw new Error("SSH launch Monitor binding is unavailable");
+    }
+    if (binding.effectiveHostDigest !== desired.effectiveDigest || binding.endpointIdentity !== entry.endpointIdentity) {
+      throw new Error("SSH launch Monitor connection fence changed");
+    }
+    if (!experimental || !(MONITOR_STREAM_FEATURE in experimental)) {
+      await this.publishMonitorStatus(binding, "unsupported");
+      return;
+    }
+    const caller = async (tool: string, args: Record<string, unknown>, timeout: number, signal?: AbortSignal): Promise<unknown> => {
+      const result = await entry.client.callTool(
+        { name: tool, arguments: args },
+        undefined,
+        { signal, timeout: timeout * 1000, maxTotalTimeout: timeout * 1000 },
+      );
+      return decodeGatewayEnvelope(result);
+    };
+    const fence = { bindingId: binding.bindingId, generation: binding.generation };
+    const launchArgs = {
+      action: "subscribe",
+      sessionId: binding.gatewaySessionId,
+      memberId: binding.gatewayMemberId,
+      handle: binding.executionHandle,
+      cursor: binding.eventCursor,
+      _sshLaunch: fence,
+    };
+    await this.launches.restoreMonitorBinding(caller, entry.hostId, desired.effectiveDigest, entry.endpointIdentity, launchArgs, desired.timeoutSeconds);
+    const prepared = this.launches.prepareMonitorCall(entry.hostId, desired.effectiveDigest, launchArgs);
+    await this.launches.refreshMonitorLease(caller, prepared.record, desired.timeoutSeconds);
+    const currentBinding = this.bindingSource?.getGatewayLaunchBinding?.(entry.hostId, desired.bindingId);
+    if (!currentBinding || currentBinding.version !== 2 || currentBinding.generation !== desired.generation) {
+      throw new Error("SSH launch Monitor binding changed during subscription");
+    }
+    this.pendingMonitorSubscriptions += 1;
+    let envelope: unknown;
+    try {
+      envelope = await caller("monitor", prepared.args, desired.timeoutSeconds);
+    } finally {
+      this.pendingMonitorSubscriptions -= 1;
+    }
+    const subscription = parseMonitorSubscription(envelope, currentBinding.executionHandle, currentBinding.gatewayPrincipalId);
+    if (currentSubscription) {
+      this.monitorSubscriptions.delete(currentSubscription.subscriptionId);
+      if (this.monitorSubscriptionByBinding.get(currentSubscription.bindingId) === currentSubscription.subscriptionId) {
+        this.monitorSubscriptionByBinding.delete(currentSubscription.bindingId);
+      }
+      await this.unsubscribeSubscription(currentSubscription);
+    }
+    const active: ActiveMonitorSubscription = {
+      subscriptionId: subscription.subscriptionId,
+      bindingId: binding.bindingId,
+      generation: binding.generation,
+      handle: currentBinding.executionHandle,
+      entry,
+      tail: Promise.resolve(),
+    };
+    this.monitorSubscriptions.set(active.subscriptionId, active);
+    this.monitorSubscriptionByBinding.set(active.bindingId, active.subscriptionId);
+    this.reconnectAttempts.delete(entry.hostId);
+    await this.publishMonitorStatus(currentBinding, "connected");
+    if (subscription.gap) {
+      await this.monitorSink.onGap?.({ binding: currentBinding, gap: subscription.gap });
+      await this.launches.advanceEventCursor(entry.hostId, desired.effectiveDigest, currentBinding.bindingId, currentBinding.generation, subscription.gap.resumeCursor, true);
+    }
+    const buffered = this.bufferedMonitorNotifications.get(active.subscriptionId) ?? [];
+    this.bufferedMonitorNotifications.delete(active.subscriptionId);
+    for (const notification of buffered) this.enqueueMonitorNotification(active, notification);
+    this.scheduleMonitorRenewal(currentBinding);
+  }
+
+  private async handleMonitorNotification(entry: GatewayPoolEntry, notification: unknown): Promise<void> {
+    const parsed = parseMonitorNotification(notification);
+    if (!parsed) return;
+    const active = this.monitorSubscriptions.get(parsed.subscriptionId);
+    if (!active) {
+      if (this.pendingMonitorSubscriptions <= 0) return;
+      const buffered = this.bufferedMonitorNotifications.get(parsed.subscriptionId) ?? [];
+      if (buffered.length < MAX_BUFFERED_MONITOR_NOTIFICATIONS) buffered.push(parsed);
+      this.bufferedMonitorNotifications.set(parsed.subscriptionId, buffered);
+      return;
+    }
+    if (active.entry !== entry || active.handle !== parsed.handle) return;
+    this.enqueueMonitorNotification(active, parsed);
+  }
+
+  private enqueueMonitorNotification(active: ActiveMonitorSubscription, notification: GatewayEventNotification["params"]): void {
+    active.tail = active.tail.then(async () => {
+      const desired = this.desiredMonitors.get(active.bindingId);
+      const binding = desired && this.bindingSource?.getGatewayLaunchBinding?.(desired.host.id, active.bindingId);
+      if (!desired || !binding || binding.version !== 2 || binding.generation !== active.generation) return;
+      if (notification.cursor <= binding.eventCursor) return;
+      if (notification.cursor !== binding.eventCursor + 1) {
+        await this.monitorSink?.onGap?.({
+          binding,
+          gap: {
+            reason: "connection-closed",
+            fromCursor: binding.eventCursor + 1,
+            toCursor: notification.cursor - 1,
+            resumeCursor: binding.eventCursor,
+          },
+        });
+        await this.unsubscribeBinding(binding.bindingId);
+        this.scheduleMonitorReconnect(binding.hostId);
+        return;
+      }
+      await this.monitorSink?.onEvent({ binding, notification });
+      await this.launches.advanceEventCursor(binding.hostId, binding.effectiveHostDigest, binding.bindingId, binding.generation, notification.cursor);
+    }).catch(async (error) => {
+      const desired = this.desiredMonitors.get(active.bindingId);
+      const binding = desired && this.bindingSource?.getGatewayLaunchBinding?.(desired.host.id, active.bindingId);
+      if (binding?.version === 2) await this.publishMonitorStatus(binding, "error", error);
+      await this.unsubscribeBinding(active.bindingId);
+      if (desired) this.scheduleMonitorReconnect(desired.host.id);
+    });
+  }
+
+  private retireMonitorSubscriptions(entry: GatewayPoolEntry): void {
+    for (const subscription of [...this.monitorSubscriptions.values()]) {
+      if (subscription.entry !== entry) continue;
+      this.monitorSubscriptions.delete(subscription.subscriptionId);
+      if (this.monitorSubscriptionByBinding.get(subscription.bindingId) === subscription.subscriptionId) {
+        this.monitorSubscriptionByBinding.delete(subscription.bindingId);
+      }
+      const desired = this.desiredMonitors.get(subscription.bindingId);
+      const binding = desired && this.bindingSource?.getGatewayLaunchBinding?.(desired.host.id, subscription.bindingId);
+      if (binding?.version === 2) void this.publishMonitorStatus(binding, "reconnecting");
+    }
+  }
+
+  private async unsubscribeBinding(bindingId: string): Promise<void> {
+    const timer = this.renewalTimers.get(bindingId);
+    if (timer) clearTimeout(timer);
+    this.renewalTimers.delete(bindingId);
+    const subscriptionId = this.monitorSubscriptionByBinding.get(bindingId);
+    if (!subscriptionId) return;
+    const subscription = this.monitorSubscriptions.get(subscriptionId);
+    this.monitorSubscriptionByBinding.delete(bindingId);
+    this.monitorSubscriptions.delete(subscriptionId);
+    if (subscription) await this.unsubscribeSubscription(subscription);
+  }
+
+  private async unsubscribeSubscription(subscription: ActiveMonitorSubscription): Promise<void> {
+    const desired = this.desiredMonitors.get(subscription.bindingId);
+    const binding = desired && this.bindingSource?.getGatewayLaunchBinding?.(desired.host.id, subscription.bindingId);
+    if (!binding || binding.version !== 2) return;
+    await subscription.entry.client.callTool({
+      name: "monitor",
+      arguments: {
+        action: "unsubscribe",
+        sessionId: binding.gatewaySessionId,
+        memberId: binding.gatewayMemberId,
+        subscriptionId: subscription.subscriptionId,
+      },
+    }, undefined, { timeout: 5_000, maxTotalTimeout: 5_000 }).catch(() => undefined);
+  }
+
+  private scheduleMonitorReconnect(hostId: string): void {
+    if (!this.monitorSink || this.reconnectTimers.has(hostId)) return;
+    const desired = [...this.desiredMonitors.values()].filter((candidate) => candidate.host.id === hostId);
+    if (desired.length === 0) return;
+    const attempt = this.reconnectAttempts.get(hostId) ?? 0;
+    const delay = Math.min(MONITOR_RECONNECT_MAX_MS, MONITOR_RECONNECT_MIN_MS * 2 ** attempt);
+    const epoch = this.poolEpoch;
+    const timer = setTimeout(() => {
+      this.reconnectTimers.delete(hostId);
+      if (epoch !== this.poolEpoch) return;
+      void (async () => {
+        try {
+          const entry = await this.acquire(desired[0]!.host, desired[0]!.effectiveDigest, desired[0]!.cacheFence, desired[0]!.timeoutSeconds);
+          for (const candidate of desired) await this.subscribeMonitor(entry, candidate);
+          this.reconnectAttempts.delete(hostId);
+        } catch (error) {
+          this.reconnectAttempts.set(hostId, Math.min(attempt + 1, 8));
+          for (const candidate of desired) {
+            const binding = this.bindingSource?.getGatewayLaunchBinding?.(hostId, candidate.bindingId);
+            if (binding?.version === 2) await this.publishMonitorStatus(binding, "error", error);
+          }
+          this.scheduleMonitorReconnect(hostId);
+        }
+      })();
+    }, delay);
+    timer.unref?.();
+    this.reconnectTimers.set(hostId, timer);
+  }
+
+  private scheduleMonitorRenewal(binding: Extract<SshGatewayLaunchBinding, { version: 2 }>): void {
+    const existing = this.renewalTimers.get(binding.bindingId);
+    if (existing) clearTimeout(existing);
+    const delay = Math.max(1_000, binding.leaseExpiresAt - this.now() - MONITOR_RENEW_WINDOW_MS);
+    const timer = setTimeout(() => {
+      this.renewalTimers.delete(binding.bindingId);
+      const desired = this.desiredMonitors.get(binding.bindingId);
+      if (!desired) return;
+      void (async () => {
+        await this.unsubscribeBinding(binding.bindingId);
+        await this.ensureMonitorSubscription(desired);
+      })().catch((error) => {
+        const current = this.bindingSource?.getGatewayLaunchBinding?.(binding.hostId, binding.bindingId);
+        if (current?.version === 2) void this.publishMonitorStatus(current, "error", error);
+        this.scheduleMonitorReconnect(binding.hostId);
+      });
+    }, delay);
+    timer.unref?.();
+    this.renewalTimers.set(binding.bindingId, timer);
+  }
+
+  private async publishMonitorStatus(
+    binding: Extract<SshGatewayLaunchBinding, { version: 2 }>,
+    status: SshGatewayMonitorStatus["status"],
+    error?: unknown,
+  ): Promise<void> {
+    try {
+      await this.monitorSink?.onStatus?.({
+        binding,
+        status,
+        ...(error === undefined ? {} : { error: error instanceof Error ? error.message : String(error) }),
+      });
+    } catch {
+      // Status projection is advisory and must not tear down a valid subscription.
+    }
+  }
+
   private async closePending(pending: Iterable<Promise<GatewayPoolEntry>>): Promise<void> {
     const entries = await Promise.all([...pending].map((entry) => entry.catch(() => undefined)));
+    for (const entry of entries) {
+      if (!entry) continue;
+      this.retireMonitorSubscriptions(entry);
+      this.scheduleMonitorReconnect(entry.hostId);
+    }
     await Promise.all(entries.map((entry) => entry?.client.close().catch(() => undefined)));
   }
+}
+
+const GATEWAY_EVENT_KINDS = new Set(["state", "progress", "child", "published", "complete", "send", "cancel", "error", "gap"]);
+const GATEWAY_GAP_REASONS = new Set<GatewayEventGap["reason"]>(["retention", "slow-consumer", "revoked", "connection-closed"]);
+
+function parseMonitorNotification(value: unknown): GatewayEventNotification["params"] | undefined {
+  if (!value || typeof value !== "object" || (value as { method?: unknown }).method !== GATEWAY_EVENT_NOTIFICATION_METHOD) return undefined;
+  const params = (value as { params?: unknown }).params;
+  if (!params || typeof params !== "object" || Array.isArray(params)) return undefined;
+  const record = params as Record<string, unknown>;
+  const subscriptionId = monitorText(record.subscriptionId, 128);
+  const handle = monitorText(record.handle, 128);
+  const eventId = monitorText(record.eventId, 256);
+  if (!subscriptionId || !handle || !eventId || !Number.isSafeInteger(record.cursor) || (record.cursor as number) < 1) return undefined;
+  if (typeof record.kind !== "string" || !GATEWAY_EVENT_KINDS.has(record.kind)) return undefined;
+  return {
+    subscriptionId,
+    handle,
+    eventId,
+    cursor: record.cursor as number,
+    kind: record.kind as GatewayEventNotification["params"]["kind"],
+    payload: record.payload,
+  };
+}
+
+function parseMonitorSubscription(
+  value: unknown,
+  expectedHandle: string,
+  expectedPrincipal: string,
+): { subscriptionId: string; gap?: GatewayEventGap } {
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("Gateway returned an invalid Monitor subscription");
+  const envelope = value as { ok?: unknown; data?: unknown; meta?: unknown; error?: { message?: unknown } };
+  if (envelope.ok !== true) throw new Error(typeof envelope.error?.message === "string" ? envelope.error.message : "Gateway Monitor subscription failed");
+  const meta = envelope.meta && typeof envelope.meta === "object" && !Array.isArray(envelope.meta) ? envelope.meta as Record<string, unknown> : undefined;
+  const principal = monitorText(meta?.principalId, 256);
+  const separator = expectedPrincipal.indexOf(":");
+  if (!principal || separator <= 0 || principal !== expectedPrincipal.slice(separator + 1)) throw new Error("Gateway principal changed during Monitor subscription");
+  if (!envelope.data || typeof envelope.data !== "object" || Array.isArray(envelope.data)) throw new Error("Gateway returned an invalid Monitor subscription");
+  const data = envelope.data as Record<string, unknown>;
+  const subscriptionId = monitorText(data.subscriptionId, 128);
+  if (!subscriptionId || data.handle !== expectedHandle) throw new Error("Gateway returned a mismatched Monitor subscription");
+  return { subscriptionId, ...(data.gap === undefined ? {} : { gap: parseMonitorGap(data.gap) }) };
+}
+
+function parseMonitorGap(value: unknown): GatewayEventGap {
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("Gateway returned an invalid Monitor gap");
+  const gap = value as Record<string, unknown>;
+  if (typeof gap.reason !== "string" || !GATEWAY_GAP_REASONS.has(gap.reason as GatewayEventGap["reason"])) throw new Error("Gateway returned an invalid Monitor gap");
+  for (const field of ["fromCursor", "toCursor", "resumeCursor"] as const) {
+    if (!Number.isSafeInteger(gap[field]) || (gap[field] as number) < 0) throw new Error("Gateway returned an invalid Monitor gap");
+  }
+  return {
+    reason: gap.reason as GatewayEventGap["reason"],
+    fromCursor: gap.fromCursor as number,
+    toCursor: gap.toCursor as number,
+    resumeCursor: gap.resumeCursor as number,
+  };
+}
+
+function monitorText(value: unknown, maximum: number): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const text = value.trim();
+  return text && Buffer.byteLength(text, "utf8") <= maximum && !/[\u0000-\u001f\u007f]/u.test(text) ? text : undefined;
 }
 
 class SshGatewayTransport implements Transport {

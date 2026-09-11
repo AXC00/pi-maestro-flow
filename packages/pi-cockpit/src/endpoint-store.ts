@@ -1,4 +1,7 @@
 import type {
+	ExternalAgentProjectionV1,
+} from "pi-maestro-teammate/v1/external-agent-projections";
+import type {
 	SessionEndpoint,
 	SessionHostSnapshot,
 	SessionMessageRequest,
@@ -47,11 +50,14 @@ export interface CockpitEndpoint {
 	contentRevision: string;
 	/** Changes only when user-visible output changes, not for heartbeat/status churn. */
 	outputRevision?: string;
-	/** Exact selector passed to SessionHostRegistry.send/MessageRouter. */
+	/** Exact selector passed to SessionHostRegistry.send/MessageRouter. Empty for read-only external projections. */
 	routeSelector: string;
-	source: "registry" | "legacy";
+	source: "registry" | "legacy" | "external";
+	/** External agents are display-only and never participate in teammate routing. */
+	readOnly?: boolean;
 	registryEndpoint?: SessionEndpoint;
 	agentRow?: AgentRow;
+	externalAgent?: ExternalAgentProjectionV1;
 	contextPressure?: number;
 	agentCount?: number;
 	remoteAgents?: readonly SessionEndpoint[];
@@ -83,6 +89,16 @@ export interface EndpointStoreConnectOptions {
 
 function legacyAgentEndpointId(correlationId: string): string {
 	return `cockpit-session/v1/agent/${encodeURIComponent(correlationId)}`;
+}
+
+function externalAgentEndpointId(projection: ExternalAgentProjectionV1): string {
+	return `cockpit-session/v1/external/${encodeURIComponent(projection.source)}/${encodeURIComponent(projection.id)}`;
+}
+
+function externalEndpointStatus(status: ExternalAgentProjectionV1["status"]): SessionEndpoint["status"] {
+	if (status === "sleeping") return "sleeping";
+	if (status === "done" || status === "failed" || status === "terminated") return "settled";
+	return "running";
 }
 
 function endpointLogicalKey(endpoint: Pick<SessionEndpoint, "kind" | "correlationId">): string {
@@ -236,6 +252,7 @@ export class EndpointStore {
 	#acceptedLocalProjection: LocalSessionProjection | undefined;
 	#registryDisposer: (() => void) | undefined;
 	#eventDisposer: (() => void) | undefined;
+	#externalAgents: readonly ExternalAgentProjectionV1[] = Object.freeze([]);
 	#mainOutputRevision: string | undefined;
 	#snapshot: EndpointStoreSnapshot = Object.freeze({
 		contentRevision: revisionOf([]),
@@ -290,6 +307,7 @@ export class EndpointStore {
 		this.#registrySnapshot = undefined;
 		this.#expectedSessionId = undefined;
 		this.#acceptedLocalProjection = undefined;
+		this.#externalAgents = Object.freeze([]);
 		this.#rebuild();
 	}
 
@@ -339,6 +357,12 @@ export class EndpointStore {
 	setMainOutputRevision(revision: string | undefined): boolean {
 		if (revision === this.#mainOutputRevision) return false;
 		this.#mainOutputRevision = revision;
+		return this.#rebuild();
+	}
+
+	/** Replace the current session's already-sanitized, read-only external agents. */
+	setExternalAgents(projections: readonly ExternalAgentProjectionV1[]): boolean {
+		this.#externalAgents = Object.freeze([...projections]);
 		return this.#rebuild();
 	}
 
@@ -443,6 +467,29 @@ export class EndpointStore {
 				routeSelector: row.correlationId,
 				source: "legacy",
 				agentRow: row,
+			});
+		}
+
+		for (const projection of this.#externalAgents) {
+			endpoints.push({
+				id: externalAgentEndpointId(projection),
+				logicalKey: `external:${projection.source}:${projection.id}`,
+				kind: "agent",
+				label: cleanLabel(projection.label, "external"),
+				ordinal: ordinal++,
+				status: externalEndpointStatus(projection.status),
+				contentRevision: revisionOf([
+					projection.revision,
+					projection.status,
+					projection.activeTool,
+					projection.activeToolArgs,
+					projection.metrics,
+					projection.updatedAt,
+				]),
+				routeSelector: "",
+				source: "external",
+				readOnly: true,
+				externalAgent: projection,
 			});
 		}
 

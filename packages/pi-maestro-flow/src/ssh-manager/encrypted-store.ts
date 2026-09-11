@@ -16,6 +16,7 @@ import { dirname, join, resolve } from "node:path";
 import {
   SSH_MANAGER_DATA_VERSION,
   cloneSshGatewayBinding,
+  cloneSshGatewayLaunchBinding,
   cloneSshHost,
   cloneSshKey,
   effectiveSshHostDigest,
@@ -200,7 +201,12 @@ export class EncryptedSshStore {
   }
   getGatewayLaunchBinding(hostId: string, bindingId: string): SshGatewayLaunchBinding | undefined {
     const binding = this.requireData().gatewayLaunchBindings.find((candidate) => candidate.hostId === hostId && candidate.bindingId === bindingId);
-    return binding ? { ...binding } : undefined;
+    return binding ? cloneSshGatewayLaunchBinding(binding) : undefined;
+  }
+  getGatewayLaunchBindings(piSessionRef?: string): SshGatewayLaunchBinding[] {
+    return this.requireData().gatewayLaunchBindings
+      .filter((binding) => piSessionRef === undefined || binding.version === 2 && binding.piSessionRef === piSessionRef)
+      .map(cloneSshGatewayLaunchBinding);
   }
   getGatewayBindingFence(hostId: string): string {
     const binding = this.getGatewayBinding(hostId);

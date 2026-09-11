@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import type { ExternalAgentProjectionV1 } from "pi-maestro-teammate/v1/external-agent-projections";
 import {
 	SessionHostRegistry,
 	projectSessionEndpoints,
@@ -102,6 +103,36 @@ test("EndpointStore falls back to stable main/start-order agent ids and hides gr
 	rows = rows.map((row) => ({ ...row, lastActivityAt: row.lastActivityAt + 100 }));
 	store.refreshLegacy();
 	assert.deepEqual(store.snapshot().endpoints.map((endpoint) => endpoint.label), ["main", "first", "later"]);
+});
+
+test("EndpointStore adds read-only external agents without creating registry endpoints or route selectors", () => {
+	const store = new EndpointStore({ getLegacyAgents: () => [] });
+	const projection: ExternalAgentProjectionV1 = {
+		version: 1,
+		source: "ssh-gateway",
+		sessionId: SESSION,
+		id: "remote-1",
+		label: "remote-builder",
+		status: "running",
+		activeTool: "bash",
+		metrics: { toolCount: 3, tokens: 1_200 },
+		revision: "r1",
+		updatedAt: 10,
+	};
+	store.setExternalAgents([projection]);
+
+	const external = store.snapshot().endpoints[1];
+	assert.equal(external?.source, "external");
+	assert.equal(external?.readOnly, true);
+	assert.equal(external?.kind, "agent");
+	assert.equal(external?.correlationId, undefined);
+	assert.equal(external?.routeSelector, "");
+	assert.equal(external?.registryEndpoint, undefined);
+	assert.equal(external?.externalAgent, projection);
+	assert.equal(store.findAgent("remote-1"), undefined, "external ids never enter local teammate lookup");
+
+	store.disconnect();
+	assert.deepEqual(store.snapshot().endpoints.map((endpoint) => endpoint.label), ["main"]);
 });
 
 test("EndpointStore subscribes to SessionHostRegistry and projects canonical local endpoints only", () => {

@@ -23,9 +23,12 @@ import type {
 import { EncryptedSshStore, defaultSshManagerStorePath } from "./encrypted-store.ts";
 import { SshExecutor, type SshExecutionResult } from "./executor.ts";
 import {
+  SshGatewayCapabilityError,
   SshGatewayClientPool,
   type SshGatewayActionResult,
 } from "./gateway-client.ts";
+import { SshGatewayBootstrapManager } from "./gateway-bootstrap.ts";
+import { GatewayCompletionRouter } from "./gateway-completion-router.ts";
 import { pairSshGateway, sshGatewayGuide, unpairSshGateway } from "./guide.ts";
 import { SshToolParams, type SshToolInput } from "./llm-tool.ts";
 import {
@@ -96,6 +99,7 @@ export interface RegisterSshManagerOptions {
   store?: EncryptedSshStore;
   executor?: SshExecutor;
   gatewayPool?: SshGatewayClientPool;
+  gatewayBootstrap?: SshGatewayBootstrapManager;
   monitor?: SshStatusMonitor;
   discoverOpenSsh?: (options?: DiscoverOpenSshOptions) => Promise<OpenSshDiscoveryResult>;
   configSource?: PiConfigLocalSource;
@@ -110,6 +114,9 @@ export function registerSshManager(
   const store = options.store ?? new EncryptedSshStore({ path: options.storePath ?? defaultSshManagerStorePath() });
   const executor = options.executor ?? new SshExecutor(undefined, store);
   const gatewayPool = options.gatewayPool ?? new SshGatewayClientPool(executor, { bindingSource: store });
+  const gatewayBootstrap = options.gatewayBootstrap ?? new SshGatewayBootstrapManager(executor, {
+    onOwnedChannelClose: (hostId) => gatewayPool.invalidateHost(hostId),
+  });
   const monitor = options.monitor ?? new SshStatusMonitor(store, executor);
   const discoverOpenSsh = options.discoverOpenSsh ?? discoverOpenSshConfig;
   const configSource = options.configSource ?? new CurrentUserPiConfigSource();
@@ -123,6 +130,69 @@ export function registerSshManager(
   // effective connection chain or Gateway endpoint credentials change.
   const connectionFence = (hostId: string): string => store.getConnectionConfigFence(hostId);
   const selectionFence = connectionFence;
+  const completionRouter = new GatewayCompletionRouter({
+    pool: gatewayPool,
+    store,
+    resolveTarget(binding) {
+      if (store.locked) return undefined;
+      const host = store.getHosts().find((candidate) => candidate.id === binding.hostId);
+      if (!host || store.getEffectiveHostDigest(host.id) !== binding.effectiveHostDigest) return undefined;
+      return { host, effectiveDigest: binding.effectiveHostDigest, cacheFence: connectionFence(host.id) };
+    },
+    deliver(binding, completion) {
+      const ctx = activeContext;
+      if (!ctx || ctx.sessionManager.getSessionId() !== binding.piSessionRef) return;
+      pi.sendMessage({
+        customType: "ssh-gateway-complete",
+        content: completion.content,
+        display: true,
+        details: {
+          bindingId: binding.bindingId,
+          deliveryId: completion.deliveryId,
+          handle: binding.executionHandle,
+          status: completion.status,
+          hostId: binding.hostId,
+        },
+      }, {
+        deliverAs: "followUp",
+        triggerTurn: true,
+      });
+    },
+  });
+
+  let monitorResume: Promise<void> | undefined;
+  const resumeActiveMonitoring = (): Promise<void> => {
+    if (monitorResume) return monitorResume;
+    const operation = (async () => {
+      const ctx = activeContext;
+      if (!ctx || store.locked) return;
+      const piSessionRef = ctx.sessionManager?.getSessionId?.();
+      if (!piSessionRef) return;
+      completionRouter.setActiveSession(piSessionRef);
+      const targets = store.getHosts().map((host) => ({
+        host,
+        effectiveDigest: store.getEffectiveHostDigest(host.id),
+        cacheFence: connectionFence(host.id),
+      }));
+      await completionRouter.resumeActiveSession(targets);
+    })();
+    const tracked = operation.finally(() => {
+      if (monitorResume === tracked) monitorResume = undefined;
+    });
+    monitorResume = tracked;
+    return tracked;
+  };
+  const scheduleActiveMonitoring = (): void => {
+    void resumeActiveMonitoring().catch(() => undefined);
+  };
+  const invalidateGatewayHost = async (hostId: string): Promise<void> => {
+    await gatewayPool.invalidateHost(hostId);
+    await gatewayBootstrap.invalidateHost(hostId);
+  };
+  const invalidateAllGatewayHosts = async (): Promise<void> => {
+    await gatewayPool.close();
+    await gatewayBootstrap.invalidateAll();
+  };
 
   const setSelectionStatus = (ctx: ExtensionContext | undefined, hosts: readonly SshHost[]): void => {
     if (hosts.length === 0) {
@@ -141,7 +211,7 @@ export function registerSshManager(
     if (store.locked) {
       const staleIds = [...selected.keys()];
       selected.clear();
-      for (const id of staleIds) void gatewayPool.invalidateHost(id).catch(() => undefined);
+      for (const id of staleIds) void invalidateGatewayHost(id).catch(() => undefined);
       setSelectionStatus(activeContext, []);
       return [];
     }
@@ -156,7 +226,7 @@ export function registerSshManager(
     if (stale.length > 0) {
       for (const id of stale) {
         selected.delete(id);
-        void gatewayPool.invalidateHost(id).catch(() => undefined);
+        void invalidateGatewayHost(id).catch(() => undefined);
       }
       setSelectionStatus(activeContext, valid);
     }
@@ -172,7 +242,7 @@ export function registerSshManager(
     activeContext = ctx;
     const next = new Map(hosts.map((host) => [host.id, selectionFence(host.id)]));
     for (const [id, digest] of selected) {
-      if (next.get(id) !== digest) void gatewayPool.invalidateHost(id).catch(() => undefined);
+      if (next.get(id) !== digest) void invalidateGatewayHost(id).catch(() => undefined);
     }
     selected.clear();
     for (const [id, digest] of next) selected.set(id, digest);
@@ -183,7 +253,7 @@ export function registerSshManager(
     activeContext = ctx;
     const digest = selectionFence(host.id);
     if (selected.has(host.id) && selected.get(host.id) !== digest) {
-      void gatewayPool.invalidateHost(host.id).catch(() => undefined);
+      void invalidateGatewayHost(host.id).catch(() => undefined);
     }
     selected.set(host.id, digest);
     setSelectionStatus(ctx, selectedHostsForDisplay());
@@ -196,7 +266,7 @@ export function registerSshManager(
   ): void => {
     for (const id of new Set(hostIds)) {
       if (!selected.delete(id)) continue;
-      if (invalidate) void gatewayPool.invalidateHost(id).catch(() => undefined);
+      if (invalidate) void invalidateGatewayHost(id).catch(() => undefined);
     }
     setSelectionStatus(ctx, selectedHostsForDisplay());
   };
@@ -204,7 +274,7 @@ export function registerSshManager(
   const clearSelection = (ctx: ExtensionContext | undefined = activeContext): void => {
     const previousIds = [...selected.keys()];
     selected.clear();
-    for (const id of previousIds) void gatewayPool.invalidateHost(id).catch(() => undefined);
+    for (const id of previousIds) void invalidateGatewayHost(id).catch(() => undefined);
     ctx?.ui.setStatus(SSH_STATUS_KEY, undefined);
   };
 
@@ -245,6 +315,7 @@ export function registerSshManager(
     if (!await ensureUnlocked(ctx, store)) return false;
     await refreshStore();
     if (wasLocked) monitor.reconcile();
+    scheduleActiveMonitoring();
     return true;
   };
 
@@ -267,6 +338,7 @@ export function registerSshManager(
     try {
       await refreshStore();
       monitor.reconcile();
+      scheduleActiveMonitoring();
       hosts = store.getHosts();
     } catch {
       clearSelection(ctx);
@@ -297,12 +369,13 @@ export function registerSshManager(
     renderShell: "self",
     description: `Execute a bounded command or use the built-in Pi Maestro Gateway on any configured SSH server after the user unlocks the manager.
 
-Use action=targets to list provider-owned target ids, then pass targetId on a command or Gateway action. Omitting targetId works only when exactly one #ssh server is attached and is an error when none or multiple are attached. The tool never accepts host or authentication parameters. Gateway actions and sync_pi_config use fixed remote commands that cannot be overridden. sync_pi_config accepts only fixed categories; the host resolves current-user Pi files internally and never exposes their paths or contents. start_pi snapshots only explicitly selected existing tasks from the current local Pi Todo and launches an independent remote Gateway session; it never synchronizes or completes either Todo authority. Server configuration stays in the encrypted user-level SSH manager. #ssh selection remains independent of teammate and remote-worker routing. Each resolved target decides whether ordinary commands run through bash or PowerShell.`,
-    promptSnippet: "List unlocked SSH targets, execute a command, securely sync fixed Pi config categories, launch selected local Todo instructions with start_pi, or use Gateway actions by provider-owned targetId.",
+Use action=targets to list provider-owned target ids, then pass targetId on a command or Gateway action. ensure_gateway may start a non-persistent Gateway whose lifetime is tied to the current local Pi session. Omitting targetId works only when exactly one #ssh server is attached and is an error when none or multiple are attached. The tool never accepts host or authentication parameters. Gateway actions and sync_pi_config use fixed remote commands that cannot be overridden. sync_pi_config accepts only fixed categories; the host resolves current-user Pi files internally and never exposes their paths or contents. start_pi snapshots only explicitly selected existing tasks from the current local Pi Todo and launches an independent remote Gateway session; it never synchronizes or completes either Todo authority. Server configuration stays in the encrypted user-level SSH manager. #ssh selection remains independent of teammate and remote-worker routing. Each resolved target decides whether ordinary commands run through bash or PowerShell.`,
+    promptSnippet: "List unlocked SSH targets, start a session-scoped remote Gateway, execute a command, securely sync fixed Pi config categories, launch selected local Todo instructions with start_pi, or use Gateway actions by provider-owned targetId.",
     promptGuidelines: [
       "Use read-only inspection before mutations unless the user explicitly requested a change.",
       "Use action=guide for local Gateway setup instructions; it does not contact a server.",
       "Use action=targets after unlock and pass only a returned targetId; never invent target ids or connection parameters.",
+      "Use action=ensure_gateway only when the remote Gateway is unavailable and a daemon tied to the current local Pi session is acceptable; it never replaces durable remote service setup.",
       "For action=call, first use action=describe with the targetId and Gateway tool name; pass the returned tool inputSchema exactly in args. Dynamic call args are intentionally generic at this outer tool boundary.",
       "For session.start-pi, use the returned taskId or monitorHandle as monitor.handle; do not rename it to taskId when calling monitor.",
       "Never read or print private keys, passwords, tokens, credential stores, or host-key material.",
@@ -350,6 +423,7 @@ Use action=targets to list provider-owned target ids, then pass targetId on a co
       let executionHost: SshHost | undefined;
       try {
         await refreshStore();
+        scheduleActiveMonitoring();
         if ("action" in params && params.action === "targets") {
           const selectedIds = new Set(selectedHostsForDisplay().map((host) => host.id));
           const targets = store.getHosts().map((host) => ({
@@ -406,6 +480,43 @@ Use action=targets to list provider-owned target ids, then pass targetId on a co
             },
           };
         }
+        if (params.action === "ensure_gateway") {
+          const effectiveDigest = store.getEffectiveHostDigest(executionHost.id);
+          const cacheFence = connectionFence(executionHost.id);
+          const bootstrap = await gatewayBootstrap.ensure(
+            executionHost,
+            effectiveDigest,
+            cacheFence,
+            async (probeSignal) => {
+              try {
+                await gatewayPool.execute(
+                  executionHost!,
+                  effectiveDigest,
+                  { action: "status" },
+                  probeSignal,
+                  undefined,
+                  cacheFence,
+                );
+                return true;
+              } catch (error) {
+                if (error instanceof SshGatewayCapabilityError) return false;
+                throw error;
+              }
+            },
+            { timeoutSeconds: params.timeout, signal },
+          );
+          const summary = bootstrap.started
+            ? "gateway started · local-session"
+            : "gateway already running";
+          return {
+            content: [{ type: "text" as const, text: JSON.stringify(bootstrap, null, 2) }],
+            details: {
+              ...details(undefined, executionHost),
+              action: "ensure_gateway",
+              summary,
+            },
+          };
+        }
         const startPiContext = params.action === "start_pi"
           ? {
               piSessionRef: activeContext?.sessionManager.getSessionId?.() ?? "",
@@ -440,7 +551,7 @@ Use action=targets to list provider-owned target ids, then pass targetId on a co
             ...("action" in params ? {
               action: params.action,
               ...(params.action === "describe" || params.action === "call" ? { tool: params.tool } : {}),
-              summary: params.action === "targets" ? "target listing failed" : params.action === "sync_pi_config" ? "configuration sync failed" : "gateway failed",
+              summary: params.action === "targets" ? "target listing failed" : params.action === "sync_pi_config" ? "configuration sync failed" : params.action === "ensure_gateway" ? "gateway bootstrap failed" : "gateway failed",
             } : {}),
           },
         };
@@ -510,8 +621,8 @@ Use action=targets to list provider-owned target ids, then pass targetId on a co
           : attachHost(host, ctx),
         remove: (hostIds) => removeSelectionIds(hostIds, ctx, false),
         clear: () => clearSelection(ctx),
-        invalidate: (hostId) => gatewayPool.invalidateHost(hostId),
-        invalidateAll: () => gatewayPool.close(),
+        invalidate: invalidateGatewayHost,
+        invalidateAll: invalidateAllGatewayHosts,
       });
     },
   });
@@ -588,6 +699,7 @@ Use action=targets to list provider-owned target ids, then pass targetId on a co
     }
     try {
       await store.reload();
+      scheduleActiveMonitoring();
       const attachedHosts = selectedHostsForDisplay();
       const safeAttachments = JSON.stringify(attachedHosts.map((host) => ({
         id: host.id,
@@ -599,7 +711,7 @@ Use action=targets to list provider-owned target ids, then pass targetId on a co
         : attachedHosts.length > 1
           ? "Multiple SSH servers are attached, so every SSH call must pass one explicit targetId; omission is an error."
           : "No SSH server is attached, so omitting targetId is an error.";
-      const systemPrompt = `${event.systemPrompt}\n\n<ssh-management-context>\nThe independent encrypted SSH manager is unlocked. Gateway endpoint and credentials remain internal and are never included in this prompt. The agent may access any configured server through the ssh tool by first calling action=targets and then passing a provider-owned targetId. Attached SSH metadata (id, label, and shell only): ${safeAttachments}. ${omissionRule} targetId never contains host or authentication data. sync_pi_config accepts only targetId and fixed categories (models, auth, teammate); local paths and contents are resolved and transferred by the host outside model-visible arguments and results. start_pi accepts only local todoIds, an optional objective/agent/timeout, targetId, and requestId; the host reads and sanitizes current local Pi Todo tasks and session identity. Gateway actions always use the fixed remote command and never accept host, authentication, command, remote cwd, sessionId, snapshot, or callback overrides. #ssh attachments do not select or configure teammate routing. Remote Monitor calls use the returned launch receipt and never update local Pi Todo. Never use remote-worker or expose credentials.\n</ssh-management-context>`;
+      const systemPrompt = `${event.systemPrompt}\n\n<ssh-management-context>\nThe independent encrypted SSH manager is unlocked. Gateway endpoint and credentials remain internal and are never included in this prompt. The agent may access any configured server through the ssh tool by first calling action=targets and then passing a provider-owned targetId. Attached SSH metadata (id, label, and shell only): ${safeAttachments}. ${omissionRule} targetId never contains host or authentication data. ensure_gateway can start a non-persistent remote Gateway tied to this local Pi session and accepts only targetId plus an optional timeout. sync_pi_config accepts only targetId and fixed categories (models, auth, teammate); local paths and contents are resolved and transferred by the host outside model-visible arguments and results. start_pi accepts only local todoIds, an optional objective/agent/timeout, targetId, and requestId; the host reads and sanitizes current local Pi Todo tasks and session identity. Gateway actions always use fixed remote commands and never accept host, authentication, command, remote cwd, sessionId, snapshot, or callback overrides. #ssh attachments do not select or configure teammate routing. Remote Monitor calls use the returned launch receipt and never update local Pi Todo. Never use remote-worker or expose credentials.\n</ssh-management-context>`;
       return { systemPrompt };
     } catch {
       clearSelection(ctx);
@@ -607,9 +719,11 @@ Use action=targets to list provider-owned target ids, then pass targetId on a co
     }
   });
 
-  pi.on("session_start", (_event, ctx) => {
+  pi.on("session_start", async (_event, ctx) => {
     activeContext = ctx;
+    completionRouter.setActiveSession(ctx.sessionManager?.getSessionId?.());
     clearSelection(ctx);
+    if (!store.locked) scheduleActiveMonitoring();
   });
   pi.on("session_shutdown", async () => {
     selected.clear();
@@ -617,8 +731,11 @@ Use action=targets to list provider-owned target ids, then pass targetId on a co
     providerRegistration.dispose();
     remoteChannelBroker.close();
     monitor.shutdown();
+    await completionRouter.dispose().catch(() => undefined);
     store.lock();
     await gatewayPool.close();
+    await gatewayBootstrap.close();
+    activeContext = undefined;
   });
 }
 

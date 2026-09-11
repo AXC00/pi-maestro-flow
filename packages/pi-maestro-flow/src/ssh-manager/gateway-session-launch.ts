@@ -40,7 +40,10 @@ export interface SessionLaunchBindingV1 {
   readonly gatewayMemberId: string;
   readonly executionHandle: string;
   readonly generation: number;
+  /** Compatibility alias for eventCursor. */
   readonly cursor: number;
+  readonly eventCursor: number;
+  readonly resultCursor: number;
 }
 
 export interface SshStartPiResult {
@@ -197,15 +200,18 @@ export class GatewaySessionLauncher {
     const observedData = requiredObject(observed.data, "Gateway Monitor result");
     if (observedData.handle !== stored.executionHandle) await fail("SSH launch Monitor execution handle changed during restore");
 
+    const eventCursor = stored.version === 2 ? stored.eventCursor : stored.cursor;
     const binding: SessionLaunchBindingV1 = {
       version: 1,
       bindingId: stored.bindingId,
-      piSessionRef: "restored",
+      piSessionRef: stored.version === 2 ? stored.piSessionRef : "restored",
       gatewaySessionId: stored.gatewaySessionId,
       gatewayMemberId: stored.gatewayMemberId,
       executionHandle: stored.executionHandle,
       generation: stored.generation,
-      cursor: stored.cursor,
+      cursor: eventCursor,
+      eventCursor,
+      resultCursor: stored.version === 2 ? stored.resultCursor : 0,
     };
     const record: LaunchRecord = {
       hostId, hostDigest, endpointIdentity, gatewayPrincipalId: stored.gatewayPrincipalId,
@@ -236,20 +242,23 @@ export class GatewaySessionLauncher {
     if (!record || !this.isCurrent(record) || record.hostId !== hostId || record.hostDigest !== hostDigest) throw new Error("SSH launch Monitor handle is stale for the selected host");
     if (record.binding.generation !== generation) throw new Error("SSH launch Monitor handle generation is stale");
     const action = args.action;
-    const cursorBearing = action === "observe" || action === "result";
+    const eventCursorBearing = action === "observe" || action === "subscribe";
+    const resultCursorBearing = action === "result";
     const cursor = args.cursor;
-    if (cursorBearing && cursor !== undefined && (!Number.isSafeInteger(cursor) || (cursor as number) < record.binding.cursor)) {
+    const minimumCursor = resultCursorBearing ? record.binding.resultCursor : record.binding.eventCursor;
+    if ((eventCursorBearing || resultCursorBearing) && cursor !== undefined
+      && (!Number.isSafeInteger(cursor) || (cursor as number) < minimumCursor)) {
       throw new Error("SSH launch Monitor cursor is stale");
     }
     const sanitized = { ...args };
     delete sanitized._sshLaunch;
-    if (!cursorBearing) {
+    if (!eventCursorBearing && !resultCursorBearing) {
       delete sanitized.cursor;
       delete sanitized.limit;
     }
     if (sanitized.sessionId !== record.binding.gatewaySessionId
       || sanitized.memberId !== record.binding.gatewayMemberId
-      || sanitized.handle !== record.binding.executionHandle) {
+      || action !== "unsubscribe" && sanitized.handle !== record.binding.executionHandle) {
       throw new Error("SSH launch Monitor binding does not match the execution handle");
     }
     return { args: sanitized, record };
@@ -264,15 +273,44 @@ export class GatewaySessionLauncher {
     finally { if (record.lease.renewal === pending) delete record.lease.renewal; }
   }
 
-  async updateMonitorCursor(record: LaunchRecord | undefined, gatewayEnvelope: unknown): Promise<void> {
+  async updateMonitorCursor(
+    record: LaunchRecord | undefined,
+    gatewayEnvelope: unknown,
+    action: "observe" | "result" = "observe",
+  ): Promise<void> {
     if (!record || !gatewayEnvelope || typeof gatewayEnvelope !== "object") return;
     const data = (gatewayEnvelope as { data?: unknown }).data;
     if (!data || typeof data !== "object") return;
     const nextCursor = (data as { nextCursor?: unknown }).nextCursor;
-    if (!Number.isSafeInteger(nextCursor) || (nextCursor as number) < record.binding.cursor) return;
-    record.binding = { ...record.binding, cursor: nextCursor as number };
+    const current = action === "result" ? record.binding.resultCursor : record.binding.eventCursor;
+    if (!Number.isSafeInteger(nextCursor) || (nextCursor as number) < current) return;
+    record.binding = action === "result"
+      ? { ...record.binding, resultCursor: nextCursor as number }
+      : { ...record.binding, cursor: nextCursor as number, eventCursor: nextCursor as number };
     record.result = resultForBinding(record.binding);
     await this.persist(record);
+  }
+
+  async advanceEventCursor(
+    hostId: string,
+    hostDigest: string,
+    bindingId: string,
+    generation: number,
+    nextCursor: number,
+    allowGap = false,
+  ): Promise<boolean> {
+    const record = this.byBinding.get(bindingId);
+    if (!record || !this.isCurrent(record) || record.hostId !== hostId || record.hostDigest !== hostDigest) {
+      throw new Error("SSH launch Monitor handle is stale for the selected host");
+    }
+    if (record.binding.generation !== generation) throw new Error("SSH launch Monitor handle generation is stale");
+    if (!Number.isSafeInteger(nextCursor) || nextCursor < 0) throw new Error("SSH launch Monitor cursor is invalid");
+    if (nextCursor <= record.binding.eventCursor) return false;
+    if (!allowGap && nextCursor !== record.binding.eventCursor + 1) throw new Error("SSH launch Monitor event cursor has a gap");
+    record.binding = { ...record.binding, cursor: nextCursor, eventCursor: nextCursor };
+    record.result = resultForBinding(record.binding);
+    await this.persist(record);
+    return true;
   }
 
   invalidateHost(hostId: string): void {
@@ -359,6 +397,8 @@ export class GatewaySessionLauncher {
       executionHandle,
       generation,
       cursor: 0,
+      eventCursor: 0,
+      resultCursor: 0,
     };
     return { hostId, hostDigest, endpointIdentity, gatewayPrincipalId, hostEpoch, lifecycleEpoch, requestKey, operationId, binding, result: resultForBinding(binding), lease };
   }
@@ -389,8 +429,13 @@ export class GatewaySessionLauncher {
 
   private persist(record: LaunchRecord): Promise<void> {
     if (!this.persistence) return Promise.resolve();
+    const existing = this.persistence.getGatewayLaunchBinding(record.hostId, record.binding.bindingId);
+    const retained = existing?.version === 2 ? {
+      ...(existing.monitorState === undefined ? {} : { monitorState: existing.monitorState }),
+      ...(existing.completion === undefined ? {} : { completion: existing.completion }),
+    } : {};
     const snapshot: SshGatewayLaunchBinding = {
-      version: 1,
+      version: 2,
       bindingId: record.binding.bindingId,
       hostId: record.hostId,
       effectiveHostDigest: record.hostDigest,
@@ -405,7 +450,11 @@ export class GatewaySessionLauncher {
       operationId: record.operationId,
       executionHandle: record.binding.executionHandle,
       generation: record.binding.generation,
-      cursor: record.binding.cursor,
+      cursor: record.binding.eventCursor,
+      piSessionRef: record.binding.piSessionRef,
+      eventCursor: record.binding.eventCursor,
+      resultCursor: record.binding.resultCursor,
+      ...retained,
     };
     const operation = this.persistenceTail.then(() => this.persistence!.saveGatewayLaunchBinding(snapshot));
     this.persistenceTail = operation.catch(() => undefined);
