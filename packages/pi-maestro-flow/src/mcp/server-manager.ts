@@ -20,7 +20,7 @@ import { serverStreamResultPatchNotificationSchema } from "./types.ts";
 import { resolveNpxBinary } from "./npx-resolver.ts";
 import { logger } from "./logger.ts";
 import { McpOAuthProvider } from "./mcp-oauth-provider.ts";
-import { extractOAuthConfig, supportsOAuth } from "./mcp-auth-flow.ts";
+import { captureOAuthContinuation, extractOAuthConfig, supportsOAuth } from "./mcp-auth-flow.ts";
 import { registerSamplingHandler, type ServerSamplingConfig } from "./sampling-handler.ts";
 import {
   handleUrlElicitation,
@@ -29,6 +29,11 @@ import {
 } from "./elicitation-handler.ts";
 import { interpolateEnvRecord, resolveBearerToken, resolveConfigPath } from "./utils.ts";
 import { abortable, throwIfAborted } from "./abort.ts";
+import {
+  combineMcpSignals,
+  type FabricMcpRouteGuard,
+  type FabricMcpRouteLease,
+} from "./fabric-route-guard.ts";
 
 export interface ServerConnection {
   client: Client;
@@ -40,11 +45,14 @@ export interface ServerConnection {
   inFlight: number;
   status: "connected" | "closed" | "needs-auth";
   lifecycle?: AbortController;
+  fabricRoute?: FabricMcpRouteLease;
 }
 
 export interface ServerConnectionLease {
   connection: ServerConnection;
   requestOptions: RequestOptions | undefined;
+  isCurrent(): boolean;
+  assertCurrent(): void;
   release(): void;
 }
 
@@ -78,6 +86,7 @@ export interface McpServerManagerOptions {
 
 export interface McpEphemeralTransportProvider {
   readonly definition: ServerDefinition;
+  readonly routeGuard?: FabricMcpRouteGuard;
   create(signal: AbortSignal): Transport | Promise<Transport>;
 }
 
@@ -503,9 +512,8 @@ export class McpServerManager {
   ): RequestOptions | undefined {
     if (!connection) return this.buildRequestOptions(undefined, signal);
     const lifecycle = connection.lifecycle ??= new AbortController();
-    const combinedSignal = signal
-      ? AbortSignal.any([signal, lifecycle.signal])
-      : lifecycle.signal;
+    const callerSignal = combineMcpSignals(signal, lifecycle.signal);
+    const combinedSignal = combineMcpSignals(callerSignal, connection.fabricRoute?.signal);
     return this.buildRequestOptions(connection.definition, combinedSignal);
   }
 
@@ -542,12 +550,13 @@ export class McpServerManager {
       return abortable(pending.promise, signal);
     }
 
-    // Reuse existing connection if healthy
+    // Reuse existing connection only while its exact outer authority remains current.
     const existing = this.connections.get(name);
-    if (existing?.status === "connected") {
+    if (existing?.status === "connected" && this.isConnectionCurrent(existing)) {
       existing.lastUsedAt = Date.now();
       return existing;
     }
+    if (existing !== undefined) await this.close(name);
 
     // The startup is owned by a manager lifecycle controller, not by the first
     // caller's signal. close() aborts this controller to fence the startup.
@@ -567,6 +576,15 @@ export class McpServerManager {
       trackStartupResource,
     ).then(
       async (connection) => {
+        try {
+          if (connection.fabricRoute !== undefined) await connection.fabricRoute.validateCurrent();
+        } catch (error) {
+          await Promise.all([
+            closeTrackedStartupResource(startupResources, connection.client, `${name} client`),
+            closeTrackedStartupResource(startupResources, connection.transport, `${name} transport`),
+          ]);
+          throw error;
+        }
         if (this.connectPromises.get(name)?.controller !== controller) {
           // Fenced by close(): reclaim the late resource and fail waiters rather
           // than inserting into or overwriting a newer generation's registry.
@@ -612,9 +630,13 @@ export class McpServerManager {
 
     let transport: Transport;
     const ephemeral = this.ephemeralTransports.get(name);
+    const fabricRoute = ephemeral?.routeGuard?.capture();
+    const operationSignal = combineMcpSignals(signal, fabricRoute?.signal);
+    fabricRoute?.assertCurrent();
 
     if (ephemeral !== undefined) {
-      transport = await ephemeral.create(signal ?? new AbortController().signal);
+      transport = await ephemeral.create(operationSignal ?? new AbortController().signal);
+      fabricRoute?.assertCurrent();
       trackStartupResource?.(transport, `${name} Fabric transport`);
     } else if (definition.command) {
       let command = definition.command;
@@ -650,17 +672,19 @@ export class McpServerManager {
       throw new Error(`Server ${name} has no command or url`);
     }
 
-    const requestOptions = this.buildRequestOptions(definition, signal);
+    const requestOptions = this.buildRequestOptions(definition, operationSignal);
 
     try {
       await client.connect(transport, requestOptions);
-      this.attachAdapterNotificationHandlers(name, client);
+      if (fabricRoute !== undefined) await fabricRoute.validateCurrent();
+      this.attachAdapterNotificationHandlers(name, client, fabricRoute);
 
       // Discover tools and resources
       const [tools, resources] = await Promise.all([
         this.fetchAllTools(client, requestOptions),
         this.fetchAllResources(client, requestOptions),
       ]);
+      if (fabricRoute !== undefined) await fabricRoute.validateCurrent();
 
       return {
         client,
@@ -672,6 +696,7 @@ export class McpServerManager {
         inFlight: 0,
         status: "connected",
         lifecycle: new AbortController(),
+        ...(fabricRoute === undefined ? {} : { fabricRoute }),
       };
     } catch (error) {
       // Check for UnauthorizedError - server requires OAuth
@@ -795,14 +820,18 @@ export class McpServerManager {
     let authProvider: McpOAuthProvider | undefined;
     if (supportsOAuth(definition)) {
       const oauthConfig = extractOAuthConfig(definition);
+      const oauthGuard = captureOAuthContinuation(serverName);
+      oauthGuard.assertCurrent();
       authProvider = new McpOAuthProvider(
         serverName,
         definition.url!,
         oauthConfig,
         {
           onRedirect: async (_authUrl) => {
+            oauthGuard.assertCurrent();
             // URL is captured by startAuth, no need to log
           },
+          guard: oauthGuard,
         }
       );
     }
@@ -880,7 +909,11 @@ export class McpServerManager {
     }
   }
 
-  private attachAdapterNotificationHandlers(serverName: string, client: Client): void {
+  private attachAdapterNotificationHandlers(
+    serverName: string,
+    client: Client,
+    fabricRoute?: FabricMcpRouteLease,
+  ): void {
     const notificationClient = client as unknown as {
       setNotificationHandler(
         schema: unknown,
@@ -888,6 +921,7 @@ export class McpServerManager {
       ): void;
     };
     notificationClient.setNotificationHandler(serverStreamResultPatchNotificationSchema, (notification) => {
+      if (fabricRoute !== undefined && !fabricRoute.isCurrent()) return;
       const listener = this.uiStreamListeners.get(notification.params.streamToken);
       if (!listener) return;
       listener(serverName, notification.params);
@@ -909,7 +943,9 @@ export class McpServerManager {
     }
 
     try {
-      return await lease.connection.client.readResource({ uri }, lease.requestOptions);
+      const result = await lease.connection.client.readResource({ uri }, lease.requestOptions);
+      lease.assertCurrent();
+      return result;
     } finally {
       lease.release();
     }
@@ -1004,14 +1040,21 @@ export class McpServerManager {
 
   acquireConnection(name: string, signal?: AbortSignal): ServerConnectionLease | undefined {
     const connection = this.connections.get(name);
-    if (!connection || connection.status !== "connected") return undefined;
+    if (!connection || connection.status !== "connected" || !this.isConnectionCurrent(connection)) return undefined;
     connection.inFlight += 1;
     this.connectionLeaseCounts.set(connection, (this.connectionLeaseCounts.get(connection) ?? 0) + 1);
     connection.lastUsedAt = Date.now();
     let released = false;
+    const isCurrent = (): boolean => this.connections.get(name) === connection
+      && connection.status === "connected"
+      && (connection.fabricRoute?.isCurrent() ?? true);
     return {
       connection,
       requestOptions: this.requestOptionsForConnection(connection, signal),
+      isCurrent,
+      assertCurrent: () => {
+        if (!isCurrent()) throw new Error(`Server "${name}" connection is no longer current.`);
+      },
       release: () => {
         if (released) return;
         released = true;
@@ -1027,6 +1070,10 @@ export class McpServerManager {
         for (const settle of waiters) settle();
       },
     };
+  }
+
+  isConnectionCurrent(connection: ServerConnection): boolean {
+    return connection.fabricRoute?.isCurrent() ?? true;
   }
 
   private waitForConnectionDrain(connection: ServerConnection): Promise<void> {

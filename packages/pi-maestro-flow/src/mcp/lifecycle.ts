@@ -153,10 +153,16 @@ export class McpLifecycleManager {
           if (reconnected.status !== "connected") {
             throw new Error(`server reported ${reconnected.status}`);
           }
+          if (!this.isConnectionCurrent(reconnected)) {
+            await this.manager.close(name);
+            throw new Error("server reconnected without current route authority");
+          }
           this.reconnectFailures.delete(name);
           logger.debug(`Reconnected to ${name}`);
-          // Notify extension to update metadata
-          this.onReconnect?.(name);
+          // Notify extension only while the exact reconnected identity remains current.
+          if (this.canPublishReconnect(name, reconnected)) {
+            this.onReconnect?.(name);
+          }
         } catch (error) {
           if (generation !== this.lifecycleGeneration) return;
           const failure = this.recordReconnectFailure(name);
@@ -189,6 +195,25 @@ export class McpLifecycleManager {
         this.onIdleShutdown?.(name);
       }
     }
+  }
+
+  private isConnectionCurrent(connection: ReturnType<McpServerManager["getConnection"]>): boolean {
+    if (connection === undefined) return false;
+    const manager = this.manager as McpServerManager & {
+      isConnectionCurrent?: (candidate: NonNullable<typeof connection>) => boolean;
+    };
+    return manager.isConnectionCurrent?.(connection) ?? true;
+  }
+
+  private canPublishReconnect(
+    name: string,
+    connection: NonNullable<ReturnType<McpServerManager["getConnection"]>>,
+  ): boolean {
+    const manager = this.manager as McpServerManager & {
+      isConnectionCurrent?: (candidate: typeof connection) => boolean;
+    };
+    if (manager.isConnectionCurrent === undefined) return true;
+    return manager.getConnection(name) === connection && manager.isConnectionCurrent(connection);
   }
 
   private recordReconnectFailure(name: string): ReconnectFailureState {

@@ -10,7 +10,7 @@ import { CallToolRequestSchema, ListToolsRequestSchema, type CallToolResult } fr
 import { FabricMcpMountProvider } from "pi-maestro-fabric";
 import type { EndpointRecord, EndpointRouteHandle, JsonValue, WorkspaceBinding } from "pi-maestro-fabric-core/v1";
 import { FabricMcpMountRegistry } from "../src/mcp/fabric-mount-registry.ts";
-import type { FabricMcpDispatchPort } from "../src/mcp/fabric-transport.ts";
+import { FabricMcpClientTransport, type FabricMcpDispatchPort } from "../src/mcp/fabric-transport.ts";
 import {
   executeCall,
   executeDescribe,
@@ -182,6 +182,37 @@ function text(result: CallToolResult | { content: Array<{ type: string; text?: s
   return result.content.find((item) => item.type === "text")?.text ?? "";
 }
 
+class DelayedFabricDispatcher implements FabricMcpDispatchPort {
+  readonly started: Promise<void>;
+  #markStarted!: () => void;
+  readonly resultGate: Promise<void>;
+  #releaseResult!: () => void;
+
+  constructor() {
+    this.started = new Promise((resolve) => { this.#markStarted = resolve; });
+    this.resultGate = new Promise((resolve) => { this.#releaseResult = resolve; });
+  }
+
+  release(): void {
+    this.#releaseResult();
+  }
+
+  async dispatch(input: Parameters<FabricMcpDispatchPort["dispatch"]>[0]): Promise<JsonValue> {
+    if (input.operation === "mcp.initialize") {
+      return { capabilities: { tools: {} }, serverVersion: { name: "delayed", version: "1" } };
+    }
+    if (input.operation === "mcp.list") {
+      return { tools: [{ name: "echo", description: "delayed", inputSchema: { type: "object" } }] };
+    }
+    if (input.operation === "mcp.call") {
+      this.#markStarted();
+      await this.resultGate;
+      return { content: [{ type: "text", text: "secret-stale-result" }] };
+    }
+    throw new Error(`unexpected operation ${input.operation}`);
+  }
+}
+
 test("Fabric MCP mounts reach fixed real servers, isolate same-name tools and sessions, and never write MCP files", async (t) => {
   const agentDir = await mkdtemp(join(tmpdir(), "fabric-mcp-mount-"));
   const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
@@ -248,4 +279,214 @@ test("Fabric MCP mounts reach fixed real servers, isolate same-name tools and se
 
   assert.equal(await readFile(configPath, "utf8"), "config-sentinel\n");
   assert.equal(await readFile(cachePath, "utf8"), "cache-sentinel\n");
+});
+
+test("Fabric revoke hides first and fences a delayed call before a replacement mount can publish", async (t) => {
+  const endpointRoute = route("endpoint-delayed");
+  const delayed = new DelayedFabricDispatcher();
+  const routes = new Map([[endpointRoute.routeId, endpointRoute]]);
+  const endpoints = new Map([[endpointRoute.endpointId, endpoint(endpointRoute.endpointId)]]);
+  const state = createState(
+    "session-fence",
+    routes,
+    endpoints,
+    new Map([[endpointRoute.endpointId, delayed]]),
+  );
+  t.after(async () => { await state.fabricMounts!.closeAll(); });
+
+  const mounted = await executeFabricMount(state, endpointRoute);
+  const serverName = String(mounted.details.server);
+  const mountId = (mounted.details.mount as { mountId: string }).mountId;
+  const toolName = state.toolMetadata.get(serverName)![0]!.name;
+  const call = executeCall(state, toolName, { value: "old" }, serverName);
+  await delayed.started;
+
+  const unmount = state.fabricMounts!.unmount(mountId);
+  assert.equal(state.fabricMounts!.hasServer(serverName), false, "outer visibility is removed synchronously before inner drain");
+  assert.equal(state.toolMetadata.has(serverName), false, "search and describe cannot observe stale tools");
+  assert.equal(executeSearch(state, "echo").details.count, 0);
+  assert.equal(executeDescribe(state, toolName).details.error, "tool_not_found");
+
+  delayed.release();
+  const staleResult = await call;
+  await unmount;
+  assert.doesNotMatch(text(staleResult), /secret-stale-result/);
+
+  const replacementDispatcher: FabricMcpDispatchPort = {
+    async dispatch(input): Promise<JsonValue> {
+      if (input.operation === "mcp.initialize") {
+        return { capabilities: { tools: {} }, serverVersion: { name: "replacement", version: "1" } };
+      }
+      if (input.operation === "mcp.list") {
+        return { tools: [{ name: "replacement", description: "new authority", inputSchema: { type: "object" } }] };
+      }
+      return { content: [{ type: "text", text: "replacement-result" }] };
+    },
+  };
+  const replacementState = createState(
+    "session-replacement",
+    routes,
+    endpoints,
+    new Map([[endpointRoute.endpointId, replacementDispatcher]]),
+  );
+  t.after(async () => { await replacementState.fabricMounts!.closeAll(); });
+  const replacement = await executeFabricMount(replacementState, endpointRoute);
+  const replacementServer = String(replacement.details.server);
+  assert.deepEqual(
+    replacementState.toolMetadata.get(replacementServer)?.map((tool) => tool.originalName),
+    ["replacement"],
+    "a stale callback cannot overwrite the replacement mount metadata",
+  );
+});
+
+test("Fabric revoke during paginated discovery drains startup without publishing a connection", async (t) => {
+  const endpointRoute = route("endpoint-pages");
+  let page = 0;
+  let markSecondPage!: () => void;
+  let releaseSecondPage!: () => void;
+  const secondPage = new Promise<void>((resolve) => { markSecondPage = resolve; });
+  const pageGate = new Promise<void>((resolve) => { releaseSecondPage = resolve; });
+  const dispatcher: FabricMcpDispatchPort = {
+    async dispatch(input): Promise<JsonValue> {
+      if (input.operation === "mcp.initialize") {
+        return { capabilities: { tools: {} }, serverVersion: { name: "pages", version: "1" } };
+      }
+      if (input.operation === "mcp.list") {
+        page += 1;
+        if (page === 1) {
+          return { tools: [{ name: "page-one", inputSchema: { type: "object" } }], nextCursor: "next" };
+        }
+        markSecondPage();
+        await pageGate;
+        return { tools: [{ name: "stale-page-two", inputSchema: { type: "object" } }] };
+      }
+      return { content: [] };
+    },
+  };
+  const state = createState(
+    "session-pages",
+    new Map([[endpointRoute.routeId, endpointRoute]]),
+    new Map([[endpointRoute.endpointId, endpoint(endpointRoute.endpointId)]]),
+    new Map([[endpointRoute.endpointId, dispatcher]]),
+  );
+  t.after(async () => { await state.fabricMounts!.closeAll(); });
+  const mounted = await state.fabricMounts!.mount(endpointRoute, new AbortController().signal);
+  const definition = state.fabricMounts!.getDefinition(mounted.serverName)!;
+  const connecting = state.manager.connect(mounted.serverName, definition);
+  await secondPage;
+  const unmounting = state.fabricMounts!.unmount(mounted.lease.mountId);
+  assert.equal(state.fabricMounts!.hasServer(mounted.serverName), false);
+  assert.equal(state.manager.getConnection(mounted.serverName), undefined);
+  releaseSecondPage();
+  await assert.rejects(connecting);
+  await unmounting;
+  assert.equal(state.manager.getConnection(mounted.serverName), undefined);
+  assert.equal(state.toolMetadata.has(mounted.serverName), false);
+});
+
+test("Fabric route validation failure immediately evicts metadata and drains the inner client", async (t) => {
+  const endpointRoute = route("endpoint-stale-route");
+  const source = await realMcpSource("stale-route");
+  t.after(async () => { await source.close(); });
+  const routes = new Map([[endpointRoute.routeId, endpointRoute]]);
+  const state = createState(
+    "session-stale-route",
+    routes,
+    new Map([[endpointRoute.endpointId, endpoint(endpointRoute.endpointId)]]),
+    new Map([[endpointRoute.endpointId, source.dispatcher]]),
+  );
+  t.after(async () => { await state.fabricMounts!.closeAll(); });
+
+  const mounted = await executeFabricMount(state, endpointRoute);
+  const serverName = String(mounted.details.server);
+  const mountId = (mounted.details.mount as { mountId: string }).mountId;
+  endpointRoute.revision += 1;
+  const validation = await executeFabricValidate(state, mountId);
+
+  assert.equal(validation.details.error, "mount_invalid");
+  assert.equal(state.fabricMounts!.hasServer(serverName), false);
+  assert.equal(state.toolMetadata.has(serverName), false);
+  assert.equal(executeSearch(state, "echo").details.count, 0);
+  await state.fabricMounts!.closeAll();
+  assert.equal(state.manager.getConnection(serverName), undefined);
+});
+
+test("Fabric mutation transport loss is reported as outcome unknown and is never replayed", async () => {
+  let dispatches = 0;
+  const endpointRoute = route("endpoint-mutation");
+  endpointRoute.operationClass = "mcp-mutation";
+  const provider = new FabricMcpMountProvider({
+    sessionId: "session-mutation",
+    routes: {
+      validateRoute: () => structuredClone(endpointRoute),
+      validateBinding: () => ({
+        bindingId: "binding-project",
+        connectionId: "connection-edge",
+        deviceId: "device-edge",
+        workspaceId: "workspace-project",
+        connectionGeneration: 4,
+        workspaceGeneration: 2,
+        policyDigest: "b".repeat(64),
+        issuedAt: Date.now() - 1_000,
+        expiresAt: Date.now() + 60_000,
+        revision: 1,
+      }),
+    },
+    endpoints: { getEndpoint: () => endpoint("endpoint-mutation") },
+    connections: {
+      requireReadyForDevice: () => ({
+        connectionId: "connection-edge",
+        deviceId: "device-edge",
+        connectorId: "connector-edge",
+        connectorInstanceNonce: "nonce-edge",
+        generation: 4,
+        state: "connected",
+        capabilityDigest: "c".repeat(64),
+        establishedAt: Date.now() - 1_000,
+        expiresAt: Date.now() + 60_000,
+        revision: 1,
+      }),
+    },
+    createMountId: () => "mount-mutation",
+  });
+  const lease = await provider.mount(endpointRoute, new AbortController().signal);
+  const transport = new FabricMcpClientTransport({
+    lease,
+    workspaceId: "workspace-project",
+    workspaceGeneration: 2,
+    mutation: true,
+    validate: async () => { await provider.validate(lease.mountId, lease.routeRevision); },
+    dispatcher: {
+      async dispatch(): Promise<JsonValue> {
+        dispatches += 1;
+        throw new Error("connection lost after write");
+      },
+    },
+  });
+  const messages: unknown[] = [];
+  transport.onmessage = (message) => { messages.push(message); };
+  await transport.start();
+  await transport.send({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "mutate", arguments: {} } });
+  assert.equal(dispatches, 1);
+  assert.match(JSON.stringify(messages), /outcome is unknown/);
+  await transport.close();
+  await provider.unmount(lease.mountId);
+});
+
+test("Fabric continuation fences structurally cover direct, resource, metadata, and UI publication paths", async () => {
+  const root = new URL("../src/mcp/", import.meta.url);
+  const [direct, init, manager, uiResource, uiServer] = await Promise.all([
+    readFile(new URL("direct-tools.ts", root), "utf8"),
+    readFile(new URL("init.ts", root), "utf8"),
+    readFile(new URL("server-manager.ts", root), "utf8"),
+    readFile(new URL("ui-resource-handler.ts", root), "utf8"),
+    readFile(new URL("ui-server.ts", root), "utf8"),
+  ]);
+  assert.match(direct, /await connection\.client\.readResource[\s\S]*lease\.assertCurrent\(\)/u);
+  assert.match(direct, /await abortable\(resultPromise[\s\S]*lease\.assertCurrent\(\)[\s\S]*sendToolResult/u);
+  assert.match(init, /routeLease\?\.assertCurrent\(\)[\s\S]*toolMetadata\.set/u);
+  assert.match(init, /if \(routeLease !== undefined\) return/u);
+  assert.match(manager, /if \(connection\.fabricRoute !== undefined\) await connection\.fabricRoute\.validateCurrent\(\);[\s\S]*connections\.set/u);
+  assert.match(uiResource, /routeLease\?\.assertCurrent\(\)/u);
+  assert.match(uiServer, /lease\.assertCurrent\(\)[\s\S]*sendJson\(res, 200/u);
 });

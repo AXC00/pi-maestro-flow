@@ -6,7 +6,8 @@ import type { EndpointRouteHandle } from "pi-maestro-fabric-core/v1";
 import type { FabricMcpMountedServer } from "./fabric-mount-registry.ts";
 import type { ToolMetadata, McpContent } from "./types.ts";
 import { getServerPrefix, parseUiPromptHandoff } from "./types.ts";
-import { getRuntimeServerDefinition, getRuntimeServerNames, lazyConnect, updateServerMetadata, updateMetadataCache, getFailureAgeSeconds, updateStatusBar } from "./init.ts";
+import { captureFabricRoute, getRuntimeServerDefinition, getRuntimeServerNames, lazyConnect, updateServerMetadata, updateMetadataCache, getFailureAgeSeconds, updateStatusBar } from "./init.ts";
+import { combineMcpSignals, type FabricMcpRouteLease } from "./fabric-route-guard.ts";
 import { abortable, throwIfAborted } from "./abort.ts";
 import { buildToolMetadata, getToolNames, findToolByName, formatSchema } from "./tool-metadata.ts";
 import { resolveMcpResultContent, transformMcpContent } from "./tool-registrar.ts";
@@ -213,12 +214,19 @@ export async function executeFabricMount(
   let mounted: FabricMcpMountedServer | undefined;
   try {
     mounted = await state.fabricMounts.mount(route as EndpointRouteHandle, signal ?? controller!.signal);
+    const routeLease = state.fabricMounts.capture(mounted.serverName)!;
     const definition = state.fabricMounts.getDefinition(mounted.serverName)!;
-    const connection = await state.manager.connect(mounted.serverName, definition, signal);
+    const connection = await state.manager.connect(
+      mounted.serverName,
+      definition,
+      combineMcpSignals(signal, routeLease.signal),
+    );
+    await routeLease.validateCurrent();
     if (connection.status !== "connected") throw new Error(`Fabric MCP server reported ${connection.status}`);
     updateServerMetadata(state, mounted.serverName);
     state.failureTracker.delete(mounted.serverName);
     updateStatusBar(state);
+    routeLease.assertCurrent();
     return {
       content: [{ type: "text" as const, text: `Mounted ${mounted.serverName} (${connection.tools.length} tools).` }],
       details: { mode: "mount", server: mounted.serverName, mount: mounted.lease, references: mounted.references },
@@ -595,6 +603,8 @@ export function executeList(state: McpExtensionState, server: string): ProxyTool
     };
   }
 
+  const routeLease = captureFabricRoute(state, server);
+  routeLease?.assertCurrent();
   const metadata = state.toolMetadata.get(server);
   const toolNames = metadata?.map(m => m.name) ?? [];
   const connection = state.manager.getConnection(server);
@@ -652,11 +662,14 @@ export async function executeConnect(state: McpExtensionState, serverName: strin
     };
   }
 
+  const routeLease = captureFabricRoute(state, serverName);
+  const operationSignal = combineMcpSignals(signal, routeLease?.signal);
   try {
     if (state.ui) {
       state.ui.setStatus("mcp", `MCP: connecting to ${serverName}...`);
     }
-    let connection = await state.manager.connect(serverName, definition, signal);
+    let connection = await state.manager.connect(serverName, definition, operationSignal);
+    if (routeLease !== undefined) await routeLease.validateCurrent();
     if (connection.status === "needs-auth") {
       const autoAuth = await attemptAutoAuth(state, serverName);
       if (autoAuth.status === "failed") {
@@ -667,7 +680,8 @@ export async function executeConnect(state: McpExtensionState, serverName: strin
       }
       if (autoAuth.status === "success") {
         await state.manager.close(serverName);
-        connection = await state.manager.connect(serverName, definition, signal);
+        connection = await state.manager.connect(serverName, definition, operationSignal);
+        if (routeLease !== undefined) await routeLease.validateCurrent();
       }
       if (connection.status === "needs-auth") {
         const message = getAuthRequiredMessage(state, serverName);
@@ -677,22 +691,24 @@ export async function executeConnect(state: McpExtensionState, serverName: strin
         };
       }
     }
-    const prefix = state.config.settings?.toolPrefix ?? "server";
+    const prefix = routeLease === undefined ? state.config.settings?.toolPrefix ?? "server" : "server";
     const { metadata } = buildToolMetadata(connection.tools, connection.resources, definition, serverName, prefix);
+    routeLease?.assertCurrent();
     state.toolMetadata.set(serverName, metadata);
     updateMetadataCache(state, serverName);
     state.failureTracker.delete(serverName);
     updateStatusBar(state);
+    routeLease?.assertCurrent();
     return executeList(state, serverName);
   } catch (error) {
-    if (!signal?.aborted) {
+    if (!operationSignal?.aborted) {
       state.failureTracker.set(serverName, Date.now());
     }
-    updateStatusBar(state);
+    if (routeLease === undefined || routeLease.isCurrent()) updateStatusBar(state);
     const message = error instanceof Error ? error.message : String(error);
     return {
       content: [{ type: "text" as const, text: `Failed to connect to "${serverName}": ${message}` }],
-      details: { mode: "connect", error: signal?.aborted ? "aborted" : "connect_failed", server: serverName, message },
+      details: { mode: "connect", error: operationSignal?.aborted ? "aborted" : "connect_failed", server: serverName, message },
     };
   }
 }
@@ -849,6 +865,10 @@ export async function executeCall(
     };
   }
 
+  const routeLease: FabricMcpRouteLease | undefined = captureFabricRoute(state, serverName);
+  const operationSignal = combineMcpSignals(signal, routeLease?.signal);
+  routeLease?.assertCurrent();
+
   let connection = state.manager.getConnection(serverName);
   if (connection?.status === "needs-auth") {
     if (!autoAuthAttempted) {
@@ -896,7 +916,8 @@ export async function executeCall(
       if (state.ui) {
         state.ui.setStatus("mcp", `MCP: connecting to ${serverName}...`);
       }
-      connection = await state.manager.connect(serverName, definition, signal);
+      connection = await state.manager.connect(serverName, definition, operationSignal);
+      if (routeLease !== undefined) await routeLease.validateCurrent();
       if (connection.status === "needs-auth") {
         if (!autoAuthAttempted) {
           autoAuthAttempted = true;
@@ -909,7 +930,8 @@ export async function executeCall(
           }
           if (autoAuth.status === "success") {
             await state.manager.close(serverName);
-            connection = await state.manager.connect(serverName, definition, signal);
+            connection = await state.manager.connect(serverName, definition, operationSignal);
+            if (routeLease !== undefined) await routeLease.validateCurrent();
           }
         }
 
@@ -937,19 +959,19 @@ export async function executeCall(
         };
       }
     } catch (error) {
-      if (!signal?.aborted) {
+      if (!operationSignal?.aborted) {
         state.failureTracker.set(serverName, Date.now());
       }
-      updateStatusBar(state);
+      if (routeLease === undefined || routeLease.isCurrent()) updateStatusBar(state);
       const message = error instanceof Error ? error.message : String(error);
       return {
         content: [{ type: "text" as const, text: `Failed to connect to "${serverName}": ${message}` }],
-        details: { mode: "call", error: signal?.aborted ? "aborted" : "connect_failed", message },
+        details: { mode: "call", error: operationSignal?.aborted ? "aborted" : "connect_failed", message },
       };
     }
   }
 
-  const lease = state.manager.acquireConnection(serverName, signal);
+  const lease = state.manager.acquireConnection(serverName, operationSignal);
   if (!lease) {
     return {
       content: [{ type: "text" as const, text: `Server "${serverName}" closed before the tool call started.` }],
@@ -965,11 +987,13 @@ export async function executeCall(
   try {
     if (toolMeta.resourceUri) {
       const result = await connection.client.readResource({ uri: toolMeta.resourceUri }, requestOptions);
+      lease.assertCurrent();
       const content = (result.contents ?? []).map(c => ({
         type: "text" as const,
         text: "text" in c ? c.text : ("blob" in c ? `[Binary data: ${(c as { mimeType?: string }).mimeType ?? "unknown"}]` : JSON.stringify(c)),
       }));
       const guarded = await guardMcpOutput(content.length > 0 ? content : [{ type: "text" as const, text: "(empty resource)" }], outputGuardOptions);
+      lease.assertCurrent();
       return {
         content: guarded.content,
         details: { mode: "call", resourceUri: toolMeta.resourceUri, server: serverName, ...guardedMcpDetails(guarded) },
@@ -985,6 +1009,7 @@ export async function executeCall(
           streamMode: toolMeta.uiStreamMode,
         })
       : null;
+    lease.assertCurrent();
 
     const resultPromise = connection.client.callTool({
       name: toolMeta.originalName,
@@ -993,7 +1018,8 @@ export async function executeCall(
     }, undefined, requestOptions);
 
     if (toolMeta.uiResourceUri) {
-      const result = await abortable(resultPromise, signal);
+      const result = await abortable(resultPromise, operationSignal);
+      lease.assertCurrent();
       uiSession?.sendToolResult(result as unknown as import("@modelcontextprotocol/sdk/types.js").CallToolResult);
 
       if (result.isError) {
@@ -1002,6 +1028,7 @@ export async function executeCall(
         const outputContent = content.length > 0 ? content : [{ type: "text" as const, text: "(empty result)" }];
         const schemaText = toolMeta.inputSchema ? `\n\nExpected parameters:\n${formatSchema(toolMeta.inputSchema)}` : "";
         const guarded = await guardMcpOutput(outputContent, { ...outputGuardOptions, prefix: "Error: ", suffix: schemaText, emptyTextFallback: "Tool execution failed", rawMcpResult: result });
+        lease.assertCurrent();
         return {
           content: guarded.content,
           details: { mode: "call", error: "tool_error", ...guardedMcpDetails(guarded) },
@@ -1014,13 +1041,15 @@ export async function executeCall(
         ? "Updated the open UI."
         : "📺 Interactive UI is now open in your browser. I'll respond to your prompts and intents as you interact with it.";
       const guarded = await guardMcpOutput(outputContent, { ...outputGuardOptions, suffix: `\n\n${uiMessage}`, rawMcpResult: result });
+      lease.assertCurrent();
       return {
         content: guarded.content,
         details: { mode: "call", ...guardedMcpDetails(guarded), server: serverName, tool: toolMeta.originalName, uiOpen: true },
       };
     }
 
-    const result = await abortable(resultPromise, signal);
+    const result = await abortable(resultPromise, operationSignal);
+    lease.assertCurrent();
 
     if (result.isError) {
       const mcpContent = (result.content ?? []) as McpContent[];
@@ -1028,6 +1057,7 @@ export async function executeCall(
       const outputContent = content.length > 0 ? content : [{ type: "text" as const, text: "(empty result)" }];
       const schemaText = toolMeta.inputSchema ? `\n\nExpected parameters:\n${formatSchema(toolMeta.inputSchema)}` : "";
       const guarded = await guardMcpOutput(outputContent, { ...outputGuardOptions, prefix: "Error: ", suffix: schemaText, emptyTextFallback: "Tool execution failed", rawMcpResult: result });
+      lease.assertCurrent();
       return {
         content: guarded.content,
         details: { mode: "call", error: "tool_error", ...guardedMcpDetails(guarded) },
@@ -1037,13 +1067,22 @@ export async function executeCall(
     const content = resolveMcpResultContent(result as Record<string, unknown>);
     const outputContent = content.length > 0 ? content : [{ type: "text" as const, text: "(empty result)" }];
     const guarded = await guardMcpOutput(outputContent, { ...outputGuardOptions, rawMcpResult: result });
+    lease.assertCurrent();
     return {
       content: guarded.content,
       details: { mode: "call", ...guardedMcpDetails(guarded), server: serverName, tool: toolMeta.originalName },
     };
   } catch (error) {
+    if (routeLease !== undefined && !lease.isCurrent()) {
+      uiSession?.close();
+      return {
+        content: [{ type: "text" as const, text: "Fabric MCP mount is no longer current." }],
+        details: { mode: "call", error: "stale_generation", server: serverName },
+      };
+    }
     if (error instanceof UrlElicitationRequiredError) {
       const action = await state.manager.handleUrlElicitationRequired(serverName, error);
+      lease.assertCurrent();
       const message = action === "accept"
         ? "The original MCP tool did not run. Complete the opened browser interaction, then retry the tool."
         : `The URL interaction was ${action === "decline" ? "declined" : "cancelled"}.`;

@@ -2,6 +2,7 @@ import type { Transport, TransportSendOptions } from "@modelcontextprotocol/sdk/
 import type { JSONRPCMessage, RequestId } from "@modelcontextprotocol/sdk/types.js";
 import { FabricContractError, assertFabricIdentifier, type FabricMountLeaseV1, type JsonValue } from "pi-maestro-fabric-core/v1";
 import type { FabricHttpsDispatchInput } from "../gateway/fabric/https-transport.ts";
+import { FabricMcpOutcomeUnknownError, combineMcpSignals } from "./fabric-route-guard.ts";
 
 export interface FabricMcpDispatchPort {
   dispatch(input: FabricHttpsDispatchInput, signal: AbortSignal): Promise<JsonValue>;
@@ -13,6 +14,8 @@ export interface FabricMcpClientTransportOptions {
   workspaceGeneration: number;
   dispatcher: FabricMcpDispatchPort;
   validate: () => Promise<void>;
+  signal?: AbortSignal;
+  mutation?: boolean;
   requestTimeoutMs?: number;
   now?: () => number;
 }
@@ -42,6 +45,8 @@ export class FabricMcpClientTransport implements Transport {
   readonly #workspaceGeneration: number;
   readonly #dispatcher: FabricMcpDispatchPort;
   readonly #validate: () => Promise<void>;
+  readonly #authoritySignal?: AbortSignal;
+  readonly #mutation: boolean;
   readonly #requestTimeoutMs: number;
   readonly #now: () => number;
   readonly #pending = new Map<string, AbortController>();
@@ -65,6 +70,8 @@ export class FabricMcpClientTransport implements Transport {
     this.#workspaceGeneration = options.workspaceGeneration;
     this.#dispatcher = options.dispatcher;
     this.#validate = options.validate;
+    this.#authoritySignal = options.signal;
+    this.#mutation = options.mutation === true;
     this.#requestTimeoutMs = requestTimeoutMs;
     this.#now = options.now ?? Date.now;
     this.sessionId = options.lease.mountId;
@@ -92,6 +99,7 @@ export class FabricMcpClientTransport implements Transport {
 
     const id = message.id;
     const controller = new AbortController();
+    const dispatchSignal = combineMcpSignals(controller.signal, this.#authoritySignal)!;
     const key = requestIdKey(id);
     if (this.#pending.has(key)) throw new FabricContractError("conflict", "MCP request identity is already pending", "requestId");
     this.#pending.set(key, controller);
@@ -100,7 +108,15 @@ export class FabricMcpClientTransport implements Transport {
       const deadlineAt = Math.min(this.#lease.expiresAt, this.#now() + this.#requestTimeoutMs);
       if (deadlineAt <= this.#now()) throw new FabricContractError("deadline_exceeded", "Fabric MCP mount has expired", "expiresAt");
       await this.#validate();
-      const result = await this.#dispatch(message.method, params, deadlineAt, controller.signal);
+      let result: JsonValue;
+      try {
+        result = await this.#dispatch(message.method, params, deadlineAt, dispatchSignal);
+      } catch (error) {
+        if (message.method === "tools/call" && this.#mutation && isUncertainFabricFailure(error)) {
+          throw new FabricMcpOutcomeUnknownError();
+        }
+        throw error;
+      }
       await this.#validate();
       if (this.#closed || this.#pending.get(key) !== controller) return;
       this.onmessage?.({ jsonrpc: "2.0", id, result } as JSONRPCMessage);
@@ -182,4 +198,15 @@ export class FabricMcpClientTransport implements Transport {
     if (method === "ping") return {};
     throw new FabricContractError("invalid_argument", `Unsupported Fabric MCP method: ${method}`, "method");
   }
+}
+
+function isUncertainFabricFailure(error: unknown): boolean {
+  if (!(error instanceof Error)) return true;
+  if (error instanceof FabricContractError) {
+    return error.code === "cancelled"
+      || error.code === "deadline_exceeded"
+      || error.code === "unavailable"
+      || error.code === "outcome_unknown";
+  }
+  return true;
 }

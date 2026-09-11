@@ -71,16 +71,61 @@ interface PendingAuth {
   resolve: (code: string) => void
   reject: (error: Error) => void
   timeout: ReturnType<typeof setTimeout>
+  bindingId: number
 }
 
 /** Server singleton state */
 let server: Server | undefined
-let bindingPromise: Promise<void> | undefined
+let activeBindingId: number | undefined
+let bindingSequence = 0
+let bindingOperation: { id: number; controller: AbortController; promise: Promise<void> } | undefined
 const pendingAuths = new Map<string, PendingAuth>()
-const reservedAuthStates = new Set<string>()
+const reservedAuthStates = new Map<string, number>()
 
 /** Timeout for callback completion (5 minutes) */
 const CALLBACK_TIMEOUT_MS = 5 * 60 * 1000
+const CALLBACK_CLOSE_TIMEOUT_MS = 5_000
+
+async function waitForSettlementUntilDeadline(
+  promise: Promise<unknown>,
+  timeoutMs: number,
+): Promise<"settled" | "deadline"> {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  try {
+    return await Promise.race([
+      promise.then(
+        () => "settled" as const,
+        () => "settled" as const,
+      ),
+      new Promise<"deadline">((resolve) => {
+        timer = setTimeout(() => resolve("deadline"), timeoutMs)
+      }),
+    ])
+  } finally {
+    if (timer !== undefined) clearTimeout(timer)
+  }
+}
+
+async function closeServerBounded(target: Server, description: string): Promise<void> {
+  let closePromise: Promise<void>
+  try {
+    closePromise = new Promise((resolve, reject) => {
+      target.close((error) => {
+        if (error) reject(error)
+        else resolve()
+      })
+    })
+  } catch (error) {
+    closePromise = Promise.reject(error)
+  }
+  const outcome = await waitForSettlementUntilDeadline(closePromise, CALLBACK_CLOSE_TIMEOUT_MS)
+  if (outcome === "deadline") {
+    target.closeAllConnections()
+    console.error(`[MCP] ${description} did not close within ${CALLBACK_CLOSE_TIMEOUT_MS}ms; connections were destroyed`)
+    return
+  }
+  await closePromise
+}
 
 interface EnsureCallbackServerOptions {
   strictPort?: boolean
@@ -89,6 +134,7 @@ interface EnsureCallbackServerOptions {
   callbackPath?: string
   oauthState?: string
   reserveState?: boolean
+  signal?: AbortSignal
 }
 
 const DEFAULT_OAUTH_CALLBACK_HOST = "localhost"
@@ -97,7 +143,12 @@ let callbackServerHost = DEFAULT_OAUTH_CALLBACK_HOST
 /**
  * Handle incoming HTTP requests to the callback server.
  */
-function handleRequest(req: IncomingMessage, res: ServerResponse): void {
+function handleRequest(bindingId: number, req: IncomingMessage, res: ServerResponse): void {
+  if (bindingId !== activeBindingId) {
+    res.writeHead(410, { "Content-Type": "text/plain" })
+    res.end("OAuth callback binding is no longer active")
+    return
+  }
   const url = new URL(req.url || "/", `http://${req.headers.host}`)
 
   // Only handle the callback path
@@ -120,8 +171,9 @@ function handleRequest(req: IncomingMessage, res: ServerResponse): void {
     return
   }
 
-  const pending = pendingAuths.get(state)
-  const isReserved = reservedAuthStates.has(state)
+  const pendingRecord = pendingAuths.get(state)
+  const pending = pendingRecord?.bindingId === bindingId ? pendingRecord : undefined
+  const isReserved = reservedAuthStates.get(state) === bindingId
 
   // Handle OAuth errors only for a state that belongs to an active flow.
   if (error) {
@@ -176,22 +228,31 @@ function handleRequest(req: IncomingMessage, res: ServerResponse): void {
  * If strictPort is false, asks the OS for an available local port.
  */
 export async function ensureCallbackServer(options: EnsureCallbackServerOptions = {}): Promise<void> {
-  while (bindingPromise) {
-    await bindingPromise
+  while (bindingOperation) {
+    await bindingOperation.promise
   }
 
-  const operation = ensureCallbackServerLocked(options)
-  bindingPromise = operation
+  const id = ++bindingSequence
+  const controller = new AbortController()
+  const signal = options.signal ? AbortSignal.any([options.signal, controller.signal]) : controller.signal
+  const promise = ensureCallbackServerLocked(options, id, signal)
+  const operation = { id, controller, promise }
+  bindingOperation = operation
   try {
-    await operation
+    await promise
   } finally {
-    if (bindingPromise === operation) {
-      bindingPromise = undefined
+    if (bindingOperation === operation) {
+      bindingOperation = undefined
     }
   }
 }
 
-async function ensureCallbackServerLocked(options: EnsureCallbackServerOptions = {}): Promise<void> {
+async function ensureCallbackServerLocked(
+  options: EnsureCallbackServerOptions,
+  bindingId: number,
+  signal: AbortSignal,
+): Promise<void> {
+  if (signal.aborted) throw signal.reason
   const requiredPort = options.port ?? getConfiguredOAuthCallbackPort()
   const strictPort = options.strictPort === true
   const requestedHost = options.callbackHost ?? DEFAULT_OAUTH_CALLBACK_HOST
@@ -218,7 +279,8 @@ async function ensureCallbackServerLocked(options: EnsureCallbackServerOptions =
         setOAuthCallbackPath(requestedPath)
       }
       if (options.reserveState && options.oauthState) {
-        reservedAuthStates.add(options.oauthState)
+        if (activeBindingId === undefined) throw new Error("OAuth callback server has no active binding identity")
+        reservedAuthStates.set(options.oauthState, activeBindingId)
         reservedState = options.oauthState
       }
       return
@@ -231,19 +293,26 @@ async function ensureCallbackServerLocked(options: EnsureCallbackServerOptions =
     }
   }
 
-  const candidateServer = createServer(handleRequest)
+  const candidateServer = createServer((req, res) => handleRequest(bindingId, req, res))
   const listenPort = strictPort ? requiredPort : 0
 
   try {
     await new Promise<void>((resolve, reject) => {
-      candidateServer.once("error", (err) => {
-        reject(err)
-      })
-
+      const onAbort = (): void => {
+        candidateServer.close()
+        reject(signal.reason)
+      }
+      candidateServer.once("error", reject)
+      signal.addEventListener("abort", onAbort, { once: true })
       candidateServer.listen(listenPort, requestedHost, () => {
+        signal.removeEventListener("abort", onAbort)
         resolve()
       })
     })
+    if (signal.aborted || bindingOperation?.id !== bindingId) {
+      await closeServerBounded(candidateServer, "stale OAuth callback candidate")
+      throw signal.reason ?? new Error("OAuth callback binding was superseded")
+    }
 
     if (strictPort) {
       setOAuthCallbackPort(requiredPort)
@@ -256,16 +325,20 @@ async function ensureCallbackServerLocked(options: EnsureCallbackServerOptions =
     }
 
     if (previousServer && (needsStrictRebind || needsHostSwitch)) {
-      await new Promise<void>((resolve) => {
-        previousServer.close(() => resolve())
-      })
+      activeBindingId = undefined
+      await closeServerBounded(previousServer, "replaced OAuth callback server")
     }
 
+    if (signal.aborted || bindingOperation?.id !== bindingId) {
+      await closeServerBounded(candidateServer, "stale OAuth callback candidate")
+      throw signal.reason ?? new Error("OAuth callback binding was superseded")
+    }
     callbackServerHost = requestedHost
     setOAuthCallbackPath(requestedPath)
     server = candidateServer
+    activeBindingId = bindingId
     if (options.reserveState && options.oauthState) {
-      reservedAuthStates.add(options.oauthState)
+      reservedAuthStates.set(options.oauthState, bindingId)
       reservedState = options.oauthState
     }
     server.unref()
@@ -274,9 +347,7 @@ async function ensureCallbackServerLocked(options: EnsureCallbackServerOptions =
       reservedAuthStates.delete(reservedState)
     }
     const nodeError = error as NodeJS.ErrnoException
-    await new Promise<void>((resolve) => {
-      candidateServer.close(() => resolve())
-    })
+    await closeServerBounded(candidateServer, "failed OAuth callback candidate")
 
     if (strictPort && nodeError.code === "EADDRINUSE") {
       throw new Error(
@@ -290,7 +361,8 @@ async function ensureCallbackServerLocked(options: EnsureCallbackServerOptions =
 }
 
 export function reserveCallbackServer(oauthState: string): void {
-  reservedAuthStates.add(oauthState)
+  if (activeBindingId === undefined) throw new Error("OAuth callback server is not running")
+  reservedAuthStates.set(oauthState, activeBindingId)
 }
 
 export function releaseCallbackServer(oauthState: string): void {
@@ -302,6 +374,10 @@ export function releaseCallbackServer(oauthState: string): void {
  * Returns a promise that resolves with the authorization code.
  */
 export function waitForCallback(oauthState: string): Promise<string> {
+  const bindingId = reservedAuthStates.get(oauthState) ?? activeBindingId
+  if (bindingId === undefined || bindingId !== activeBindingId) {
+    throw new Error("OAuth callback server binding is not current")
+  }
   reservedAuthStates.delete(oauthState)
   return new Promise((resolve, reject) => {
     const timeout = setTimeout(() => {
@@ -311,7 +387,7 @@ export function waitForCallback(oauthState: string): Promise<string> {
       }
     }, CALLBACK_TIMEOUT_MS)
 
-    pendingAuths.set(oauthState, { resolve, reject, timeout })
+    pendingAuths.set(oauthState, { resolve, reject, timeout, bindingId })
   })
 }
 
@@ -332,29 +408,39 @@ export function cancelPendingCallback(oauthState: string): void {
  * Stop the callback server and reject all pending authorizations.
  */
 export async function stopCallbackServer(): Promise<void> {
-  if (server) {
-    await new Promise<void>((resolve) => {
-      server!.close(() => {
-        resolve()
-      })
-    })
-    server = undefined
+  const activeServer = server
+  const activeOperation = bindingOperation
+  server = undefined
+  activeBindingId = undefined
+  if (activeOperation !== undefined) {
+    activeOperation.controller.abort(new Error("OAuth callback binding stopped"))
   }
 
   setOAuthCallbackPort(getConfiguredOAuthCallbackPort())
   callbackServerHost = DEFAULT_OAUTH_CALLBACK_HOST
   setOAuthCallbackPath(DEFAULT_OAUTH_CALLBACK_PATH)
 
-  // Reject all pending auths (defer to allow any pending operations to complete)
-  const pendingList = Array.from(pendingAuths.entries())
+  const pendingList = Array.from(pendingAuths.values())
   pendingAuths.clear()
   reservedAuthStates.clear()
+
+  const cleanup: Promise<unknown>[] = []
+  if (activeServer !== undefined) {
+    cleanup.push(closeServerBounded(activeServer, "OAuth callback server"))
+  }
+  if (activeOperation !== undefined) {
+    cleanup.push(waitForSettlementUntilDeadline(activeOperation.promise, CALLBACK_CLOSE_TIMEOUT_MS))
+  }
+  const results = await Promise.allSettled(cleanup)
+
   setTimeout(() => {
-    for (const [, pending] of pendingList) {
+    for (const pending of pendingList) {
       clearTimeout(pending.timeout)
       pending.reject(new Error("OAuth callback server stopped"))
     }
   }, 0)
+  const failure = results.find((result): result is PromiseRejectedResult => result.status === "rejected")
+  if (failure !== undefined) throw failure.reason
 }
 
 /**

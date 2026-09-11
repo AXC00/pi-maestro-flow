@@ -25,6 +25,7 @@ import { authenticate, supportsOAuth } from "./mcp-auth-flow.ts";
 import { getMissingConfiguredDirectToolServers } from "./direct-tools.ts";
 import { throwIfAborted } from "./abort.ts";
 import { FabricMcpMountRegistry, type FabricMcpMountRegistryOptions } from "./fabric-mount-registry.ts";
+import { combineMcpSignals, type FabricMcpRouteLease } from "./fabric-route-guard.ts";
 
 const FAILURE_BACKOFF_MS = 60 * 1000;
 
@@ -254,6 +255,13 @@ export async function initializeMcp(
   return state;
 }
 
+export function captureFabricRoute(
+  state: McpExtensionState,
+  serverName: string,
+): FabricMcpRouteLease | undefined {
+  return state.fabricMounts?.capture(serverName);
+}
+
 export function getRuntimeServerDefinition(state: McpExtensionState, serverName: string): ServerDefinition | undefined {
   return state.config.mcpServers[serverName] ?? state.fabricMounts?.getDefinition(serverName);
 }
@@ -266,6 +274,8 @@ export function getRuntimeServerNames(state: McpExtensionState): string[] {
 }
 
 export function updateServerMetadata(state: McpExtensionState, serverName: string): void {
+  const routeLease = captureFabricRoute(state, serverName);
+  routeLease?.assertCurrent();
   const connection = state.manager.getConnection(serverName);
   if (!connection || connection.status !== "connected") return;
 
@@ -277,11 +287,13 @@ export function updateServerMetadata(state: McpExtensionState, serverName: strin
     : state.config.settings?.toolPrefix ?? "server";
 
   const { metadata } = buildToolMetadata(connection.tools, connection.resources, definition, serverName, prefix);
+  routeLease?.assertCurrent();
   state.toolMetadata.set(serverName, metadata);
 }
 
 export function updateMetadataCache(state: McpExtensionState, serverName: string): void {
-  if (state.fabricMounts?.hasServer(serverName)) return;
+  const routeLease = captureFabricRoute(state, serverName);
+  if (routeLease !== undefined) return;
   const connection = state.manager.getConnection(serverName);
   if (!connection || connection.status !== "connected") return;
 
@@ -389,6 +401,8 @@ async function tryAutoAuth(state: McpExtensionState, serverName: string): Promis
 }
 
 export async function lazyConnect(state: McpExtensionState, serverName: string, signal?: AbortSignal): Promise<boolean> {
+  const routeLease = captureFabricRoute(state, serverName);
+  const operationSignal = combineMcpSignals(signal, routeLease?.signal);
   const connection = state.manager.getConnection(serverName);
   if (connection?.status === "needs-auth") {
     if (await tryAutoAuth(state, serverName)) {
@@ -398,6 +412,7 @@ export async function lazyConnect(state: McpExtensionState, serverName: string, 
     }
   }
   if (state.manager.getConnection(serverName)?.status === "connected") {
+    routeLease?.assertCurrent();
     updateServerMetadata(state, serverName);
     return true;
   }
@@ -412,11 +427,13 @@ export async function lazyConnect(state: McpExtensionState, serverName: string, 
     if (state.ui) {
       state.ui.setStatus("mcp", `MCP: connecting to ${serverName}...`);
     }
-    const newConnection = await state.manager.connect(serverName, definition, signal);
+    const newConnection = await state.manager.connect(serverName, definition, operationSignal);
+    if (routeLease !== undefined) await routeLease.validateCurrent();
     if (newConnection.status === "needs-auth") {
       if (await tryAutoAuth(state, serverName)) {
         await state.manager.close(serverName);
-        const retryConnection = await state.manager.connect(serverName, definition, signal);
+        const retryConnection = await state.manager.connect(serverName, definition, operationSignal);
+        if (routeLease !== undefined) await routeLease.validateCurrent();
         if (retryConnection.status === "needs-auth") {
           autoAuthFailed.add(serverName);
           return false;
@@ -435,8 +452,8 @@ export async function lazyConnect(state: McpExtensionState, serverName: string, 
     updateStatusBar(state);
     return true;
   } catch (error) {
-    if (signal?.aborted) {
-      throwIfAborted(signal);
+    if (operationSignal?.aborted) {
+      throwIfAborted(operationSignal);
     }
     state.failureTracker.set(serverName, Date.now());
     const message = error instanceof Error ? error.message : String(error);

@@ -32,6 +32,7 @@ import {
   type StoredTokens,
 } from "./mcp-auth.ts"
 import type { ServerEntry } from "./types.ts"
+import { McpContinuationAuthority, type McpContinuationLease } from "./fabric-route-guard.ts"
 
 /** Auth status for a server */
 export type AuthStatus = "authenticated" | "expired" | "not_authenticated"
@@ -43,10 +44,54 @@ export interface AuthenticateOptions {
 // Track pending transports for auth completion
 const pendingTransports = new Map<string, StreamableHTTPClientTransport>()
 const pendingAuthStates = new Map<string, string>()
+const pendingAuthGuards = new Map<string, McpContinuationLease>()
 const pendingAuthCleanupTimers = new Map<string, ReturnType<typeof setTimeout>>()
 
 // Deduplicate concurrent authenticate() calls per server.
-const pendingAuthentications = new Map<string, Promise<AuthStatus>>()
+const pendingAuthentications = new Map<string, { operation: Promise<AuthStatus>; guard: McpContinuationLease }>()
+const oauthAuthority = new McpContinuationAuthority("MCP OAuth lifecycle")
+const oauthServerAuthorities = new Map<string, McpContinuationAuthority>()
+
+function serverOAuthAuthority(serverName: string): McpContinuationAuthority {
+  let authority = oauthServerAuthorities.get(serverName)
+  if (authority === undefined) {
+    authority = new McpContinuationAuthority(`MCP OAuth server ${serverName}`)
+    oauthServerAuthorities.set(serverName, authority)
+  }
+  return authority
+}
+
+function combineOAuthContinuation(
+  serverName: string,
+  session: McpContinuationLease,
+  server: McpContinuationLease,
+): McpContinuationLease {
+  return {
+    identity: `MCP OAuth ${serverName}`,
+    generation: server.generation,
+    signal: AbortSignal.any([session.signal, server.signal]),
+    isCurrent: () => session.isCurrent() && server.isCurrent(),
+    assertCurrent: () => {
+      session.assertCurrent()
+      server.assertCurrent()
+    },
+  }
+}
+
+export function captureOAuthContinuation(serverName?: string): McpContinuationLease {
+  const session = oauthAuthority.capture()
+  return serverName === undefined
+    ? session
+    : combineOAuthContinuation(serverName, session, serverOAuthAuthority(serverName).capture())
+}
+
+export function beginOAuthContinuation(serverName: string): McpContinuationLease {
+  return combineOAuthContinuation(
+    serverName,
+    oauthAuthority.capture(),
+    serverOAuthAuthority(serverName).renew(`MCP OAuth server ${serverName} operation replaced`),
+  )
+}
 
 /** Timeout for manual auth completion (5 minutes) */
 const MANUAL_AUTH_TIMEOUT_MS = 5 * 60 * 1000
@@ -148,12 +193,15 @@ function parseOAuthRedirectUri(redirectUri: string): { port: number; callbackHos
 export async function startAuth(
   serverName: string,
   serverUrl: string,
-  definition?: ServerEntry
+  definition?: ServerEntry,
+  guard: McpContinuationLease = beginOAuthContinuation(serverName),
 ): Promise<{ authorizationUrl: string }> {
+  guard.assertCurrent()
   const config = definition ? extractOAuthConfig(definition) : {}
 
   if (config.grantType === "client_credentials") {
     const storedAuth = await getAuthForUrl(serverName, serverUrl)
+    guard.assertCurrent()
     if (storedAuth?.clientInfo && !storedAuth.tokens && !config.clientId) {
       clearClientInfo(serverName)
       clearCodeVerifier(serverName)
@@ -162,10 +210,13 @@ export async function startAuth(
 
     const authProvider = new McpOAuthProvider(serverName, serverUrl, config, {
       onRedirect: async () => {
+        guard.assertCurrent()
         throw new Error("Browser redirect is not used for client_credentials flow")
       },
+      guard,
     })
     const result = await runSdkAuth(authProvider, { serverUrl })
+    guard.assertCurrent()
     if (result !== "AUTHORIZED") {
       throw new UnauthorizedError("Failed to authorize")
     }
@@ -177,25 +228,30 @@ export async function startAuth(
 
   try {
     await ensureCallbackServer({
+      signal: guard.signal,
       strictPort: Boolean(config.clientId) || config.redirectUri !== undefined,
       oauthState,
       reserveState: true,
       ...(redirectCallback ? { port: redirectCallback.port, callbackHost: redirectCallback.callbackHost, callbackPath: redirectCallback.callbackPath } : {}),
     })
+    guard.assertCurrent()
   } catch (error) {
-    await clearOAuthState(serverName)
+    if (guard.isCurrent()) await clearOAuthState(serverName)
     throw error
   }
 
   let capturedUrl: URL | undefined
   const authProvider = new McpOAuthProvider(serverName, serverUrl, config, {
     onRedirect: async (url) => {
+      guard.assertCurrent()
       capturedUrl = url
     },
+    guard,
   })
 
   try {
     const storedAuth = await getAuthForUrl(serverName, serverUrl)
+    guard.assertCurrent()
     if (storedAuth?.clientInfo && !config.clientId) {
       if (!storedAuth.tokens) {
         clearClientInfo(serverName)
@@ -212,9 +268,12 @@ export async function startAuth(
       }
     }
 
+    guard.assertCurrent()
     await updateOAuthState(serverName, oauthState, serverUrl)
+    guard.assertCurrent()
 
     const result = await runSdkAuth(authProvider, { serverUrl })
+    guard.assertCurrent()
     if (result === "AUTHORIZED") {
       releaseCallbackServer(oauthState)
       await clearOAuthState(serverName)
@@ -224,7 +283,8 @@ export async function startAuth(
       throw new UnauthorizedError("OAuth authorization URL was not provided")
     }
     const pendingTransport = new StreamableHTTPClientTransport(new URL(serverUrl), { authProvider })
-    await setPendingTransport(serverName, pendingTransport, oauthState)
+    await setPendingTransport(serverName, pendingTransport, oauthState, guard)
+    guard.assertCurrent()
     return { authorizationUrl: capturedUrl.toString() }
   } catch (error) {
     await clearPendingAuth(serverName, oauthState)
@@ -236,10 +296,13 @@ async function setPendingTransport(
   serverName: string,
   transport: StreamableHTTPClientTransport,
   oauthState: string,
+  guard: McpContinuationLease,
 ): Promise<void> {
   await clearPendingAuth(serverName)
+  guard.assertCurrent()
   pendingTransports.set(serverName, transport)
   pendingAuthStates.set(serverName, oauthState)
+  pendingAuthGuards.set(serverName, guard)
   const cleanupTimer = setTimeout(() => {
     clearPendingAuth(serverName, oauthState).catch((error) => {
       console.debug("[MCP] Failed to clear pending auth on timeout", error)
@@ -262,6 +325,7 @@ async function clearPendingAuth(serverName: string, oauthState?: string): Promis
   const transport = pendingTransports.get(serverName)
   pendingTransports.delete(serverName)
   pendingAuthStates.delete(serverName)
+  pendingAuthGuards.delete(serverName)
   const stateToRelease = pendingState ?? oauthState
   if (stateToRelease) {
     releaseCallbackServer(stateToRelease)
@@ -342,9 +406,12 @@ export async function completeAuthFromInput(
   serverName: string,
   input: string,
 ): Promise<AuthStatus> {
+  const guard = pendingAuthGuards.get(serverName) ?? captureOAuthContinuation(serverName)
+  guard.assertCurrent()
   const oauthState = await getOAuthState(serverName)
+  guard.assertCurrent()
   const code = parseAuthorizationCodeInput(input, oauthState)
-  return completeAuth(serverName, code)
+  return completeAuth(serverName, code, guard)
 }
 
 /**
@@ -352,8 +419,10 @@ export async function completeAuthFromInput(
  */
 export async function completeAuth(
   serverName: string,
-  authorizationCode: string
+  authorizationCode: string,
+  guard: McpContinuationLease = pendingAuthGuards.get(serverName) ?? captureOAuthContinuation(serverName),
 ): Promise<AuthStatus> {
+  guard.assertCurrent()
   const transport = pendingTransports.get(serverName)
   if (!transport) {
     throw new Error(`No pending OAuth flow for server: ${serverName}`)
@@ -364,6 +433,7 @@ export async function completeAuth(
   try {
     // Complete the auth using the transport's finishAuth method
     await transport.finishAuth(authorizationCode)
+    guard.assertCurrent()
     return "authenticated"
   } finally {
     await clearPendingAuth(serverName, oauthState)
@@ -385,13 +455,15 @@ export async function authenticate(
   options: AuthenticateOptions = {},
 ): Promise<AuthStatus> {
   const inFlight = pendingAuthentications.get(serverName)
-  if (inFlight) {
-    return inFlight
+  if (inFlight?.guard.isCurrent()) {
+    return inFlight.operation
   }
 
+  const guard = beginOAuthContinuation(serverName)
   const operation = (async (): Promise<AuthStatus> => {
     // Start auth flow
-    const { authorizationUrl } = await startAuth(serverName, serverUrl, definition)
+    const { authorizationUrl } = await startAuth(serverName, serverUrl, definition, guard)
+    guard.assertCurrent()
 
     // If no auth URL needed, already authenticated
     if (!authorizationUrl) {
@@ -400,6 +472,7 @@ export async function authenticate(
 
     // Get the state that was already generated and stored in startAuth()
     const oauthState = await getOAuthState(serverName)
+    guard.assertCurrent()
     if (!oauthState) {
       throw new Error("OAuth state not found - this should not happen")
     }
@@ -412,6 +485,7 @@ export async function authenticate(
       // even when the OS browser handoff is unavailable or invisible.
       if (options.onAuthorizationUrl) {
         await options.onAuthorizationUrl(authorizationUrl)
+        guard.assertCurrent()
       } else {
         console.log(`MCP Auth: Open this URL to authenticate ${serverName}:\n${authorizationUrl}`)
       }
@@ -423,9 +497,11 @@ export async function authenticate(
 
       // Wait for callback
       const code = await callbackPromise
+      guard.assertCurrent()
 
       // Validate state
       const storedState = await getOAuthState(serverName)
+      guard.assertCurrent()
       if (storedState !== oauthState) {
         await clearOAuthState(serverName)
         throw new Error("OAuth state mismatch - potential CSRF attack")
@@ -433,7 +509,7 @@ export async function authenticate(
       await clearOAuthState(serverName)
 
       // Complete the auth
-      return await completeAuth(serverName, code)
+      return await completeAuth(serverName, code, guard)
     } catch (error) {
       cancelPendingCallback(oauthState)
       await clearPendingAuth(serverName, oauthState)
@@ -441,12 +517,13 @@ export async function authenticate(
     }
   })()
 
-  pendingAuthentications.set(serverName, operation)
+  const record = { operation, guard }
+  pendingAuthentications.set(serverName, record)
 
   try {
     return await operation
   } finally {
-    if (pendingAuthentications.get(serverName) === operation) {
+    if (pendingAuthentications.get(serverName) === record) {
       pendingAuthentications.delete(serverName)
     }
   }
@@ -463,39 +540,49 @@ export async function getValidToken(
   serverName: string,
   serverUrl: string,
 ): Promise<StoredTokens | null> {
+  let guard = captureOAuthContinuation(serverName)
+  guard.assertCurrent()
   // Check if we have valid tokens
   const entry = await getAuthForUrl(serverName, serverUrl)
+  guard.assertCurrent()
   if (!entry?.tokens) {
     return null
   }
 
   // Check expiration
   const expired = await isTokenExpired(serverName)
+  guard.assertCurrent()
   if (expired === false) {
     return entry.tokens
   }
 
   if (expired === true && entry.tokens.refreshToken) {
-    // Token is expired, try to refresh
+    // Token refresh is a credential mutation and replaces any older flow for this server.
+    guard = beginOAuthContinuation(serverName)
+    guard.assertCurrent()
     console.log(`MCP Auth: Token expired for ${serverName}, attempting refresh`)
 
     try {
       // Create auth provider for token refresh
       const authProvider = new McpOAuthProvider(serverName, serverUrl, {}, {
-        onRedirect: async () => {},
+        onRedirect: async () => { guard.assertCurrent() },
+        guard,
       })
 
       const clientInfo = await authProvider.clientInformation()
+      guard.assertCurrent()
       if (!clientInfo) {
         console.log(`MCP Auth: No client info for refresh for ${serverName}`)
         return null
       }
 
       const result = await runSdkAuth(authProvider, { serverUrl })
+      guard.assertCurrent()
       if (result !== "AUTHORIZED") {
         return null
       }
       const refreshed = await getAuthForUrl(serverName, serverUrl)
+      guard.assertCurrent()
       return refreshed?.tokens ?? null
     } catch (error) {
       console.error(`MCP Auth: Token refresh failed for ${serverName}`, { error })
@@ -514,10 +601,13 @@ export async function getValidToken(
  * @returns The current auth status
  */
 export async function getAuthStatus(serverName: string): Promise<AuthStatus> {
+  const guard = captureOAuthContinuation(serverName)
   const hasTokens = await hasStoredTokens(serverName)
+  guard.assertCurrent()
   if (!hasTokens) return "not_authenticated"
 
   const expired = await isTokenExpired(serverName)
+  guard.assertCurrent()
   return expired ? "expired" : "authenticated"
 }
 
@@ -527,13 +617,17 @@ export async function getAuthStatus(serverName: string): Promise<AuthStatus> {
  * @param serverName - The name of the MCP server
  */
 export async function removeAuth(serverName: string): Promise<void> {
+  const guard = beginOAuthContinuation(serverName)
   const oauthState = await getOAuthState(serverName)
+  guard.assertCurrent()
   if (oauthState) {
     cancelPendingCallback(oauthState)
   }
   await clearPendingAuth(serverName, oauthState)
+  guard.assertCurrent()
   clearAllCredentials(serverName)
   await clearOAuthState(serverName)
+  guard.assertCurrent()
   console.log(`MCP Auth: Removed credentials for ${serverName}`)
 }
 
@@ -564,15 +658,22 @@ export function supportsOAuth(definition: ServerEntry): boolean {
  * Initialize the OAuth system on startup.
  * OAuth callback binding is lazy and starts from startAuth() only.
  */
-export async function initializeOAuth(): Promise<void> {}
+export async function initializeOAuth(): Promise<void> {
+  oauthAuthority.renew("MCP OAuth lifecycle initialized")
+  oauthServerAuthorities.clear()
+}
 
 /**
  * Shutdown the OAuth system.
  * Stops the callback server and cancels pending auths.
  */
 export async function shutdownOAuth(): Promise<void> {
-  for (const serverName of Array.from(pendingTransports.keys())) {
+  oauthAuthority.revoke("MCP OAuth lifecycle shut down")
+  for (const authority of oauthServerAuthorities.values()) authority.revoke("MCP OAuth lifecycle shut down")
+  oauthServerAuthorities.clear()
+  const pendingServerNames = Array.from(pendingTransports.keys())
+  await Promise.all(pendingServerNames.map(async (serverName) => {
     await clearPendingAuth(serverName)
-  }
+  }))
   await stopCallbackServer()
 }

@@ -313,11 +313,13 @@ export function createDirectToolExecutor(
     try {
       if (spec.resourceUri) {
         const result = await connection.client.readResource({ uri: spec.resourceUri }, requestOptions);
+        lease.assertCurrent();
         const content = (result.contents ?? []).map(c => ({
           type: "text" as const,
           text: "text" in c ? c.text : ("blob" in c ? `[Binary data: ${(c as { mimeType?: string }).mimeType ?? "unknown"}]` : JSON.stringify(c)),
         }));
         const guarded = await guardMcpOutput(content.length > 0 ? content : [{ type: "text" as const, text: "(empty resource)" }], outputGuardOptions);
+        lease.assertCurrent();
         return {
           content: guarded.content,
           details: { server: spec.serverName, resourceUri: spec.resourceUri, ...guardedMcpDetails(guarded) },
@@ -334,6 +336,7 @@ export function createDirectToolExecutor(
             streamMode: spec.uiStreamMode,
           })
         : null;
+      lease.assertCurrent();
 
       const resultPromise = connection.client.callTool({
         name: spec.originalName,
@@ -342,6 +345,7 @@ export function createDirectToolExecutor(
       }, undefined, requestOptions);
 
       const result = await abortable(resultPromise, signal);
+      lease.assertCurrent();
       uiSession?.sendToolResult(result as unknown as import("@modelcontextprotocol/sdk/types.js").CallToolResult);
 
       if (result.isError) {
@@ -350,6 +354,7 @@ export function createDirectToolExecutor(
         const outputContent = content.length > 0 ? content : [{ type: "text" as const, text: "(empty result)" }];
         const schemaText = spec.inputSchema ? `\n\nExpected parameters:\n${formatSchema(spec.inputSchema)}` : "";
         const guarded = await guardMcpOutput(outputContent, { ...outputGuardOptions, prefix: "Error: ", suffix: schemaText, emptyTextFallback: "Tool execution failed" });
+        lease.assertCurrent();
         return {
           content: guarded.content,
           details: { error: "tool_error", server: spec.serverName, ...guardedMcpDetails(guarded) },
@@ -363,6 +368,7 @@ export function createDirectToolExecutor(
           ? "Updated the open UI."
           : "📺 Interactive UI is now open in your browser. I'll respond to your prompts and intents as you interact with it.";
         const guarded = await guardMcpOutput(outputContent, { ...outputGuardOptions, suffix: `\n\n${uiMessage}` });
+        lease.assertCurrent();
         return {
           content: guarded.content,
           details: { server: spec.serverName, tool: spec.originalName, uiOpen: true, ...guardedMcpDetails(guarded) },
@@ -370,13 +376,22 @@ export function createDirectToolExecutor(
       }
 
       const guarded = await guardMcpOutput(outputContent, { ...outputGuardOptions });
+      lease.assertCurrent();
       return {
         content: guarded.content,
         details: { server: spec.serverName, tool: spec.originalName, ...guardedMcpDetails(guarded) },
       };
     } catch (error) {
+      if (lease.connection.fabricRoute !== undefined && !lease.isCurrent()) {
+        uiSession?.close();
+        return {
+          content: [{ type: "text" as const, text: "Fabric MCP mount is no longer current." }],
+          details: { error: "stale_generation", server: spec.serverName },
+        };
+      }
       if (error instanceof UrlElicitationRequiredError) {
         const action = await state.manager.handleUrlElicitationRequired(spec.serverName, error);
+        lease.assertCurrent();
         const message = action === "accept"
           ? "The original MCP tool did not run. Complete the opened browser interaction, then retry the tool."
           : `The URL interaction was ${action === "decline" ? "declined" : "cancelled"}.`;

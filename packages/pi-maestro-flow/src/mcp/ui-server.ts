@@ -732,6 +732,7 @@ export async function startUiServer(options: UiServerOptions): Promise<UiServerH
                 ? callParams.arguments
                 : {},
           }, undefined, lease.requestOptions);
+          lease.assertCurrent();
           sendJson(res, 200, { ok: true, result });
         } finally {
           lease.release();

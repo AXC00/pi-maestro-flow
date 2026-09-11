@@ -27,9 +27,15 @@ export class UiResourceHandler {
 
     log.debug("Fetching UI resource");
 
+    const connectionIdentity = this.manager.getConnection(serverName);
+    const routeLease = connectionIdentity?.fabricRoute;
     let result: ReadResourceResult;
     try {
       result = await this.manager.readResource(serverName, uri);
+      routeLease?.assertCurrent();
+      if (connectionIdentity !== undefined && this.manager.getConnection(serverName) !== connectionIdentity) {
+        throw new Error(`Server "${serverName}" changed while its UI resource was loading`);
+      }
     } catch (error) {
       if (error instanceof UrlElicitationRequiredError) throw error;
       const message = error instanceof Error ? error.message : String(error);

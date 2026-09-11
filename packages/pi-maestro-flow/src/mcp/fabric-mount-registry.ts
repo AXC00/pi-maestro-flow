@@ -7,6 +7,12 @@ import {
 } from "pi-maestro-fabric-core/v1";
 import type { FabricMcpMountProvider } from "pi-maestro-fabric";
 import { FabricMcpClientTransport, type FabricMcpDispatchPort } from "./fabric-transport.ts";
+import {
+  combineMcpSignals,
+  FabricMcpRouteGuard,
+  McpContinuationAuthority,
+  type FabricMcpRouteLease,
+} from "./fabric-route-guard.ts";
 import type { McpServerManager } from "./server-manager.ts";
 import type { ServerDefinition } from "./types.ts";
 
@@ -39,6 +45,7 @@ interface MountedServerRecord {
   readonly route: EndpointRouteHandle;
   readonly serverName: string;
   readonly definition: ServerDefinition;
+  readonly guard: FabricMcpRouteGuard;
   references: number;
 }
 
@@ -52,6 +59,9 @@ export class FabricMcpMountRegistry {
   readonly #byMount = new Map<string, MountedServerRecord>();
   readonly #byServer = new Map<string, MountedServerRecord>();
   readonly #unmounts = new Set<Promise<void>>();
+  readonly #revocations = new WeakMap<MountedServerRecord, Promise<void>>();
+  readonly #mounts = new Set<Promise<unknown>>();
+  readonly #lifecycle = new McpContinuationAuthority("Fabric MCP mount registry");
 
   constructor(options: FabricMcpMountRegistryOptions) {
     this.#provider = options.provider;
@@ -62,9 +72,33 @@ export class FabricMcpMountRegistry {
   }
 
   async mount(route: EndpointRouteHandle, signal: AbortSignal): Promise<FabricMcpMountedServer> {
+    const registryLease = this.#lifecycle.capture();
+    const operation = this.#mount(route, combineMcpSignals(signal, registryLease.signal)!, registryLease);
+    this.#mounts.add(operation);
+    try {
+      return await operation;
+    } finally {
+      this.#mounts.delete(operation);
+    }
+  }
+
+  async #mount(
+    route: EndpointRouteHandle,
+    signal: AbortSignal,
+    registryLease: ReturnType<McpContinuationAuthority["capture"]>,
+  ): Promise<FabricMcpMountedServer> {
     const lease = await this.#provider.mount(route, signal);
+    try {
+      registryLease.assertCurrent();
+      await this.#provider.validate(lease.mountId, lease.routeRevision);
+      registryLease.assertCurrent();
+    } catch (error) {
+      await this.#provider.unmount(lease.mountId);
+      throw error;
+    }
     const existing = this.#byMount.get(lease.mountId);
     if (existing !== undefined) {
+      existing.guard.capture().assertCurrent();
       existing.references += 1;
       return this.#project(existing);
     }
@@ -78,33 +112,50 @@ export class FabricMcpMountRegistry {
       directTools: false,
       exposeResources: false,
     };
-    const record: MountedServerRecord = {
+    let record!: MountedServerRecord;
+    const guard = new FabricMcpRouteGuard({
+      mountId: lease.mountId,
+      serverName,
+      routeRevision: lease.routeRevision,
+      mutation: route.operationClass === "mcp-mutation",
+      validate: async () => { await this.#provider.validate(lease.mountId, lease.routeRevision); },
+      onInvalid: (error) => this.#invalidate(record, error),
+    });
+    record = {
       lease: structuredClone(lease),
       route: structuredClone(route),
       serverName,
       definition,
+      guard,
       references: 1,
     };
     try {
       this.#manager.registerEphemeralServer(serverName, {
         definition,
-        create: async () => {
-          await this.#provider.validate(lease.mountId, lease.routeRevision);
+        routeGuard: guard,
+        create: async (createSignal) => {
+          const routeLease = guard.capture();
+          await routeLease.validateCurrent();
           const resolved = await this.#resolveTransport(structuredClone(lease), structuredClone(route));
+          await routeLease.validateCurrent();
           return new FabricMcpClientTransport({
             lease,
             workspaceId: resolved.workspaceId,
             workspaceGeneration: resolved.workspaceGeneration,
             dispatcher: resolved.dispatcher,
-            validate: async () => { await this.#provider.validate(lease.mountId, lease.routeRevision); },
+            validate: routeLease.validateCurrent,
+            signal: combineMcpSignals(createSignal, routeLease.signal),
+            mutation: routeLease.mutation,
             ...(resolved.requestTimeoutMs === undefined ? {} : { requestTimeoutMs: resolved.requestTimeoutMs }),
           });
         },
       });
     } catch (error) {
+      guard.revoke("Fabric MCP mount registration failed");
       await this.#provider.unmount(lease.mountId);
       throw error;
     }
+    registryLease.assertCurrent();
     this.#byMount.set(lease.mountId, record);
     this.#byServer.set(serverName, record);
     return this.#project(record);
@@ -113,7 +164,10 @@ export class FabricMcpMountRegistry {
   async validate(mountId: string, expectedRouteRevision?: number): Promise<FabricMcpMountedServer> {
     const record = this.#byMount.get(mountId);
     if (record === undefined) throw new FabricContractError("not_found", "Fabric MCP mount is not registered in this Pi session", "mountId");
-    await this.#provider.validate(mountId, expectedRouteRevision ?? record.lease.routeRevision);
+    if (expectedRouteRevision !== undefined && expectedRouteRevision !== record.lease.routeRevision) {
+      throw new FabricContractError("stale_generation", "Fabric MCP mount route revision is stale", "routeRevision");
+    }
+    await record.guard.capture().validateCurrent();
     return this.#project(record);
   }
 
@@ -128,32 +182,24 @@ export class FabricMcpMountRegistry {
       await this.#provider.unmount(mountId);
       return;
     }
-    const operation = this.#provider.unmount(mountId, async () => {
-      this.#byMount.delete(mountId);
-      this.#byServer.delete(record.serverName);
-      let visibilityFailure: unknown;
-      try {
-        this.#onHidden?.(record.serverName);
-      } catch (error) {
-        visibilityFailure = error;
-      }
-      await this.#manager.unregisterEphemeralServer(record.serverName);
-      if (visibilityFailure !== undefined) throw visibilityFailure;
-    });
-    this.#unmounts.add(operation);
-    try {
-      await operation;
-    } finally {
-      this.#unmounts.delete(operation);
-    }
+    await this.#revoke(record, `Fabric MCP mount ${mountId} was unmounted`);
   }
 
   hasServer(serverName: string): boolean {
-    return this.#byServer.has(serverName);
+    return this.#byServer.get(serverName)?.guard.isCurrent() === true;
+  }
+
+  capture(serverName: string): FabricMcpRouteLease | undefined {
+    const record = this.#byServer.get(serverName);
+    if (record === undefined) return undefined;
+    const lease = record.guard.capture();
+    lease.assertCurrent();
+    return lease;
   }
 
   getDefinition(serverName: string): ServerDefinition | undefined {
-    return this.#byServer.get(serverName)?.definition;
+    const record = this.#byServer.get(serverName);
+    return record?.guard.isCurrent() === true ? record.definition : undefined;
   }
 
   getByServer(serverName: string): FabricMcpMountedServer | undefined {
@@ -168,17 +214,66 @@ export class FabricMcpMountRegistry {
   }
 
   async closeAll(): Promise<void> {
+    this.#lifecycle.revoke("Fabric MCP mount registry closed");
     const records = [...this.#byMount.values()];
     const alreadyUnmounting = [...this.#unmounts];
+    const mounting = [...this.#mounts].map((operation) => operation.then(
+      () => undefined,
+      () => undefined,
+    ));
     const results = await Promise.allSettled([
       ...alreadyUnmounting,
-      ...records.map(async (record) => {
-        record.references = 1;
-        await this.unmount(record.lease.mountId);
-      }),
+      ...mounting,
+      ...records.map((record) => this.#revoke(record, "Fabric MCP mount registry closed")),
     ]);
     const failure = results.find((result): result is PromiseRejectedResult => result.status === "rejected");
     if (failure !== undefined) throw failure.reason;
+  }
+
+  #invalidate(record: MountedServerRecord, cause: unknown): void {
+    if (this.#byMount.get(record.lease.mountId) !== record) return;
+    const reason = cause instanceof Error ? cause.message : String(cause);
+    void this.#revoke(record, `Fabric MCP mount validation failed: ${reason}`).catch((error) => {
+      console.error("MCP: failed to clean up an invalid Fabric mount", error);
+    });
+  }
+
+  #revoke(record: MountedServerRecord, reason: string): Promise<void> {
+    const current = this.#byMount.get(record.lease.mountId);
+    if (current !== record) return this.#revocations.get(record) ?? Promise.resolve();
+    const releases: Promise<void>[] = [];
+    for (let index = 1; index < record.references; index += 1) {
+      releases.push(this.#provider.unmount(record.lease.mountId));
+    }
+    releases.push(this.#provider.unmount(record.lease.mountId, async () => {
+      await this.#manager.unregisterEphemeralServer(record.serverName);
+    }));
+    record.references = 0;
+    record.guard.revoke(reason);
+    this.#byMount.delete(record.lease.mountId);
+    this.#byServer.delete(record.serverName);
+    let visibilityFailure: unknown;
+    try {
+      this.#onHidden?.(record.serverName);
+    } catch (error) {
+      visibilityFailure = error;
+    }
+    const operation = Promise.all(releases).then(() => {
+      if (visibilityFailure !== undefined) throw visibilityFailure;
+    });
+    this.#unmounts.add(operation);
+    this.#revocations.set(record, operation);
+    void operation.then(
+      () => {
+        this.#unmounts.delete(operation);
+        this.#revocations.delete(record);
+      },
+      () => {
+        this.#unmounts.delete(operation);
+        this.#revocations.delete(record);
+      },
+    );
+    return operation;
   }
 
   #project(record: MountedServerRecord): FabricMcpMountedServer {
