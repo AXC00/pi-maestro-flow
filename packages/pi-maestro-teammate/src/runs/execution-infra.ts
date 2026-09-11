@@ -19,6 +19,7 @@ import { fileURLToPath } from "node:url";
 import { Check, Errors } from "typebox/value";
 import crossSpawn from "cross-spawn";
 import { listAgentSummaries, resolveAgent, type AgentConfig } from "../agents/agents.ts";
+import { resolvePiAgentDirectory } from "../shared/agent-directory.ts";
 import { resolveReplyTo, type ReplyTarget } from "../shared/routing.ts";
 import type {
   SingleResult,
@@ -2225,8 +2226,7 @@ export function restoreRetrySettingSnapshot(settingsPath: string, snapshot: Retr
 }
 
 export function childSettingsPath(env: NodeJS.ProcessEnv): string {
-  const agentDir = env.PI_CODING_AGENT_DIR?.trim() || path.join(os.homedir(), ".pi", "agent");
-  return path.join(agentDir, "settings.json");
+  return path.join(resolvePiAgentDirectory(env), "settings.json");
 }
 
 // ---------------------------------------------------------------------------

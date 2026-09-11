@@ -9,7 +9,6 @@
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import type {
   BackendRegistryConfig,
   TeammateExecutionMode,
@@ -21,6 +20,7 @@ import { createRemoteBackend } from "pi-maestro-backends/remote";
 import type { RemoteWorkerManagerLike as RemoteManagerPort } from "pi-maestro-backends/remote";
 import { loadCliToolsConfigProjection, type CliToolsConfig } from "../cli-tools/cli-tools-config.ts";
 import type { AvailableModelEntry } from "../models/model-catalog.ts";
+import { resolvePiAgentDirectory } from "../shared/agent-directory.ts";
 import {
   compileModelRegistryManifest,
   parseModelRegistryManifest,
@@ -35,7 +35,7 @@ const REGISTRY_FILE = "teammate-backends.json";
 
 /** Global registration document under Pi's configured agent directory. */
 export function getGlobalBackendRegistryPath(): string {
-  return join(getAgentDir(), REGISTRY_FILE);
+  return join(resolvePiAgentDirectory(), REGISTRY_FILE);
 }
 
 /** Project registration document relative to the workspace root. */

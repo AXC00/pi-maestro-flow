@@ -11,8 +11,8 @@
 import { execFile } from "node:child_process";
 import { existsSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
-import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import { probeCliToolCommand, type CliToolConfig } from "../cli-tools/cli-tools-config.ts";
+import { resolvePiAgentDirectory } from "../shared/agent-directory.ts";
 import { ACP_REGISTRY_AGENTS, type AcpRegistryAgent } from "./acp-registry-snapshot.ts";
 
 /** Where a resolved launch command came from. */
@@ -128,7 +128,7 @@ export function resolveRegistryLaunch(
  * @returns the prefix `npm install --prefix` is given.
  */
 export function installPrefixFor(agent: AcpRegistryAgent): string {
-  return join(getAgentDir(), "acp-agents", agent.id, agent.version);
+  return join(resolvePiAgentDirectory(), "acp-agents", agent.id, agent.version);
 }
 
 /**
