@@ -647,17 +647,9 @@ export class GatewayTeammateService {
       entry.cancelledRequested = true;
       const reason = boundedText(request.reason, 512) ?? "Cancelled by Gateway caller";
       entry.error = reason;
+      await this.abortEntryControls(entry);
       entry.controller.abort(reason);
       this.setStatus(entry, "cancelled", reason);
-      const controls = [...entry.controls.values()];
-      for (const control of controls) {
-        try {
-          const sent = await this.sendControl(control, "", "interrupt", true);
-          if (!sent) control.sendControl?.({ type: "abort" });
-        } catch {
-          control.sendControl?.({ type: "abort" });
-        }
-      }
       this.appendEvent(entry, "cancel", { reason });
       await this.persist(entry);
       this.notifyWaiters(entry);
@@ -716,8 +708,8 @@ export class GatewayTeammateService {
   }
   async monitorCancel(sessionId: string, taskId: string, reason = "Cancelled by Monitor caller"): Promise<GatewayTeammateTaskView> {
     await this.ready(); const entry = this.findSessionEntry(sessionId, taskId); if (!terminalStatus(entry.status)) {
-      entry.cancelledRequested = true; entry.error = utf8Tail(reason, 512); entry.controller.abort(entry.error); this.setStatus(entry, "cancelled", entry.error); this.appendEvent(entry, "cancel", { reason: entry.error });
-      for (const control of entry.controls.values()) await this.sendControl(control, "", "interrupt", true).catch(() => false);
+      entry.cancelledRequested = true; entry.error = utf8Tail(reason, 512);
+      await this.abortEntryControls(entry); entry.controller.abort(entry.error); this.setStatus(entry, "cancelled", entry.error); this.appendEvent(entry, "cancel", { reason: entry.error });
       await this.persist(entry); this.notifyWaiters(entry);
     }
     return this.view(entry);
@@ -732,6 +724,7 @@ export class GatewayTeammateService {
     for (const entry of this.entries.values()) {
       if (!terminalStatus(entry.status)) {
         entry.cancelledRequested = true;
+        await this.abortEntryControls(entry);
         entry.controller.abort("Gateway teammate service shutdown");
       }
     }
@@ -1083,6 +1076,17 @@ export class GatewayTeammateService {
     if (control.stdin && this.port.sendRpcMessage) return Boolean(await this.port.sendRpcMessage(control.stdin, message, mode));
     if (control.stdin) return sendPublicRpcMessage(control.stdin, message, mode);
     return false;
+  }
+
+  private async abortEntryControls(entry: TaskEntry): Promise<void> {
+    for (const control of entry.controls.values()) {
+      try {
+        const sent = await this.sendControl(control, "", "interrupt", true);
+        if (!sent) control.sendControl?.({ type: "abort" });
+      } catch {
+        control.sendControl?.({ type: "abort" });
+      }
+    }
   }
 
   private async waitForEntry(entry: TaskEntry, timeoutMs?: number, signal?: AbortSignal): Promise<boolean> {

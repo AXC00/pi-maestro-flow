@@ -36,6 +36,7 @@ function result(prompt: string, correlationId: string, index = 0): SingleResult 
 
 class FakePort implements GatewayTeammatePort {
   calls: Array<{ control: GatewayTeammateControl; message: string; mode: string }> = [];
+  controlAbortStates: boolean[] = [];
   options?: Parameters<GatewayTeammatePort["runTeammate"]>[1];
   resultSet: SingleResult[] = [];
   deferred?: Promise<SingleResult[]>;
@@ -44,7 +45,10 @@ class FakePort implements GatewayTeammatePort {
   async runTeammate(_params: Parameters<GatewayTeammatePort["runTeammate"]>[0], options: Parameters<GatewayTeammatePort["runTeammate"]>[1]): Promise<SingleResult[]> {
     this.options = options;
     const correlationId = options.taskCorrelationIds?.[0] ?? "child";
-    options.onChildSpawned?.({} as never, () => true, undefined, correlationId, 1);
+    options.onChildSpawned?.({} as never, () => {
+      this.controlAbortStates.push(options.signal?.aborted ?? false);
+      return true;
+    }, undefined, correlationId, 1);
     options.onProgress?.({
       agent: "general",
       correlationId,
@@ -138,6 +142,8 @@ test("Gateway teammate routes steer/follow_up/interrupt and makes cancel idempot
   const cancelled = await service.cancel(owner, taskId, "stop");
   assert.equal(cancelled.ok, true);
   assert.equal(cancelled.data?.cancelled, true);
+  assert.deepEqual(port.controlAbortStates, [false], "abort control must be sent before the run signal closes child IPC");
+  assert.equal(port.options?.signal?.aborted, true);
   const repeated = await service.cancel(owner, taskId);
   assert.equal(repeated.ok, true);
   assert.equal(repeated.data?.alreadyTerminal, true);
