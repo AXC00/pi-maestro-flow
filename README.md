@@ -38,6 +38,7 @@
 - 🔀 **并行多智能体调度** — 一次派出多个子进程智能体并行工作，支持 DAG 依赖图与结构化输出
 - 🖥️ **pi-teammate-models CLI** — 终端维护 `.pi/teammate-backends.json`：静态路由表、字段级编辑与引导式注册向导，写入前编译校验，`.bak`/`.bak.1` 备份轮换可撤销
 - 🌐 **DSH 直连 SSH 部署** — `mode: ssh` 通过 OpenSSH 在远端主机启动 DeepSeek Harness 运行时：BatchMode 免提示认证、主机密钥指纹预检固定、按请求超时调优告警
+- 🌉 **原生 Gateway 与持久公网入口** — 独立 CLI/TUI 可在无 Pi 环境配置和托管 Gateway；统一 tunnel profile 支持 Cloudflare Quick/Named、实验性 OpenAI Secure 与 Managed OpenSSH Reverse
 - 🎯 **Goal 自主长时目标** — 设定目标与 Token 预算，跨多轮自主循环，完成后由独立验证器审计
 - 📝 **Plan 先批准再动手** — 只读起草 Markdown 计划，用户批准后才放行编辑；支持独立 Plan 模型
 - 🛰️ **Pi Cockpit 可视化** — 实时呈现运行中的 teammate 与 todo 计划，内置 9 套主题；Quiet 模式压缩工具输出与思考折叠
@@ -122,6 +123,9 @@ Maestro Flow 自动分类意图并路由：**简单任务**直接执行 · **多
 | **[用户手册](GUIDE.md)** | 深入教程，每个子系统附示例 |
 | **[Smart Search Provider 配置指南](docs/smart-search-provider-config.md)** | 搜索引擎配置 — 双路径架构、Provider API Key、凭证源语法、TUI 操作、配置同步 |
 | **[Teammate Backend 适配器契约](docs/teammate-backend-adapter-contract.md)** | 第三方执行后端接入 — `TeammateBackend` 接口、`.pi/teammate-backends.json` 注册、能力裁决、recovery facts、完整示例 |
+| **[Gateway Tunnel 配置指南](docs/gateway-tunnel-configuration.md)** | 独立配置 TUI、Gateway HTTP/OAuth、Quick/Persistent tunnel profile、OpenSSH Reverse 与服务器 HTTPS 反代 |
+| **[Gateway 命令与 MCP 工具边界](docs/gateway-command-mcp-tool-design.md)** | `/gateway` 管理面、Gateway MCP 控制面与模型侧 `mcp` 工具的职责划分 |
+| **[多设备 Fabric 架构](docs/fabric/README.md)** | Endpoint-first、connection-first 的目标架构及 `pi-maestro-fabric-core` Phase 1 契约基线 |
 | **[发布说明](RELEASE.md)** | 版本历史与变更日志 |
 | **[更新说明](docs/UPDATES.md)** | 历史提交变更记录 |
 | **[新特性使用说明](docs/new-features-usage.md)** | Vision 委托 · 终端标题 · Mailbox · observe watch · self-evolve 快速上手 |
