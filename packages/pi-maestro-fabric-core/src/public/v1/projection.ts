@@ -1,3 +1,5 @@
+import type { CapabilityBinding } from "./capability.ts";
+import type { JsonValue } from "./common.ts";
 import type { ConnectionLease } from "./connection.ts";
 import type { ConnectorRecord, DeviceRecord } from "./device.ts";
 import type { EndpointRecord } from "./endpoint.ts";
@@ -58,6 +60,34 @@ export function projectDevice(record: DeviceRecord): DeviceRecord {
     architecture: record.architecture,
     enabled: record.enabled,
     revision: record.revision,
+  };
+}
+
+function cloneJsonValue(value: JsonValue): JsonValue {
+  if (value === null || typeof value !== "object") return value;
+  if (Array.isArray(value)) return value.map(cloneJsonValue);
+  const clone: Record<string, JsonValue> = {};
+  for (const [key, entry] of Object.entries(value)) clone[key] = cloneJsonValue(entry);
+  return clone;
+}
+
+/** Explicit allowlist projection for data originating in capability advertisements. */
+export function projectCapability(record: CapabilityBinding): CapabilityBinding {
+  let inputSchema: Readonly<Record<string, JsonValue>> | undefined;
+  if (record.inputSchema !== undefined) {
+    const clone: Record<string, JsonValue> = {};
+    for (const [key, entry] of Object.entries(record.inputSchema)) clone[key] = cloneJsonValue(entry);
+    inputSchema = clone;
+  }
+  return {
+    capabilityId: record.capabilityId,
+    kind: record.kind,
+    endpointId: record.endpointId,
+    inputSchema,
+    contractHash: record.contractHash,
+    trustLevel: record.trustLevel,
+    locality: record.locality,
+    priority: record.priority,
   };
 }
 

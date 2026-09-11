@@ -142,8 +142,16 @@ test("capability validation covers kind, endpoint and priority", () => {
     trustLevel: "paired",
     priority: 0,
   };
-  assert.doesNotThrow(() => assertValidCapabilityBinding(capability));
+  assert.doesNotThrow(() => assertValidCapabilityBinding({ ...capability, inputSchema: { type: "object" } }));
   expectCode(() => assertValidCapabilityBinding({ ...capability, priority: -1 }), "invalid_argument");
+
+  const getter: Record<string, unknown> = {};
+  Object.defineProperty(getter, "type", { enumerable: true, get: () => "object" });
+  expectCode(() => assertValidCapabilityBinding({ ...capability, inputSchema: getter }), "invalid_argument");
+  expectCode(() => assertValidCapabilityBinding({ ...capability, inputSchema: { [Symbol("hidden")]: true } }), "invalid_argument");
+  expectCode(() => assertValidCapabilityBinding({ ...capability, inputSchema: { toJSON: () => ({}) } }), "invalid_argument");
+  expectCode(() => assertValidCapabilityBinding({ ...capability, inputSchema: { value: undefined } }), "invalid_argument");
+  expectCode(() => assertValidCapabilityBinding({ ...capability, inputSchema: { huge: "x".repeat(70_000) } }), "resource_exhausted");
 });
 
 test("runtime record guards reject null, missing fields and wrong scalar types", () => {

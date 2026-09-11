@@ -32,6 +32,7 @@ export const CONNECTION_FIRST_PHASES = [
   "registered",
   "connecting",
   "connected",
+  "ready",
   "workspace-bound",
   "endpoint-ready",
   "draining",
@@ -112,12 +113,25 @@ export function establishConnection(
   };
 }
 
+export function markConnectionReady(state: ConnectionFirstState): ConnectionFirstState {
+  requirePhase(state, ["connected", "ready"]);
+  if (!state.connection || state.connection.state !== "connected") {
+    throw new FabricContractError("invalid_state", "Readiness requires a connected lease", "connection.state");
+  }
+  return {
+    phase: "ready",
+    deviceId: state.deviceId,
+    connectorId: state.connectorId,
+    connection: state.connection,
+  };
+}
+
 export function bindWorkspace(
   state: ConnectionFirstState,
   binding: WorkspaceBinding,
   now: number,
 ): ConnectionFirstState {
-  requirePhase(state, ["connected", "workspace-bound"]);
+  requirePhase(state, ["ready", "workspace-bound"]);
   if (!state.connection) throw new FabricContractError("invalid_state", "Connection is required", "connection");
   assertValidConnectionLease(state.connection, now);
   if (state.connection.state !== "connected") {
@@ -146,7 +160,7 @@ export function openEndpointRoute(
   route: EndpointRouteHandle,
   now: number,
 ): ConnectionFirstState {
-  requirePhase(state, ["connected", "workspace-bound"]);
+  requirePhase(state, ["ready", "workspace-bound"]);
   if (!state.connection) throw new FabricContractError("invalid_state", "Connection is required", "connection");
   assertValidConnectionLease(state.connection, now);
   if (state.connection.state !== "connected") {
@@ -198,7 +212,7 @@ export function openEndpointRoute(
 }
 
 export function beginConnectionDrain(state: ConnectionFirstState): ConnectionFirstState {
-  requirePhase(state, ["connected", "workspace-bound", "endpoint-ready"]);
+  requirePhase(state, ["connected", "ready", "workspace-bound", "endpoint-ready"]);
   if (!state.connection) throw new FabricContractError("invalid_state", "Connection is required", "connection");
   return {
     phase: "draining",
@@ -209,7 +223,7 @@ export function beginConnectionDrain(state: ConnectionFirstState): ConnectionFir
 }
 
 export function closeConnection(state: ConnectionFirstState): ConnectionFirstState {
-  requirePhase(state, ["connecting", "connected", "workspace-bound", "endpoint-ready", "draining"]);
+  requirePhase(state, ["connecting", "connected", "ready", "workspace-bound", "endpoint-ready", "draining"]);
   return {
     phase: "closed",
     deviceId: state.deviceId,

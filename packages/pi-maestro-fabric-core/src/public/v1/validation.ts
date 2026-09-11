@@ -9,6 +9,7 @@ import {
   assertGeneration,
   assertRevision,
   assertUnexpired,
+  utf8ByteLength,
 } from "./common.ts";
 import type { CapabilityBinding } from "./capability.ts";
 import { FABRIC_CAPABILITY_KINDS } from "./capability.ts";
@@ -73,11 +74,40 @@ function assertModelRegistrationList(input: unknown, path: string): asserts inpu
   }
 }
 
-function assertJsonValue(value: unknown, path: string, depth = 0): void {
-  if (depth > 32) throw new FabricContractError("resource_exhausted", `${path} exceeds maximum JSON depth`, path);
-  if (value === null || typeof value === "string" || typeof value === "boolean") return;
+const MAX_JSON_DEPTH = 32;
+const MAX_JSON_NODES = 10_000;
+const MAX_JSON_BYTES = 65_536;
+
+interface JsonBudget {
+  nodes: number;
+  bytes: number;
+}
+
+function consumeJsonBudget(budget: JsonBudget, bytes: number, path: string): void {
+  budget.nodes += 1;
+  budget.bytes += bytes;
+  if (budget.nodes > MAX_JSON_NODES || budget.bytes > MAX_JSON_BYTES) {
+    throw new FabricContractError("resource_exhausted", `${path} exceeds maximum JSON size`, path);
+  }
+}
+
+function assertJsonValue(value: unknown, path: string, depth = 0, budget: JsonBudget = { nodes: 0, bytes: 0 }): void {
+  if (depth > MAX_JSON_DEPTH) throw new FabricContractError("resource_exhausted", `${path} exceeds maximum JSON depth`, path);
+  if (value === null) {
+    consumeJsonBudget(budget, 4, path);
+    return;
+  }
+  if (typeof value === "string") {
+    consumeJsonBudget(budget, utf8ByteLength(value) + 2, path);
+    return;
+  }
+  if (typeof value === "boolean") {
+    consumeJsonBudget(budget, value ? 4 : 5, path);
+    return;
+  }
   if (typeof value === "number") {
     if (!Number.isFinite(value)) throw new FabricContractError("invalid_argument", `${path} must be a finite JSON number`, path);
+    consumeJsonBudget(budget, String(value).length, path);
     return;
   }
   if (Array.isArray(value)) {
@@ -87,6 +117,7 @@ function assertJsonValue(value: unknown, path: string, depth = 0): void {
     if (value.length > 10_000) {
       throw new FabricContractError("resource_exhausted", `${path} exceeds maximum array length`, path);
     }
+    consumeJsonBudget(budget, 2, path);
     for (let index = 0; index < value.length; index += 1) {
       if (!Object.hasOwn(value, index)) {
         throw new FabricContractError("invalid_argument", `${path} cannot contain sparse or inherited entries`, `${path}[${index}]`);
@@ -95,7 +126,7 @@ function assertJsonValue(value: unknown, path: string, depth = 0): void {
       if (!descriptor || descriptor.get !== undefined || descriptor.set !== undefined || !descriptor.enumerable) {
         throw new FabricContractError("invalid_argument", `${path}[${index}] must be an enumerable data property`, `${path}[${index}]`);
       }
-      assertJsonValue(descriptor.value, `${path}[${index}]`, depth + 1);
+      assertJsonValue(descriptor.value, `${path}[${index}]`, depth + 1, budget);
     }
     for (const key of Reflect.ownKeys(value)) {
       if (key === "length") continue;
@@ -111,6 +142,7 @@ function assertJsonValue(value: unknown, path: string, depth = 0): void {
     throw new FabricContractError("invalid_argument", `${path} must be a plain JSON object`, path);
   }
   const keys = Reflect.ownKeys(record);
+  consumeJsonBudget(budget, 2, path);
   if (keys.length > 10_000) {
     throw new FabricContractError("resource_exhausted", `${path} exceeds maximum object size`, path);
   }
@@ -118,11 +150,12 @@ function assertJsonValue(value: unknown, path: string, depth = 0): void {
     if (typeof key !== "string" || key === "toJSON") {
       throw new FabricContractError("invalid_argument", `${path} contains a non-JSON property`, path);
     }
+    consumeJsonBudget(budget, utf8ByteLength(key) + 3, path);
     const descriptor = Object.getOwnPropertyDescriptor(record, key);
     if (!descriptor || descriptor.get !== undefined || descriptor.set !== undefined || !descriptor.enumerable) {
       throw new FabricContractError("invalid_argument", `${path}.${key} must be an enumerable data property`, `${path}.${key}`);
     }
-    assertJsonValue(descriptor.value, `${path}.${key}`, depth + 1);
+    assertJsonValue(descriptor.value, `${path}.${key}`, depth + 1, budget);
   }
 }
 
@@ -242,6 +275,7 @@ export function assertValidCapabilityBinding(input: unknown): asserts input is C
   assertBoundedString(record.contractHash, "contractHash", FABRIC_CONTRACT_HASH_MAX_BYTES);
   assertBoundedString(record.trustLevel, "trustLevel", 128);
   if (record.locality !== undefined) assertBoundedString(record.locality, "locality", FABRIC_LABEL_MAX_BYTES);
+  if (record.inputSchema !== undefined) assertJsonObject(record.inputSchema, "inputSchema");
   if (!Number.isSafeInteger(record.priority) || record.priority < 0) {
     throw new FabricContractError("invalid_argument", "priority must be a non-negative safe integer", "priority");
   }

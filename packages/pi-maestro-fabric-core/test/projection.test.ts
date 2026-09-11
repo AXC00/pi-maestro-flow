@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  projectCapability,
   projectConnection,
   projectConnector,
   projectDevice,
@@ -8,6 +9,7 @@ import {
   projectFabricSnapshot,
   projectWorkspace,
   type AgentRuntimeEndpoint,
+  type CapabilityBinding,
   type ConnectionLease,
   type ConnectorRecord,
   type WorkspaceRecord,
@@ -93,6 +95,24 @@ test("device and endpoint projections copy only public fields and nested values"
   assert.equal("command" in endpointProjection, false);
   assert.notEqual(endpointProjection.scope, endpoint.scope);
   assert.notEqual(endpointProjection.kind === "agent" ? endpointProjection.models : [], endpoint.models);
+});
+
+test("capability projection allowlists fields and deeply clones validated JSON", () => {
+  const input = {
+    capabilityId: "capability-a",
+    kind: "tool",
+    endpointId: "endpoint-a",
+    inputSchema: { type: "object", properties: { value: { type: "string" } } },
+    contractHash: "contract-a",
+    trustLevel: "owner",
+    priority: 1,
+    secret: "do-not-project",
+  } as CapabilityBinding & { secret: string };
+  const projection = projectCapability(input);
+  assert.equal("secret" in projection, false);
+  assert.notEqual(projection.inputSchema, input.inputSchema);
+  (projection.inputSchema as { properties: { value: { type: string } } }).properties.value.type = "number";
+  assert.equal((input.inputSchema as { properties: { value: { type: string } } }).properties.value.type, "string");
 });
 
 test("snapshot projection preserves source records", () => {

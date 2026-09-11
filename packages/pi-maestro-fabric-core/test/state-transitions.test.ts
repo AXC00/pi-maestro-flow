@@ -8,6 +8,7 @@ import {
   closeConnection,
   createRegisteredConnectionState,
   establishConnection,
+  markConnectionReady,
   openEndpointRoute,
   type AgentRuntimeEndpoint,
   type ConnectionLease,
@@ -89,13 +90,18 @@ function connectedState() {
   return establishConnection(connecting, connection, now);
 }
 
+function readyState() {
+  return markConnectionReady(connectedState());
+}
+
 function expectCode(action: () => unknown, code: string): void {
   assert.throws(action, (error: unknown) => error instanceof FabricContractError && error.code === code);
 }
 
-test("connection-first flow reaches endpoint-ready only after binding", () => {
+test("connection-first flow reaches endpoint-ready only after advertisement readiness and binding", () => {
   const connected = connectedState();
-  const workspaceBound = bindWorkspace(connected, binding, now);
+  expectCode(() => bindWorkspace(connected, binding, now), "invalid_state");
+  const workspaceBound = bindWorkspace(markConnectionReady(connected), binding, now);
   const ready = openEndpointRoute(workspaceBound, endpoint, route, now);
 
   assert.equal(ready.phase, "endpoint-ready");
@@ -104,11 +110,11 @@ test("connection-first flow reaches endpoint-ready only after binding", () => {
 });
 
 test("workspace-scoped endpoint rejects an unbound connection", () => {
-  expectCode(() => openEndpointRoute(connectedState(), endpoint, route, now), "permission_denied");
+  expectCode(() => openEndpointRoute(readyState(), endpoint, route, now), "permission_denied");
 });
 
 test("route generation must match the current connection", () => {
-  const workspaceBound = bindWorkspace(connectedState(), binding, now);
+  const workspaceBound = bindWorkspace(readyState(), binding, now);
   expectCode(
     () => openEndpointRoute(workspaceBound, endpoint, { ...route, connectionGeneration: 2 }, now),
     "stale_generation",
@@ -127,11 +133,11 @@ test("device-scoped routes reject workspace binding fields", () => {
     endpointId: deviceEndpoint.endpointId,
     endpointGeneration: deviceEndpoint.generation,
   };
-  expectCode(() => openEndpointRoute(connectedState(), deviceEndpoint, deviceRoute, now), "conflict");
+  expectCode(() => openEndpointRoute(readyState(), deviceEndpoint, deviceRoute, now), "conflict");
 });
 
 test("drain and close discard binding and route authority", () => {
-  const ready = openEndpointRoute(bindWorkspace(connectedState(), binding, now), endpoint, route, now);
+  const ready = openEndpointRoute(bindWorkspace(readyState(), binding, now), endpoint, route, now);
   const draining = beginConnectionDrain(ready);
   const closed = closeConnection(draining);
 
@@ -152,9 +158,9 @@ test("closed connections require a new explicit begin step and generation", () =
 });
 
 test("a binding that expires after admission cannot open a route", () => {
-  const connected = connectedState();
+  const ready = readyState();
   const shortBinding = { ...binding, expiresAt: 1_100 };
-  const workspaceBound = bindWorkspace(connected, shortBinding, now);
+  const workspaceBound = bindWorkspace(ready, shortBinding, now);
   expectCode(() => openEndpointRoute(workspaceBound, endpoint, route, 1_200), "expired");
 });
 
@@ -167,19 +173,19 @@ test("cancelled reconnect attempts preserve the generation high-water mark", () 
 });
 
 test("binding rejects an expired or non-connected lease", () => {
-  const connected = connectedState();
+  const ready = readyState();
   expectCode(
-    () => bindWorkspace({ ...connected, connection: { ...connection, expiresAt: 1_050 } }, binding, 1_100),
+    () => bindWorkspace({ ...ready, connection: { ...connection, expiresAt: 1_050 } }, binding, 1_100),
     "expired",
   );
   expectCode(
-    () => bindWorkspace({ ...connected, connection: { ...connection, state: "closed" } }, binding, now),
+    () => bindWorkspace({ ...ready, connection: { ...connection, state: "closed" } }, binding, now),
     "invalid_state",
   );
 });
 
 test("endpoint-ready rejects a closed route even when its fields match", () => {
-  const workspaceBound = bindWorkspace(connectedState(), binding, now);
+  const workspaceBound = bindWorkspace(readyState(), binding, now);
   expectCode(
     () => openEndpointRoute(workspaceBound, endpoint, { ...route, state: "closed" }, now),
     "invalid_state",
