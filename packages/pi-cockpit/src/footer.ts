@@ -213,6 +213,7 @@ const HIDDEN_EXTENSION_STATUS_KEYS = new Set([
 function isVisibleExtensionStatus(status: ExtensionStatusSegment, thinking?: string): boolean {
 	if (status.text === "" || status.text === thinking) return false;
 	if (HIDDEN_EXTENSION_STATUS_KEYS.has(status.key)) return false;
+	if (status.key === "self-evolve" && /^EVOL off$/i.test(status.text.trim())) return false;
 	return !/^(?:TEAM SWARM\b|BEST\b|COMPLETED$|ACT$)/i.test(status.text.trim());
 }
 

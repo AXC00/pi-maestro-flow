@@ -339,6 +339,20 @@ test("ambient MCP and auto compact statuses stay out of the footer", () => {
 	assert.match(line, /PLAN/);
 });
 
+test("disabled self-evolve status stays out of the footer", () => {
+	const disabled = renderFooter(parts({
+		extensionStatuses: [{ key: "self-evolve", text: "EVOL off" }],
+	}));
+	assert.equal(disabled.length, 1);
+	assert.doesNotMatch(disabled[0], /EVOL/);
+
+	const enabled = renderFooter(parts({
+		extensionStatuses: [{ key: "self-evolve", text: "EVOL ● 2·1·0" }],
+	}));
+	assert.equal(enabled.length, 2);
+	assert.match(enabled[1], /EVOL ● 2·1·0/);
+});
+
 test("Plan mode leads line one while duplicate thinking is omitted", () => {
 	const lines = renderFooter(parts({
 		thinking: "high",
