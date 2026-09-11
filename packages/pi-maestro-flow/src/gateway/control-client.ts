@@ -338,6 +338,22 @@ export class GatewayControlClient {
     return this.tunnelControl("tunnel-restart", provider, options.instance ?? "default", options, true) as Promise<GatewayTunnelPublicState>;
   }
 
+  async tunnelProfileStatus(profile: string, timeoutMs = STATUS_TIMEOUT_MS): Promise<GatewayTunnelPublicState> {
+    return this.tunnelControl("tunnel-status", undefined, "default", { timeoutMs }, false, profile) as Promise<GatewayTunnelPublicState>;
+  }
+
+  async tunnelProfileStart(profile: string, options: { timeoutMs?: number; expectedGeneration?: number } = {}): Promise<GatewayTunnelPublicState> {
+    return this.tunnelControl("tunnel-start", undefined, "default", options, true, profile) as Promise<GatewayTunnelPublicState>;
+  }
+
+  async tunnelProfileStop(profile: string, options: { timeoutMs?: number; expectedGeneration?: number } = {}): Promise<GatewayTunnelPublicState> {
+    return this.tunnelControl("tunnel-stop", undefined, "default", options, false, profile) as Promise<GatewayTunnelPublicState>;
+  }
+
+  async tunnelProfileRestart(profile: string, options: { timeoutMs?: number; expectedGeneration?: number } = {}): Promise<GatewayTunnelPublicState> {
+    return this.tunnelControl("tunnel-restart", undefined, "default", options, true, profile) as Promise<GatewayTunnelPublicState>;
+  }
+
   async listWorkspaces(): Promise<GatewayWorkspace[]> {
     return (await this.registry()).list().then((workspaces) => workspaces.map(({ ownerToken: _ownerToken, ...workspace }) => workspace));
   }
@@ -392,6 +408,7 @@ export class GatewayControlClient {
     instance: string,
     options: { timeoutMs?: number; expectedGeneration?: number; input?: Record<string, unknown> },
     startGateway: boolean,
+    profile?: string,
   ): Promise<unknown> {
     const status = startGateway ? await this.start() : await this.status();
     if (!status.online || !status.owner?.socket) throw new Error("Pi Maestro Gateway is offline. Start it with `pi-maestro-gateway serve`.");
@@ -405,6 +422,7 @@ export class GatewayControlClient {
       data: {
         ...(provider === undefined ? {} : { provider }),
         ...(provider === undefined ? {} : { instance }),
+        ...(profile === undefined ? {} : { profile }),
         deadlineAt,
         ...(options.expectedGeneration === undefined ? {} : { expectedGeneration: options.expectedGeneration }),
         ...(options.input === undefined ? {} : { input: options.input }),

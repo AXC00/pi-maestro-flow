@@ -10,6 +10,9 @@ try {
     const manifest = JSON.parse(await readFile(new URL("../package.json", import.meta.url), "utf8"));
     if (args.includes("--json")) console.log(JSON.stringify({ name: "pi-maestro-gateway", version: manifest.version, protocolVersion: 1 }));
     else console.log(`pi-maestro-gateway ${manifest.version}`);
+  } else if (command === "config") {
+    const { runGatewayConfigCommand } = await import("../src/gateway/config-tui.ts");
+    await runGatewayConfigCommand(args.slice(1));
   } else {
     const jiti = createJiti(import.meta.url, { interopDefault: true });
     if (command === "connect") {

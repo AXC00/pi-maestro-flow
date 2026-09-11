@@ -8,8 +8,17 @@ import type { GatewayObservationSink } from "../observability.ts";
 
 export type GatewayTunnelPublicState = Omit<GatewayTunnelState, "ownerToken">;
 
+export interface GatewayTunnelProfileDefinition {
+  id: string;
+  provider: string;
+  lifecycle: "ephemeral" | "persistent";
+  enabled: boolean;
+  input: Readonly<Record<string, unknown>>;
+}
+
 export interface GatewayTunnelManagerOptions {
   providers?: readonly GatewayTunnelProvider[];
+  profiles?: readonly GatewayTunnelProfileDefinition[];
   stateRoot?: string;
   processOwner?: GatewayTunnelProcessOwner;
   supervisorOptions?: Omit<Partial<GatewayTunnelSupervisorOptions>, "provider" | "instance" | "stateStore" | "processOwner" | "observer">;
@@ -35,6 +44,8 @@ export class GatewayTunnelManager {
   private readonly supervisorOptions: GatewayTunnelManagerOptions["supervisorOptions"];
   private readonly observer?: GatewayObservationSink;
   private readonly supervisors = new Map<string, GatewayTunnelSupervisor>();
+  private readonly supervisorInputs = new Map<string, Readonly<Record<string, unknown>>>();
+  private readonly profiles = new Map<string, GatewayTunnelProfileDefinition>();
 
   constructor(options: GatewayTunnelManagerOptions = {}) {
     this.registry = new GatewayTunnelProviderRegistry(options.providers);
@@ -42,9 +53,25 @@ export class GatewayTunnelManager {
     this.processOwner = options.processOwner;
     this.supervisorOptions = options.supervisorOptions;
     this.observer = options.observer;
+    for (const profile of options.profiles ?? []) {
+      if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u.test(profile.id)) throw new Error("Tunnel profile id must be a safe identifier");
+      if (this.profiles.has(profile.id)) throw new Error(`Tunnel profile is already registered: ${profile.id}`);
+      if (!this.registry.get(profile.provider)) throw new Error(`Unknown tunnel provider for profile ${profile.id}: ${profile.provider}`);
+      this.profiles.set(profile.id, { ...profile, input: structuredClone(profile.input) });
+    }
   }
 
   register(provider: GatewayTunnelProvider): void { this.registry.register(provider); }
+
+  listProfiles(): GatewayTunnelProfileDefinition[] {
+    return [...this.profiles.values()].map((profile) => ({ ...profile, input: structuredClone(profile.input) }));
+  }
+
+  profile(id: string): GatewayTunnelProfileDefinition {
+    const profile = this.profiles.get(id);
+    if (!profile) throw controlError("tunnel_profile_unavailable", `Unknown tunnel profile: ${id}`);
+    return profile;
+  }
 
   supervisor(providerName: string, instance = "default"): GatewayTunnelSupervisor {
     const provider = this.registry.get(providerName);
@@ -67,17 +94,20 @@ export class GatewayTunnelManager {
   }
 
   async control(action: GatewayTunnelControlAction, data?: Record<string, unknown>): Promise<unknown> {
-    if (action === "tunnel-status" && data?.provider === undefined) {
+    if (action === "tunnel-status" && data?.provider === undefined && data?.profile === undefined) {
       const states = await Promise.all(this.registry.list().map(async (provider) => {
         const state = await this.supervisor(provider.name).status();
         return state ? publicState(state) : { provider: provider.name, instance: "default", desiredState: "stopped", observed: { phase: "stopped" } };
       }));
       return { providers: states };
     }
-    const provider = requiredIdentifier(data?.provider, "provider");
-    const instance = data?.instance === undefined ? "default" : requiredIdentifier(data.instance, "instance");
+    const profile = data?.profile === undefined ? undefined : this.profile(requiredIdentifier(data.profile, "profile"));
+    const provider = profile?.provider ?? requiredIdentifier(data?.provider, "provider");
+    const instance = profile?.id ?? (data?.instance === undefined ? "default" : requiredIdentifier(data.instance, "instance"));
     const supervisor = this.supervisor(provider, instance);
-    const options = operationOptions(data);
+    const key = `${provider}\0${instance}`;
+    const options = operationOptions(data, profile?.input);
+    if (options.input) this.supervisorInputs.set(key, options.input);
     const state = action === "tunnel-status" ? await supervisor.status()
       : action === "tunnel-start" ? await supervisor.start(options)
         : action === "tunnel-stop" ? await supervisor.stop(options)
@@ -86,31 +116,59 @@ export class GatewayTunnelManager {
   }
 
   async recoverAll(options: GatewayTunnelOperationOptions = {}): Promise<void> {
-    // Providers may add named instances later through explicit control. Default
-    // instance recovery is deterministic and does not scan untrusted paths.
-    await Promise.allSettled(this.registry.list().map((provider) => this.supervisor(provider.name).recover(options)));
+    const configuredDefaults = new Set([...this.profiles.values()].filter((profile) => profile.id === "default").map((profile) => profile.provider));
+    const operations: Array<Promise<unknown>> = this.registry.list()
+      .filter((provider) => !configuredDefaults.has(provider.name))
+      .map((provider) => this.supervisor(provider.name).recover(options));
+    for (const profile of this.profiles.values()) {
+      const supervisor = this.supervisor(profile.provider, profile.id);
+      const key = `${profile.provider}\0${profile.id}`;
+      this.supervisorInputs.set(key, profile.input);
+      operations.push((async () => {
+        const current = await supervisor.status();
+        if (profile.lifecycle === "ephemeral" || !profile.enabled) {
+          if (current?.desiredState === "running") await supervisor.stop({ ...options, input: profile.input });
+          return;
+        }
+        if (current?.desiredState === "running") {
+          await supervisor.recover({ ...options, input: profile.input });
+          return;
+        }
+        await supervisor.start({ ...options, input: profile.input });
+      })());
+    }
+    await Promise.allSettled(operations);
   }
 
   async quiesceAll(deadlineAt: number): Promise<void> {
-    await Promise.allSettled([...this.supervisors.values()].map((supervisor) => supervisor.quiesce(deadlineAt)));
+    await Promise.allSettled([...this.supervisors.entries()].map(([key, supervisor]) => supervisor.quiesce(deadlineAt, this.supervisorInputs.get(key))));
   }
 
   async closeAll(deadlineAt: number): Promise<void> {
-    await Promise.allSettled([...this.supervisors.values()].map((supervisor) => supervisor.close(deadlineAt)));
+    const persistent = new Set([...this.profiles.values()]
+      .filter((profile) => profile.lifecycle === "persistent" && profile.enabled)
+      .map((profile) => `${profile.provider}\0${profile.id}`));
+    await Promise.allSettled([...this.supervisors.entries()].map(([key, supervisor]) => supervisor.close(
+      deadlineAt,
+      this.supervisorInputs.get(key),
+      persistent.has(key),
+    )));
   }
 }
 
-function operationOptions(data?: Record<string, unknown>): GatewayTunnelOperationOptions {
+function operationOptions(data?: Record<string, unknown>, profileInput?: Readonly<Record<string, unknown>>): GatewayTunnelOperationOptions {
   const timeoutMs = optionalPositiveInteger(data?.timeoutMs, "timeoutMs");
   const deadlineAt = optionalPositiveInteger(data?.deadlineAt, "deadlineAt");
   const expectedGeneration = optionalNonNegativeInteger(data?.expectedGeneration ?? data?.generation, "expectedGeneration");
   const input = data?.input;
   if (input !== undefined && (!input || typeof input !== "object" || Array.isArray(input))) throw controlError("invalid_arguments", "Tunnel input must be an object");
+  if (profileInput !== undefined && input !== undefined) throw controlError("invalid_arguments", "Tunnel profile input cannot be overridden");
+  const effectiveInput = profileInput ?? input as Record<string, unknown> | undefined;
   return {
     ...(timeoutMs === undefined ? {} : { timeoutMs }),
     ...(deadlineAt === undefined ? {} : { deadlineAt }),
     ...(expectedGeneration === undefined ? {} : { expectedGeneration }),
-    ...(input === undefined ? {} : { input: input as Record<string, unknown> }),
+    ...(effectiveInput === undefined ? {} : { input: effectiveInput }),
   };
 }
 

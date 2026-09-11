@@ -222,6 +222,53 @@ test("readiness requires local MCP and tunnel-client control-plane /readyz", asy
   assert.match(ready.detail ?? "", /local: ready; control-plane/u);
 });
 
+test("persistent profile publishes its fixed endpoint and requests a fresh process after Gateway restart", async (t) => {
+  const fetchImpl: typeof fetch = async () => new Response("{}", { status: 200 });
+  const fx = await fixture(t, { fetch: fetchImpl });
+  const profiledRequest: GatewayTunnelProviderRequest = {
+    ...request,
+    instance: "openai-prod",
+    input: {
+      mode: "secure",
+      experimental: true,
+      publicUrl: "https://openai.example.com",
+      credentialTtlMs: 60_000,
+    },
+  };
+  const context = deadline();
+  t.after(() => context.close());
+  assert.equal((await fx.provider.doctor(context, profiledRequest)).ok, true);
+  const started = await fx.provider.start(context, profiledRequest);
+  assert.equal(started.endpoint, "https://openai.example.com");
+  const config = readFileSync(fx.configPath!, "utf8");
+  const healthPath = config.match(/url_file: "([^"]+)"/u)?.[1];
+  assert.ok(healthPath);
+  await writeFile(healthPath!, "http://127.0.0.1:43210\n");
+  const ready = await fx.provider.probe(context, started, profiledRequest);
+  assert.equal(ready.ready, true);
+  assert.equal(ready.endpoint, "https://openai.example.com");
+  assert.equal(await fx.provider.adopt(), undefined);
+  const invalid = await fx.provider.doctor(context, { ...profiledRequest, input: { ...profiledRequest.input, publicUrl: "http://openai.example.com" } });
+  assert.equal(invalid.ok, false);
+  assert.match(invalid.detail ?? "", /HTTPS origin/u);
+});
+
+test("short-lived Gateway credentials trigger a controlled tunnel-client rotation", async (t) => {
+  const child = fakeChild(51003);
+  const fx = await fixture(t, { child });
+  const rotatingRequest: GatewayTunnelProviderRequest = {
+    ...request,
+    generation: 3,
+    ownerToken: "owner-token-00000003",
+    input: { experimental: true, credentialTtlMs: 1_000 },
+  };
+  const context = deadline();
+  t.after(() => context.close());
+  await fx.provider.start(context, rotatingRequest);
+  await until(() => child.killed, 2_000);
+  assert.equal(child.killed, true);
+});
+
 test("doctor failures and child lifecycle redact secrets, revoke, and remove all temporary artifacts", async (t) => {
   const failed = await fixture(t, { doctor: { code: 7, stdout: "", stderr: `api_key=${runtimeKey} Authorization: Bearer ${gatewayToken}` } });
   let context = deadline();

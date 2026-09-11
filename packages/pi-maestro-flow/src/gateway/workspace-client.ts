@@ -10,7 +10,7 @@ import {
   type GatewayControlStatus,
 } from "./control-client.ts";
 import type { GatewayWorkspace } from "./contracts.ts";
-import { loadGatewayConfig, loadGatewayConfigSync, writeGatewayConfigPatch, type GatewayConfigPatch } from "./config.ts";
+import { loadGatewayConfig, loadGatewayConfigSync, writeGatewayConfigPatch, type GatewayConfigPatch, type GatewayTunnelProfileConfig } from "./config.ts";
 import { SessionStore } from "./session-store.ts";
 import type { CollaborativeSessionStateV1 } from "./session-contracts.ts";
 import { buildGatewayChangesYaml, type GatewayConfigChanges } from "../tui/gateway-wizard.ts";
@@ -395,6 +395,7 @@ export interface GatewayConfigView {
       minimumVersion: string;
       credentialTtlMs: number;
     };
+    profiles: GatewayTunnelProfileConfig[];
   };
 }
 
@@ -426,6 +427,7 @@ export function readGatewayConfigView(): GatewayConfigView | undefined {
           minimumVersion: config.tunnels.openai.minimumVersion,
           credentialTtlMs: config.tunnels.openai.credentialTtlMs,
         },
+        profiles: structuredClone(config.tunnels.profiles),
       },
     };
   } catch {

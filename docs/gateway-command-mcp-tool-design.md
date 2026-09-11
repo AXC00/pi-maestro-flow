@@ -1,6 +1,8 @@
 # `/gateway` 命令与 MCP 工具设计说明
 
 > 本文说明 Pi Maestro 中 `/gateway`、Gateway MCP 控制面和本地 MCP 客户端工具之间的关系。重点是调用边界与生命周期，不是 MCP 协议入门。
+>
+> Gateway HTTP、认证、Cloudflare/OpenAI/SSH tunnel 与服务器反代的实际配置见 [Gateway Tunnel 配置指南](./gateway-tunnel-configuration.md)。
 
 ## 1. 结论先行
 

@@ -77,8 +77,10 @@ interface OpenAiInput {
   binaryPath?: string;
   localPort: number;
   mcpPath: string;
+  publicUrl?: string;
   tunnelIdEnv: string;
   runtimeKeyEnv: string;
+  credentialTtlMs: number;
 }
 
 interface ValidatedDoctor {
@@ -103,6 +105,7 @@ interface OpenAiRuntime {
   logPath: string;
   exited: Promise<GatewayTunnelExit>;
   exit?: GatewayTunnelExit;
+  rotationTimer?: ReturnType<typeof setTimeout>;
   cleaned: boolean;
 }
 
@@ -208,8 +211,7 @@ export class OpenAiTunnelProvider implements GatewayTunnelProvider {
       throw providerError("credentials_missing", "OpenAI Tunnel requires a short-lived Gateway credential issuer and revoker");
     }
 
-    const credentialTtlMs = this.options.credentialTtlMs ?? DEFAULT_CREDENTIAL_TTL_MS;
-    if (!Number.isSafeInteger(credentialTtlMs) || credentialTtlMs < 1_000 || credentialTtlMs > 60 * 60_000) throw providerError("invalid_arguments", "OpenAI Tunnel credential TTL must be in [1000, 3600000] ms");
+    const credentialTtlMs = validated.input.credentialTtlMs;
     const credential = await this.options.issueGatewayCredential(request, credentialTtlMs);
     if (!credential || typeof credential.id !== "string" || !credential.id || typeof credential.token !== "string" || credential.token.length < 16
       || /[\r\n\0]/u.test(credential.token) || !Number.isSafeInteger(credential.expiresAt) || credential.expiresAt <= this.now()) {
@@ -270,7 +272,16 @@ export class OpenAiTunnelProvider implements GatewayTunnelProvider {
       child.once("error", (error) => finish({ code: null, at: this.now(), detail: redactOpenAiTunnelText(`spawn error: ${error.message}`, [runtimeKey, credential.token]) }));
       child.once("exit", (code, signal) => finish({ code, signal, at: this.now() }));
       this.runtimes.set(key, runtime);
-      return { pid: runtime.pid, executablePath: runtime.executablePath, args, opaqueId: runtime.tunnelId, exited, child };
+      this.scheduleCredentialRotation(runtime);
+      return {
+        pid: runtime.pid,
+        executablePath: runtime.executablePath,
+        args,
+        ...(runtime.input.publicUrl ? { endpoint: runtime.input.publicUrl } : {}),
+        opaqueId: runtime.tunnelId,
+        exited,
+        child,
+      };
     } catch (error) {
       if (child?.pid) try { child.kill(); } catch { /* best effort before ownership is published */ }
       if (directory) await rm(directory, { recursive: true, force: true }).catch(() => undefined);
@@ -282,26 +293,30 @@ export class OpenAiTunnelProvider implements GatewayTunnelProvider {
   async probe(context: GatewayTunnelDeadlineContext, process: GatewayTunnelStartResult, request: GatewayTunnelProviderRequest): Promise<GatewayTunnelProbeResult> {
     context.throwIfExpired("probe");
     const runtime = this.runtimes.get(runtimeKeyFor(request));
-    if (!runtime || runtime.pid !== process.pid) return { ready: false, terminal: true, opaqueId: process.opaqueId, detail: "OpenAI tunnel runtime is not owned by this provider generation" };
-    if (runtime.exit || !this.alive(runtime.pid)) return { ready: false, terminal: true, opaqueId: runtime.tunnelId, detail: `tunnel-client exited before readiness (exit=${runtime.exit?.code ?? "unknown"})` };
+    const endpoint = runtime?.input.publicUrl ?? process.endpoint;
+    if (!runtime || runtime.pid !== process.pid) return { ready: false, terminal: true, ...(endpoint ? { endpoint } : {}), opaqueId: process.opaqueId, detail: "OpenAI tunnel runtime is not owned by this provider generation" };
+    if (runtime.exit || !this.alive(runtime.pid)) return { ready: false, terminal: true, ...(endpoint ? { endpoint } : {}), opaqueId: runtime.tunnelId, detail: `tunnel-client exited before readiness (exit=${runtime.exit?.code ?? "unknown"})` };
 
     const local = await this.probeLocal(context, runtime);
-    if (!local.ready) return { ...local, opaqueId: runtime.tunnelId };
+    if (!local.ready) return { ...local, ...(endpoint ? { endpoint } : {}), opaqueId: runtime.tunnelId };
     let healthUrl: string | undefined;
     try { healthUrl = validateHealthUrl((await readFile(runtime.healthUrlPath, "utf8")).trim()); }
     catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "ENOENT") return { ready: false, terminal: true, opaqueId: runtime.tunnelId, detail: redactOpenAiTunnelText(error instanceof Error ? error.message : String(error)), retryAfterMs: 100 };
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") return { ready: false, terminal: true, ...(endpoint ? { endpoint } : {}), opaqueId: runtime.tunnelId, detail: redactOpenAiTunnelText(error instanceof Error ? error.message : String(error)), retryAfterMs: 100 };
     }
-    if (!healthUrl) return { ready: false, opaqueId: runtime.tunnelId, detail: "local: ready; control-plane: waiting for tunnel-client health URL", retryAfterMs: 100 };
+    if (!healthUrl) return { ready: false, ...(endpoint ? { endpoint } : {}), opaqueId: runtime.tunnelId, detail: "local: ready; control-plane: waiting for tunnel-client health URL", retryAfterMs: 100 };
     try {
       const response = await this.fetchImpl(`${healthUrl}/readyz`, { method: "GET", signal: context.signal, redirect: "manual" });
-      if (response.status >= 200 && response.status < 300) return { ready: true, opaqueId: runtime.tunnelId, detail: "local: ready; control-plane: tunnel-client /readyz ready" };
-      return { ready: false, opaqueId: runtime.tunnelId, detail: `local: ready; control-plane: /readyz HTTP ${response.status}`, retryAfterMs: 250 };
+      if (response.status >= 200 && response.status < 300) return { ready: true, ...(endpoint ? { endpoint } : {}), opaqueId: runtime.tunnelId, detail: "local: ready; control-plane: tunnel-client /readyz ready" };
+      return { ready: false, ...(endpoint ? { endpoint } : {}), opaqueId: runtime.tunnelId, detail: `local: ready; control-plane: /readyz HTTP ${response.status}`, retryAfterMs: 250 };
     } catch (error) {
       if (context.signal.aborted) context.throwIfExpired("probe");
-      return { ready: false, opaqueId: runtime.tunnelId, detail: `local: ready; control-plane: ${redactOpenAiTunnelText(error instanceof Error ? error.message : String(error))}`, retryAfterMs: 100 };
+      return { ready: false, ...(endpoint ? { endpoint } : {}), opaqueId: runtime.tunnelId, detail: `local: ready; control-plane: ${redactOpenAiTunnelText(error instanceof Error ? error.message : String(error))}`, retryAfterMs: 100 };
     }
   }
+
+  /** OpenAI runtime credentials and private files are process-local, so restart instead of adopting. */
+  async adopt(): Promise<undefined> { return undefined; }
 
   async stop(context: GatewayTunnelDeadlineContext, identity: GatewayTunnelProcessIdentity, request: GatewayTunnelStopRequest): Promise<void> {
     context.throwIfExpired("stop");
@@ -315,17 +330,21 @@ export class OpenAiTunnelProvider implements GatewayTunnelProvider {
     const raw = request.input ?? {};
     const forbidden = ["runtimeKey", "runtimeApiKey", "apiKey", "token", "authorization", "gatewayToken", "configFile"].find((key) => raw[key] !== undefined);
     if (forbidden) throw providerError("invalid_arguments", `OpenAI Tunnel rejects literal secret/config input: ${forbidden}`);
-    const allowed = new Set(["enabled", "experimental", "binaryPath", "localPort", "mcpPath", "tunnelIdEnv", "runtimeKeyEnv"]);
+    const allowed = new Set(["mode", "enabled", "experimental", "binaryPath", "localPort", "mcpPath", "publicUrl", "tunnelIdEnv", "runtimeKeyEnv", "credentialTtlMs"]);
     const unknown = Object.keys(raw).find((key) => !allowed.has(key));
     if (unknown) throw providerError("invalid_arguments", `Unknown OpenAI Tunnel input: ${unknown}`);
+    if (raw.mode !== undefined && raw.mode !== "secure") throw providerError("tunnel_mode_unsupported", "Only OpenAI Secure Tunnel mode is supported");
     const enabled = raw.enabled === undefined && raw.experimental === undefined ? this.options.enabled === true : raw.enabled === true || raw.experimental === true;
     const binaryPath = raw.binaryPath === undefined ? undefined : String(raw.binaryPath);
     const localPort = raw.localPort === undefined ? this.options.defaultLocalPort ?? DEFAULT_LOCAL_PORT : Number(raw.localPort);
     if (!Number.isSafeInteger(localPort) || localPort < 1 || localPort > 65_535) throw providerError("invalid_arguments", "OpenAI Tunnel localPort must be in [1, 65535]");
     const mcpPath = normalizeMcpPath(raw.mcpPath === undefined ? this.options.mcpPath ?? DEFAULT_MCP_PATH : String(raw.mcpPath));
+    const publicUrl = raw.publicUrl === undefined ? undefined : normalizePublicUrl(String(raw.publicUrl));
     const tunnelIdEnv = envName(raw.tunnelIdEnv === undefined ? this.options.tunnelIdEnv ?? "CONTROL_PLANE_TUNNEL_ID" : String(raw.tunnelIdEnv), "tunnelIdEnv");
     const runtimeKeyEnv = envName(raw.runtimeKeyEnv === undefined ? this.options.runtimeKeyEnv ?? "CONTROL_PLANE_API_KEY" : String(raw.runtimeKeyEnv), "runtimeKeyEnv");
-    return { enabled, ...(binaryPath === undefined ? {} : { binaryPath }), localPort, mcpPath, tunnelIdEnv, runtimeKeyEnv };
+    const credentialTtlMs = raw.credentialTtlMs === undefined ? this.options.credentialTtlMs ?? DEFAULT_CREDENTIAL_TTL_MS : Number(raw.credentialTtlMs);
+    if (!Number.isSafeInteger(credentialTtlMs) || credentialTtlMs < 1_000 || credentialTtlMs > 60 * 60_000) throw providerError("invalid_arguments", "OpenAI Tunnel credential TTL must be in [1000, 3600000] ms");
+    return { enabled, ...(binaryPath === undefined ? {} : { binaryPath }), localPort, mcpPath, ...(publicUrl ? { publicUrl } : {}), tunnelIdEnv, runtimeKeyEnv, credentialTtlMs };
   }
 
   private secretReference(name: string, label: string): string | undefined {
@@ -377,9 +396,22 @@ export class OpenAiTunnelProvider implements GatewayTunnelProvider {
     if (this.alive(pid)) throw providerError("tunnel_stop_failed", `tunnel-client pid ${pid} survived stop escalation`);
   }
 
+  private scheduleCredentialRotation(runtime: OpenAiRuntime): void {
+    const now = this.now();
+    const effectiveExpiry = Math.min(runtime.gatewayCredential.expiresAt, now + runtime.input.credentialTtlMs);
+    const remainingMs = Math.max(1, effectiveExpiry - now);
+    const leadMs = Math.min(30_000, Math.max(100, Math.floor(remainingMs / 5)));
+    runtime.rotationTimer = setTimeout(() => {
+      if (runtime.cleaned || this.runtimes.get(runtime.key) !== runtime) return;
+      try { runtime.child.kill("SIGTERM"); } catch { /* supervisor recovery handles an eventual exit */ }
+    }, Math.max(1, remainingMs - leadMs));
+    runtime.rotationTimer.unref?.();
+  }
+
   private async cleanup(runtime: OpenAiRuntime): Promise<void> {
     if (runtime.cleaned) return;
     runtime.cleaned = true;
+    if (runtime.rotationTimer) clearTimeout(runtime.rotationTimer);
     if (this.runtimes.get(runtime.key) === runtime) this.runtimes.delete(runtime.key);
     await rm(runtime.directory, { recursive: true, force: true }).catch(() => undefined);
     await Promise.resolve(this.options.revokeGatewayCredential?.(runtime.gatewayCredential.id)).catch(() => undefined);
@@ -438,6 +470,15 @@ function normalizeMcpPath(value: string): string {
   const trimmed = value.trim();
   if (!trimmed.startsWith("/") || trimmed.includes("?") || trimmed.includes("#") || trimmed.length > 256) throw providerError("invalid_arguments", "OpenAI Tunnel mcpPath must be an absolute URL path");
   return trimmed;
+}
+
+function normalizePublicUrl(value: string): string {
+  let parsed: URL;
+  try { parsed = new URL(value); } catch { throw providerError("invalid_arguments", "OpenAI Tunnel publicUrl must be an HTTPS origin"); }
+  if (parsed.protocol !== "https:" || parsed.origin !== value || parsed.pathname !== "/" || parsed.username || parsed.password || parsed.search || parsed.hash) {
+    throw providerError("invalid_arguments", "OpenAI Tunnel publicUrl must be an exact credential-free HTTPS origin");
+  }
+  return parsed.origin;
 }
 
 function envName(value: string, field: string): string {

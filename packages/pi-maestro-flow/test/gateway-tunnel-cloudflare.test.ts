@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PassThrough } from "node:stream";
@@ -12,6 +12,7 @@ import { setGatewayControlClientForTest, updateGatewayConfigServerURL } from "..
 import type { GatewayTunnelPublicState } from "../src/gateway/tunnel/provider.ts";
 import {
   CloudflareQuickTunnelProvider,
+  cloudflareNamedTunnelArgs,
   cloudflareQuickTunnelArgs,
   isCloudflareQuickTunnelCommandLine,
   parseCloudflareQuickTunnelUrl,
@@ -68,18 +69,22 @@ async function fixture(t: test.TestContext, options: {
   const binary = join(root, process.platform === "win32" ? "cloudflared.exe" : "cloudflared");
   await writeFile(binary, "test binary");
   const child = options.child ?? fakeChild();
+  const spawned: Array<{ command: string; args: string[]; options: SpawnOptions }> = [];
   const provider = new CloudflareQuickTunnelProvider({
     binaryPath: binary,
     fetch: options.fetch,
     discoverProcesses: options.discover ?? (() => []),
-    spawn: ((_command: string, _args: readonly string[], _options: SpawnOptions) => child) as typeof import("node:child_process").spawn,
+    spawn: ((command: string, args: readonly string[], spawnOptions: SpawnOptions) => {
+      spawned.push({ command, args: [...args], options: spawnOptions });
+      return child;
+    }) as typeof import("node:child_process").spawn,
     processAlive: options.processAlive ?? (() => child.exitCode === null),
     signalProcess: options.signalProcess,
     maxOutputBytes: options.maxOutputBytes,
     now: options.now,
     platform: "linux",
   });
-  return { provider, child, binary };
+  return { provider, child, binary, root, spawned };
 }
 
 function deadline(timeoutMs = 2_000) {
@@ -94,6 +99,128 @@ test("Quick Tunnel argv and URL parsing reject named or mutated tunnels", () => 
   assert.equal(isCloudflareQuickTunnelCommandLine("cloudflared tunnel --protocol quic --url http://127.0.0.1:19090", 19090), false);
   assert.equal(parseCloudflareQuickTunnelUrl("INF https://abc-123.trycloudflare.com ready"), "https://abc-123.trycloudflare.com");
   assert.equal(parseCloudflareQuickTunnelUrl("https://example.com"), undefined);
+});
+
+test("Named Tunnel argv supports credentials-file and token-file references", async (t) => {
+  for (const credential of [
+    { field: "credentialsFile", flag: "--credentials-file", filename: "credentials.json" },
+    { field: "tokenFile", flag: "--token-file", filename: "token.txt" },
+  ] as const) {
+    await t.test(credential.field, async (t) => {
+      const probed: string[] = [];
+      const fetchImpl: typeof fetch = async (input) => {
+        probed.push(String(input));
+        return new Response("ready", { status: 200 });
+      };
+      const { provider, child, binary, root, spawned } = await fixture(t, { fetch: fetchImpl });
+      const credentialPath = join(root, credential.filename);
+      await writeFile(credentialPath, "reference-only-secret");
+      const namedRequest: GatewayTunnelProviderRequest = {
+        ...request,
+        generation: credential.field === "credentialsFile" ? 10 : 11,
+        ownerToken: `owner-token-${credential.field}-0001`,
+        input: {
+          mode: "named",
+          tunnelId: "prod_gateway-01",
+          publicUrl: "https://gateway.example.com/",
+          [credential.field]: credentialPath,
+          localPort: 19091,
+          binaryPath: binary,
+        },
+      };
+      const context = deadline();
+      t.after(() => context.close());
+
+      assert.deepEqual(await provider.doctor(context, namedRequest), { ok: true, executablePath: binary });
+      const started = await provider.start(context, namedRequest);
+      const expectedArgs = cloudflareNamedTunnelArgs({
+        localPort: 19091,
+        tunnelId: "prod_gateway-01",
+        credentialFlag: credential.flag,
+        credentialPath,
+      });
+      assert.deepEqual(started.args, expectedArgs);
+      assert.deepEqual(spawned, [{
+        command: binary,
+        args: expectedArgs,
+        options: { detached: true, stdio: ["ignore", "pipe", "pipe"], shell: false, windowsHide: true },
+      }]);
+      assert.equal(started.endpoint, "https://gateway.example.com");
+
+      child.stderr.write("INF unrelated https://wrong.trycloudflare.com URL\n");
+      const ready = await provider.probe(context, started, namedRequest);
+      assert.deepEqual(probed, ["http://127.0.0.1:19091/mcp", "https://gateway.example.com/mcp"]);
+      assert.equal(ready.ready, true);
+      assert.equal(ready.endpoint, "https://gateway.example.com");
+      assert.match(ready.detail ?? "", /provider: configured URL/u);
+
+      child.stderr.write(`must-not-persist ${credentialPath} reference-only-secret\n`);
+      child.setExit(7);
+      const exit = await started.exited;
+      assert.equal(exit.detail, undefined, "Named Tunnel logs and argv references are not exposed to durable exit state");
+    });
+  }
+});
+
+test("Named Tunnel rejects missing, ambiguous, relative, or unavailable credential references", async (t) => {
+  const { provider, root } = await fixture(t);
+  const credentialsFile = join(root, "credentials.json");
+  const tokenFile = join(root, "token.txt");
+  await Promise.all([writeFile(credentialsFile, "{}"), writeFile(tokenFile, "token")]);
+  const base = { mode: "named", tunnelId: "prod-01", publicUrl: "https://gateway.example.com", localPort: 19091 } as const;
+  const context = deadline();
+  t.after(() => context.close());
+
+  await assert.rejects(() => provider.doctor(context, { ...request, input: base }), /exactly one/u);
+  await assert.rejects(() => provider.doctor(context, { ...request, input: { ...base, credentialsFile, tokenFile } }), /exactly one/u);
+  await assert.rejects(() => provider.doctor(context, { ...request, input: { ...base, credentialsFile: "relative.json" } }), /absolute existing file path/u);
+  await assert.rejects(() => provider.doctor(context, { ...request, input: { ...base, tokenFile: join(root, "missing-token.txt") } }), /absolute existing file path/u);
+  await assert.rejects(() => provider.doctor(context, { ...request, input: { ...base, tokenFile: root } }), /regular file/u);
+  const symlinkPath = join(root, "token-link.txt");
+  try {
+    await symlink(tokenFile, symlinkPath, "file");
+    await assert.rejects(() => provider.doctor(context, { ...request, input: { ...base, tokenFile: symlinkPath } }), /non-symlink regular file/u);
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code !== "EPERM" && code !== "EACCES") throw error;
+    t.diagnostic(`symlink creation unavailable on this platform (${code})`);
+  }
+  assert.equal((await provider.doctor(context, { ...request, input: { ...base, tokenFile, binaryPath: "relative-cloudflared" } })).ok, false);
+  assert.equal((await provider.doctor(context, { ...request, input: { ...base, tokenFile, binaryPath: join(root, "missing-cloudflared") } })).ok, false);
+});
+
+test("Named Tunnel rejects literal secrets/config and unsafe identifiers or public URLs", async (t) => {
+  const { provider, root } = await fixture(t);
+  const tokenFile = join(root, "token.txt");
+  await writeFile(tokenFile, "token");
+  const base: Readonly<Record<string, unknown>> = {
+    mode: "named",
+    tunnelId: "prod-01",
+    publicUrl: "https://gateway.example.com",
+    tokenFile,
+    localPort: 19091,
+  };
+  const context = deadline();
+  t.after(() => context.close());
+
+  for (const key of ["token", "credentials", "credentialsContents", "config", "configContents", "configFile"] as const) {
+    await assert.rejects(
+      () => provider.doctor(context, { ...request, input: { ...base, [key]: "literal-secret-or-config" } }),
+      /rejects literal secret\/config input/u,
+    );
+  }
+  for (const tunnelId of ["../prod", "-prod", "prod.", "prod tunnel", "a".repeat(129)]) {
+    await assert.rejects(() => provider.doctor(context, { ...request, input: { ...base, tunnelId } }), /safe identifier/u);
+  }
+  for (const publicUrl of [
+    "http://gateway.example.com",
+    "https://user:pass@gateway.example.com",
+    "https://gateway.example.com/mcp",
+    "https://gateway.example.com?secret=value",
+    "https://gateway.example.com#fragment",
+  ]) {
+    await assert.rejects(() => provider.doctor(context, { ...request, input: { ...base, publicUrl } }), /HTTPS origin/u);
+  }
 });
 
 test("stderr URL delay and Cloudflare 1033 do not bypass local/provider/public readiness", async (t) => {
@@ -239,11 +366,9 @@ test("a stale native generation cannot overwrite the configured public endpoint"
   assert.match(await readFile(configPath, "utf8"), /new\.trycloudflare\.com/u);
 });
 
-test("named-tunnel inputs and unavailable explicit binaries are rejected without download", async (t) => {
-  const { provider } = await fixture(t);
+test("unavailable explicit binaries are rejected without download", async (t) => {
   const context = deadline();
   t.after(() => context.close());
-  await assert.rejects(() => provider.doctor(context, { ...request, input: { mode: "named", tunnelName: "prod" } }), /Only Cloudflare Quick Tunnel/u);
   const missing = new CloudflareQuickTunnelProvider({ binaryPath: join(tmpdir(), "definitely-missing-cloudflared"), discoverProcesses: () => [] });
   assert.equal((await missing.doctor(context, request)).ok, false);
 });

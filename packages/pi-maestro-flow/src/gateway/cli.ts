@@ -7,16 +7,19 @@ import { GatewayOwnerActiveError, GatewayOwnerStore } from "./owner-store.ts";
 import type { GatewayOwnerRecord } from "./contracts.ts";
 import { GATEWAY_OFFLINE_MESSAGE, relayGatewayStdio } from "./stdio-relay.ts";
 import { GatewayResidentService } from "./resident-service.ts";
-import { loadGatewayConfig } from "./config.ts";
+import { gatewayTunnelProfileInput, loadGatewayConfig, writeGatewayConfigPatch } from "./config.ts";
 import { applyPiConfigStream, serializePiConfigApplyError } from "./pi-config-apply.ts";
 import { GatewayControlClient } from "./control-client.ts";
 import { migrateLegacyGateway } from "./config-migration.ts";
 import { serializeGatewayLegacyMigrationError } from "./migration-contracts.ts";
+import { gatewayConfigPath } from "./state-paths.ts";
 
 export interface GatewayCliIo {
   stdin?: Readable;
   stdout?: Writable;
   stderr?: Writable;
+  /** Test seam for lifecycle sequencing; production always constructs the native client. */
+  createControlClient?: (configPath?: string) => GatewayControlClient;
 }
 
 interface ServeFlags {
@@ -160,6 +163,7 @@ export async function main(argv = process.argv.slice(2), io: GatewayCliIo = {}):
   const stdin = io.stdin ?? process.stdin;
   const stdout = io.stdout ?? process.stdout;
   const stderr = io.stderr ?? process.stderr;
+  const createControlClient = (configPath?: string): GatewayControlClient => io.createControlClient?.(configPath) ?? new GatewayControlClient({ configPath });
   const [command = "help", ...args] = argv;
   try {
     if (command === "version" || command === "--version" || command === "-v") {
@@ -171,6 +175,11 @@ export async function main(argv = process.argv.slice(2), io: GatewayCliIo = {}):
     if (command === "connect") {
       if (args.length !== 1 || args[0] !== "--stdio") throw new Error("Usage: pi-maestro-gateway connect --stdio");
       await relayGatewayStdio();
+      return 0;
+    }
+    if (command === "config") {
+      const { runGatewayConfigCommand } = await import("./config-tui.ts");
+      await runGatewayConfigCommand(args, { input: stdin, output: stdout });
       return 0;
     }
     if (command === "config-sync") {
@@ -238,13 +247,78 @@ export async function main(argv = process.argv.slice(2), io: GatewayCliIo = {}):
     }
     if (command === "tunnel") {
       const action = args[0];
+      if (action === "profile") {
+        const profileAction = args[1];
+        if (!profileAction || !["list", "status", "start", "stop", "restart", "enable", "disable"].includes(profileAction)) throw new Error("Usage: pi-maestro-gateway tunnel profile list|status|start|stop|restart|enable|disable [PROFILE] [--timeout-ms MS] [--generation N] [--json]");
+        const flags = parseTunnelFlags(args.slice(2));
+        if (flags.instance !== undefined || flags.localPort !== undefined || flags.binaryPath !== undefined || flags.experimental || flags.tunnelIdEnv !== undefined || flags.runtimeKeyEnv !== undefined) {
+          throw new Error("Tunnel profile commands use the persisted profile and do not accept provider-specific overrides");
+        }
+        const config = await loadGatewayConfig(flags.configPath);
+        if (profileAction === "list") {
+          if (flags.provider !== undefined || flags.expectedGeneration !== undefined || flags.timeoutMs !== undefined) throw new Error("tunnel profile list accepts only --config and --json");
+          write(stdout, flags.json ? JSON.stringify(config.tunnels.profiles) : JSON.stringify(config.tunnels.profiles, null, 2));
+          return 0;
+        }
+        const profileId = flags.provider;
+        if (!profileId) throw new Error(`tunnel profile ${profileAction} requires a profile id`);
+        const profile = config.tunnels.profiles.find((candidate) => candidate.id === profileId);
+        if (!profile) throw new Error(`Unknown tunnel profile: ${profileId}`);
+        if (profileAction === "status" && flags.expectedGeneration !== undefined) throw new Error("tunnel profile status does not accept --generation");
+        const client = createControlClient(flags.configPath);
+        const input = gatewayTunnelProfileInput(profile, config.transport.http);
+        const options = {
+          instance: profile.id,
+          ...(flags.timeoutMs === undefined ? {} : { timeoutMs: flags.timeoutMs }),
+          ...(flags.expectedGeneration === undefined ? {} : { expectedGeneration: flags.expectedGeneration }),
+          input: { ...input },
+        };
+        if (profileAction === "enable" || profileAction === "disable") {
+          if (profile.lifecycle !== "persistent") throw new Error(`tunnel profile ${profileAction} requires a persistent profile`);
+          if (flags.expectedGeneration !== undefined) throw new Error(`tunnel profile ${profileAction} does not accept --generation`);
+          const enabled = profileAction === "enable";
+          if (enabled && config.tunnels.profiles.some((candidate) => candidate.id !== profile.id && candidate.enabled && candidate.lifecycle === "persistent")) {
+            throw new Error("Disable the active persistent tunnel profile before enabling another one");
+          }
+          let state: unknown;
+          const gateway = await client.status();
+          if (!enabled && gateway.online) state = await client.tunnelStop(profile.provider, options);
+          const profiles = config.tunnels.profiles.map((candidate) => candidate.id === profile.id ? { ...candidate, enabled } : candidate);
+          await writeGatewayConfigPatch(flags.configPath ?? gatewayConfigPath(), {
+            tunnels: { profiles } as never,
+            ...(enabled ? {
+              server: { disable_localhost_protection: true, trust_proxy_headers: true } as never,
+              auth: {
+                mode: config.auth.mode === "open" ? "oauth" : config.auth.mode === "bearer" ? "dual" : config.auth.mode,
+                oauth: { server_url: profile.publicUrl, tokenTtlMs: config.auth.oauth?.tokenTtlMs ?? 86_400_000 },
+              } as never,
+            } : {}),
+          });
+          if (enabled) {
+            if (gateway.online) await client.restart();
+            state = await client.tunnelStart(profile.provider, options);
+          }
+          const value = { profile: profile.id, enabled, ...(state === undefined ? {} : { state }) };
+          write(stdout, flags.json ? JSON.stringify(value) : JSON.stringify(value, null, 2));
+          return 0;
+        }
+        const value = profileAction === "status"
+          ? await client.tunnelStatus(profile.provider, profile.id, flags.timeoutMs)
+          : profileAction === "start"
+            ? await client.tunnelStart(profile.provider, options)
+            : profileAction === "stop"
+              ? await client.tunnelStop(profile.provider, options)
+              : await client.tunnelRestart(profile.provider, options);
+        write(stdout, flags.json ? JSON.stringify(value) : JSON.stringify(value, null, 2));
+        return 0;
+      }
       if (!action || !["status", "start", "stop", "restart"].includes(action)) throw new Error("Usage: pi-maestro-gateway tunnel status|start|stop|restart [PROVIDER] [INSTANCE] [--timeout-ms MS] [--generation N] [--json]");
       const flags = parseTunnelFlags(args.slice(1));
       if (action !== "status" && !flags.provider) throw new Error(`tunnel ${action} requires a provider`);
       if (action === "status" && (flags.expectedGeneration !== undefined || flags.localPort !== undefined || flags.binaryPath !== undefined || flags.experimental || flags.tunnelIdEnv !== undefined || flags.runtimeKeyEnv !== undefined)) throw new Error("tunnel status does not accept start/configuration options");
       if (flags.provider && flags.provider !== "cloudflare" && flags.provider !== "openai" && (flags.localPort !== undefined || flags.binaryPath !== undefined || flags.experimental || flags.tunnelIdEnv !== undefined || flags.runtimeKeyEnv !== undefined)) throw new Error("Tunnel provider-specific options require cloudflare or openai");
       if (flags.provider === "cloudflare" && (flags.experimental || flags.tunnelIdEnv !== undefined || flags.runtimeKeyEnv !== undefined)) throw new Error("--experimental and OpenAI credential references are OpenAI Tunnel options");
-      const client = new GatewayControlClient({ configPath: flags.configPath });
+      const client = createControlClient(flags.configPath);
       const common = {
         ...(flags.instance === undefined ? {} : { instance: flags.instance }),
         ...(flags.timeoutMs === undefined ? {} : { timeoutMs: flags.timeoutMs }),
@@ -272,7 +346,7 @@ export async function main(argv = process.argv.slice(2), io: GatewayCliIo = {}):
       const action = args[0];
       if (!action || !["list", "register", "renew", "remove"].includes(action)) throw new Error("Usage: pi-maestro-gateway workspace list|register|renew|remove [PATH_OR_ID] [--ttl SECONDS] [--generation N] [--json]");
       const flags = parseWorkspaceFlags(args.slice(1));
-      const client = new GatewayControlClient({ configPath: flags.configPath });
+      const client = createControlClient(flags.configPath);
       let value: unknown;
       if (action === "list") {
         if (flags.target !== undefined || flags.ttlSeconds !== undefined || flags.expectedGeneration !== undefined || flags.permanent) throw new Error("workspace list accepts only --config and --json");
@@ -344,6 +418,7 @@ export async function main(argv = process.argv.slice(2), io: GatewayCliIo = {}):
         "Commands:",
         "  serve [--config PATH] [--host HOST] [--port PORT] [--no-http] [--json]",
         "  connect --stdio",
+        "  config [--config PATH]  # standalone terminal UI; no Pi host required",
         "  config-sync apply",
         "  migrate-legacy --dry-run|--apply [--json]",
         "  service install|ensure|start|stop|restart|status|uninstall [--config PATH] [--json]",
@@ -352,6 +427,8 @@ export async function main(argv = process.argv.slice(2), io: GatewayCliIo = {}):
         "    In a non-interactive SSH session, ensure guarantees readiness only until that session ends.",
         "  pair create|bootstrap|list|revoke [ID]",
         "  tunnel status|start|stop|restart [PROVIDER] [INSTANCE] [--timeout-ms MS] [--generation N] [--local-port PORT] [--binary PATH] [--json]",
+        "  tunnel profile list|status|start|stop|restart|enable|disable [PROFILE] [--timeout-ms MS] [--generation N] [--config PATH] [--json]",
+        "    persisted profiles support Cloudflare Quick/Named, OpenAI Secure, and Managed OpenSSH Reverse modes; legacy provider commands remain compatible",
         "    openai is experimental: explicitly configure env references or pass --experimental --tunnel-id-env NAME --runtime-key-env NAME; no auto-download/provisioning",
         "  workspace list [--config PATH] [--json]",
         "  workspace register PATH [--ttl SECONDS | --permanent] [--generation N] [--config PATH] [--json]",

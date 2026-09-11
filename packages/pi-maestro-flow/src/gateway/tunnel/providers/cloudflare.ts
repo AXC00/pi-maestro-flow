@@ -1,6 +1,6 @@
-/** Cloudflare Quick Tunnel provider for the native Gateway tunnel supervisor. */
+/** Cloudflare Quick and Named Tunnel provider for the native Gateway tunnel supervisor. */
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
-import { existsSync, readFileSync, readdirSync, realpathSync } from "node:fs";
+import { existsSync, lstatSync, readFileSync, readdirSync, realpathSync, statSync } from "node:fs";
 import { isAbsolute } from "node:path";
 import type {
   GatewayTunnelDeadlineContext,
@@ -22,6 +22,23 @@ const DEFAULT_PROBE_PATH = "/mcp";
 const STOP_GRACE_MS = 2_000;
 const STOP_POLL_MS = 50;
 const QUICK_TUNNEL_URL = /https:\/\/[a-z0-9-]+\.trycloudflare\.com\b/iu;
+const SAFE_TUNNEL_ID = /^[A-Za-z0-9](?:[A-Za-z0-9_-]{0,126}[A-Za-z0-9])?$/u;
+
+type CloudflareTunnelMode = "quick" | "named";
+
+type CloudflareInput = {
+  mode: "quick";
+  localPort: number;
+  binaryPath?: string;
+} | {
+  mode: "named";
+  localPort: number;
+  binaryPath?: string;
+  tunnelId: string;
+  publicUrl: string;
+  credentialFlag: "--credentials-file" | "--token-file";
+  credentialPath: string;
+};
 
 export interface CloudflareQuickTunnelProcess {
   pid: number;
@@ -47,11 +64,13 @@ export interface CloudflareQuickTunnelProviderOptions {
 interface CloudflareRuntime {
   readonly key: string;
   readonly pid: number;
+  readonly mode: CloudflareTunnelMode;
   readonly localPort: number;
   readonly binaryPath: string;
   readonly args: string[];
   readonly child: ChildProcess;
   readonly exited: Promise<GatewayTunnelExit>;
+  readonly publicUrl?: string;
   output: Buffer;
   exit?: GatewayTunnelExit;
 }
@@ -63,6 +82,24 @@ export function isValidCloudflareLocalPort(value: number): boolean {
 export function cloudflareQuickTunnelArgs(localPort: number): string[] {
   if (!isValidCloudflareLocalPort(localPort)) throw new Error("Cloudflare Quick Tunnel localPort must be in [1, 65535]");
   return ["tunnel", "--protocol", "http2", "--url", `http://127.0.0.1:${localPort}`];
+}
+
+export function cloudflareNamedTunnelArgs(input: {
+  localPort: number;
+  tunnelId: string;
+  credentialFlag: "--credentials-file" | "--token-file";
+  credentialPath: string;
+}): string[] {
+  if (!isValidCloudflareLocalPort(input.localPort)) throw new Error("Cloudflare Named Tunnel localPort must be in [1, 65535]");
+  return [
+    "tunnel",
+    "run",
+    "--url",
+    `http://127.0.0.1:${input.localPort}`,
+    input.credentialFlag,
+    input.credentialPath,
+    input.tunnelId,
+  ];
 }
 
 /** Exact matcher used only for duplicate discovery; named tunnels never match. */
@@ -142,8 +179,13 @@ export class CloudflareQuickTunnelProvider implements GatewayTunnelProvider {
 
   async doctor(context: GatewayTunnelDeadlineContext, request: GatewayTunnelProviderRequest): Promise<GatewayTunnelDoctorResult> {
     context.throwIfExpired("doctor");
-    this.assertQuickOnly(request);
-    const configured = this.input(request).binaryPath ?? this.binaryPath;
+    const raw = request.input ?? {};
+    let configured: string | undefined;
+    if (raw.mode === "named") configured = this.input(request).binaryPath ?? this.binaryPath;
+    else {
+      this.assertQuickInput(request);
+      configured = raw.binaryPath === undefined ? this.binaryPath : String(raw.binaryPath);
+    }
     const executablePath = resolveCloudflaredBinary(configured);
     return executablePath
       ? { ok: true, executablePath }
@@ -152,18 +194,25 @@ export class CloudflareQuickTunnelProvider implements GatewayTunnelProvider {
 
   async start(context: GatewayTunnelDeadlineContext, request: GatewayTunnelProviderRequest): Promise<GatewayTunnelStartResult> {
     context.throwIfExpired("start");
-    this.assertQuickOnly(request);
     const input = this.input(request);
-    const localPort = input.localPort ?? this.defaultLocalPort;
-    if (!isValidCloudflareLocalPort(localPort)) throw providerError("invalid_arguments", "Cloudflare localPort must be in [1, 65535]");
+    const localPort = input.localPort;
     const binaryPath = resolveCloudflaredBinary(input.binaryPath ?? this.binaryPath);
     if (!binaryPath) throw providerError("tunnel_doctor_failed", "cloudflared was not found in explicit configuration or PATH");
-    const existing = await this.discover(localPort);
-    context.throwIfExpired("start");
-    if (existing === undefined) throw providerError("tunnel_discovery_failed", "Cloudflare process discovery was incomplete; refusing a duplicate start");
-    if (existing.length > 0) throw providerError("tunnel_duplicate", `Found ${existing.length} existing Cloudflare Quick Tunnel process(es) for 127.0.0.1:${localPort}`);
+    if (input.mode === "quick") {
+      const existing = await this.discover(localPort);
+      context.throwIfExpired("start");
+      if (existing === undefined) throw providerError("tunnel_discovery_failed", "Cloudflare process discovery was incomplete; refusing a duplicate start");
+      if (existing.length > 0) throw providerError("tunnel_duplicate", `Found ${existing.length} existing Cloudflare Quick Tunnel process(es) for 127.0.0.1:${localPort}`);
+    }
 
-    const args = cloudflareQuickTunnelArgs(localPort);
+    const args = input.mode === "quick"
+      ? cloudflareQuickTunnelArgs(localPort)
+      : cloudflareNamedTunnelArgs({
+        localPort,
+        tunnelId: input.tunnelId,
+        credentialFlag: input.credentialFlag,
+        credentialPath: input.credentialPath,
+      });
     const isShim = this.platform === "win32" && /\.(?:cmd|bat)$/iu.test(binaryPath);
     const child = this.spawnImpl(binaryPath, args, {
       detached: !isShim,
@@ -180,56 +229,88 @@ export class CloudflareQuickTunnelProvider implements GatewayTunnelProvider {
     let settle!: (exit: GatewayTunnelExit) => void;
     let settled = false;
     const exited = new Promise<GatewayTunnelExit>((resolve) => { settle = resolve; });
-    const runtime: CloudflareRuntime = { key, pid: child.pid, localPort, binaryPath, args, child, exited, output: Buffer.alloc(0) };
+    const runtime: CloudflareRuntime = {
+      key,
+      pid: child.pid,
+      mode: input.mode,
+      localPort,
+      binaryPath,
+      args,
+      child,
+      exited,
+      ...(input.mode === "named" ? { publicUrl: input.publicUrl } : {}),
+      output: Buffer.alloc(0),
+    };
     const finish = (exit: GatewayTunnelExit): void => {
       if (settled) return;
       settled = true;
       runtime.exit = exit;
-      appendBounded(runtime, exit.detail ?? "", this.maxOutputBytes);
+      if (runtime.mode === "quick") appendBounded(runtime, exit.detail ?? "", this.maxOutputBytes);
       settle(exit);
     };
-    child.stdout?.on("data", (chunk: Buffer | string) => appendBounded(runtime, chunk, this.maxOutputBytes));
-    child.stderr?.on("data", (chunk: Buffer | string) => appendBounded(runtime, chunk, this.maxOutputBytes));
-    child.once("error", (error) => finish({ code: null, at: this.now(), detail: `spawn error: ${error.message}` }));
-    child.once("exit", (code, signal) => finish({ code, signal, at: this.now(), detail: outputTail(runtime.output) }));
+    if (runtime.mode === "quick") {
+      child.stdout?.on("data", (chunk: Buffer | string) => appendBounded(runtime, chunk, this.maxOutputBytes));
+      child.stderr?.on("data", (chunk: Buffer | string) => appendBounded(runtime, chunk, this.maxOutputBytes));
+    } else {
+      child.stdout?.resume();
+      child.stderr?.resume();
+    }
+    child.once("error", (error) => finish(runtime.mode === "quick"
+      ? { code: null, at: this.now(), detail: `spawn error: ${error.message}` }
+      : { code: null, at: this.now(), detail: "cloudflared spawn failed" }));
+    child.once("exit", (code, signal) => finish(runtime.mode === "quick"
+      ? { code, signal, at: this.now(), detail: outputTail(runtime.output) }
+      : { code, signal, at: this.now() }));
     this.runtimes.set(key, runtime);
-    return { pid: runtime.pid, executablePath: binaryPath, args, exited, child };
+    return {
+      pid: runtime.pid,
+      executablePath: binaryPath,
+      args,
+      ...(runtime.publicUrl ? { endpoint: runtime.publicUrl } : {}),
+      exited,
+      child,
+    };
   }
 
   async probe(context: GatewayTunnelDeadlineContext, process: GatewayTunnelStartResult, request: GatewayTunnelProviderRequest): Promise<GatewayTunnelProbeResult> {
     context.throwIfExpired("probe");
-    this.assertQuickOnly(request);
+    const input = this.input(request);
     const runtime = this.runtimes.get(runtimeKey(request));
+    const mode = runtime?.mode ?? input.mode;
     if (runtime && runtime.pid !== process.pid) return { ready: false, terminal: true, detail: "Cloudflare runtime pid does not match the requested generation" };
     if (runtime?.exit || !this.alive(process.pid)) {
       const exit = runtime?.exit;
+      const suffix = mode === "quick" ? `: ${runtime ? outputTail(runtime.output) : ""}` : "";
       return {
         ready: false,
         terminal: true,
-        detail: boundedDetail(`cloudflared exited before readiness (exit=${exit?.code ?? "unknown"}${exit?.signal ? `, signal=${exit.signal}` : ""}): ${runtime ? outputTail(runtime.output) : ""}`),
+        detail: boundedDetail(`cloudflared exited before readiness (exit=${exit?.code ?? "unknown"}${exit?.signal ? `, signal=${exit.signal}` : ""})${suffix}`),
       };
     }
 
-    const localPort = runtime?.localPort ?? this.input(request).localPort ?? this.defaultLocalPort;
+    const localPort = runtime?.localPort ?? input.localPort;
     const local = await this.probeEndpoint(context, `http://127.0.0.1:${localPort}${this.probePath}`, false);
     if (!local.ready) return { ready: false, terminal: local.terminal, detail: `local: ${local.detail}`, retryAfterMs: local.retryAfterMs };
 
-    const endpoint = process.endpoint ?? (runtime ? parseCloudflareQuickTunnelUrl(runtime.output) : undefined);
+    const endpoint = mode === "named"
+      ? runtime?.publicUrl ?? (input.mode === "named" ? input.publicUrl : undefined)
+      : process.endpoint ?? (runtime ? parseCloudflareQuickTunnelUrl(runtime.output) : undefined);
     if (!endpoint) {
       return { ready: false, terminal: runtime === undefined, detail: boundedDetail(`local: ready; provider: ${runtime ? "waiting for Quick Tunnel URL" : "persisted endpoint unavailable"}; log: ${runtime ? outputTail(runtime.output) : ""}`), retryAfterMs: 100 };
     }
 
     const publicProbe = await this.probeEndpoint(context, `${endpoint}${this.probePath}`, true);
+    const providerDetail = mode === "named" ? "configured URL" : "URL acquired";
     if (!publicProbe.ready) {
       return {
         ready: false,
         terminal: publicProbe.terminal,
         endpoint,
-        detail: `local: ready; provider: URL acquired; public: ${publicProbe.detail}`,
+        detail: `local: ready; provider: ${providerDetail}; public: ${publicProbe.detail}`,
         retryAfterMs: publicProbe.retryAfterMs,
       };
     }
-    return { ready: true, endpoint, detail: `local: ready; provider: URL acquired; public: ${publicProbe.detail}` };
+    return { ready: true, endpoint, detail: `local: ready; provider: ${providerDetail}; public: ${publicProbe.detail}` };
   }
 
   async stop(context: GatewayTunnelDeadlineContext, identity: GatewayTunnelProcessIdentity, request: GatewayTunnelStopRequest): Promise<void> {
@@ -241,19 +322,60 @@ export class CloudflareQuickTunnelProvider implements GatewayTunnelProvider {
     if (this.runtimes.get(key)?.pid === identity.pid) this.runtimes.delete(key);
   }
 
-  private input(request: GatewayTunnelProviderRequest): { localPort?: number; binaryPath?: string; mode?: string } {
-    const value = request.input ?? {};
-    const localPort = value.localPort === undefined ? undefined : Number(value.localPort);
-    const binaryPath = value.binaryPath === undefined ? undefined : String(value.binaryPath);
-    const mode = value.mode === undefined ? undefined : String(value.mode);
-    return { ...(localPort === undefined ? {} : { localPort }), ...(binaryPath === undefined ? {} : { binaryPath }), ...(mode === undefined ? {} : { mode }) };
+  private input(request: GatewayTunnelProviderRequest): CloudflareInput {
+    const raw = request.input ?? {};
+    const mode = raw.mode === undefined ? "quick" : String(raw.mode);
+    if (mode === "quick") {
+      this.assertQuickInput(request);
+      const localPort = raw.localPort === undefined ? this.defaultLocalPort : Number(raw.localPort);
+      if (!isValidCloudflareLocalPort(localPort)) throw providerError("invalid_arguments", "Cloudflare localPort must be in [1, 65535]");
+      const binaryPath = raw.binaryPath === undefined ? undefined : String(raw.binaryPath);
+      return { mode, localPort, ...(binaryPath === undefined ? {} : { binaryPath }) };
+    }
+    if (mode !== "named") throw providerError("tunnel_mode_unsupported", "Only Cloudflare Quick or Named Tunnel mode is supported");
+
+    const allowed = new Set(["mode", "tunnelId", "publicUrl", "credentialsFile", "tokenFile", "localPort", "binaryPath"]);
+    const literal = Object.keys(raw).find((key) => raw[key] !== undefined && !allowed.has(key) && /token|credential|config/iu.test(key));
+    if (literal) throw providerError("invalid_arguments", `Cloudflare Named Tunnel rejects literal secret/config input: ${literal}`);
+    const unknown = Object.keys(raw).find((key) => !allowed.has(key));
+    if (unknown) throw providerError("invalid_arguments", `Unknown Cloudflare Named Tunnel input: ${unknown}`);
+
+    const tunnelId = requiredString(raw.tunnelId, "tunnelId");
+    if (!SAFE_TUNNEL_ID.test(tunnelId)) {
+      throw providerError("invalid_arguments", "Cloudflare tunnelId must be a 1-128 character safe identifier using only letters, digits, hyphens, or underscores, without leading/trailing punctuation");
+    }
+    const publicUrl = normalizePublicOrigin(requiredString(raw.publicUrl, "publicUrl"));
+    const hasCredentialsFile = raw.credentialsFile !== undefined;
+    const hasTokenFile = raw.tokenFile !== undefined;
+    if (hasCredentialsFile === hasTokenFile) {
+      throw providerError("invalid_arguments", "Cloudflare Named Tunnel requires exactly one of credentialsFile or tokenFile");
+    }
+    const credentialFlag = hasCredentialsFile ? "--credentials-file" as const : "--token-file" as const;
+    const credentialPath = resolveExistingFile(
+      requiredString(hasCredentialsFile ? raw.credentialsFile : raw.tokenFile, hasCredentialsFile ? "credentialsFile" : "tokenFile"),
+      hasCredentialsFile ? "credentialsFile" : "tokenFile",
+    );
+    const localPort = raw.localPort === undefined ? this.defaultLocalPort : Number(raw.localPort);
+    if (!isValidCloudflareLocalPort(localPort)) throw providerError("invalid_arguments", "Cloudflare localPort must be in [1, 65535]");
+    const binaryPath = raw.binaryPath === undefined ? undefined : String(raw.binaryPath);
+    return {
+      mode,
+      localPort,
+      ...(binaryPath === undefined ? {} : { binaryPath }),
+      tunnelId,
+      publicUrl,
+      credentialFlag,
+      credentialPath,
+    };
   }
 
-  private assertQuickOnly(request: GatewayTunnelProviderRequest): void {
+  private assertQuickInput(request: GatewayTunnelProviderRequest): void {
     const input = request.input ?? {};
-    const forbidden = ["name", "tunnelName", "token", "credentialsFile", "configFile"].find((key) => input[key] !== undefined);
-    if (forbidden || (input.mode !== undefined && input.mode !== "quick")) {
-      throw providerError("tunnel_mode_unsupported", "Only Cloudflare Quick Tunnel mode is supported");
+    const allowed = new Set(["mode", "localPort", "binaryPath"]);
+    const unknown = Object.keys(input).find((key) => !allowed.has(key));
+    if (unknown) throw providerError("invalid_arguments", `Unknown Cloudflare Quick Tunnel input: ${unknown}`);
+    if (input.mode !== undefined && input.mode !== "quick") {
+      throw providerError("tunnel_mode_unsupported", "Only Cloudflare Quick or Named Tunnel mode is supported");
     }
   }
 
@@ -315,6 +437,40 @@ function normalizeProbePath(value: string): string {
   const trimmed = value.trim();
   if (!trimmed.startsWith("/") || trimmed.includes("?") || trimmed.includes("#") || trimmed.length > 256) throw new Error("Cloudflare probePath must be an absolute URL path");
   return trimmed.replace(/\/$/u, "") || "/";
+}
+
+function requiredString(value: unknown, field: string): string {
+  if (typeof value !== "string" || value.length === 0 || value !== value.trim()) {
+    throw providerError("invalid_arguments", `Cloudflare ${field} must be a non-empty string without surrounding whitespace`);
+  }
+  return value;
+}
+
+function resolveExistingFile(value: string, field: string): string {
+  if (!isAbsolute(value)) throw providerError("invalid_arguments", `Cloudflare ${field} must be an absolute existing file path`);
+  try {
+    const source = lstatSync(value);
+    if (source.isSymbolicLink() || !source.isFile()) throw providerError("invalid_arguments", `Cloudflare ${field} must reference a non-symlink regular file`);
+    const realpath = realpathSync.native(value);
+    if (!statSync(realpath).isFile()) throw providerError("invalid_arguments", `Cloudflare ${field} must reference a non-symlink regular file`);
+    return realpath;
+  } catch (error) {
+    if (error instanceof Error && "code" in error && error.code === "invalid_arguments") throw error;
+    throw providerError("invalid_arguments", `Cloudflare ${field} must be an absolute existing file path`);
+  }
+}
+
+function normalizePublicOrigin(value: string): string {
+  if (!value.startsWith("https://") || value.includes("?") || value.includes("#")) {
+    throw providerError("invalid_arguments", "Cloudflare publicUrl must be an HTTPS origin without credentials, query, or hash");
+  }
+  let parsed: URL;
+  try { parsed = new URL(value); }
+  catch { throw providerError("invalid_arguments", "Cloudflare publicUrl must be a valid HTTPS origin"); }
+  if (parsed.protocol !== "https:" || !parsed.hostname || parsed.username || parsed.password || parsed.pathname !== "/") {
+    throw providerError("invalid_arguments", "Cloudflare publicUrl must be an HTTPS origin without credentials, path, query, or hash");
+  }
+  return parsed.origin;
 }
 
 function runtimeKey(request: Pick<GatewayTunnelProviderRequest, "generation" | "ownerToken">): string {

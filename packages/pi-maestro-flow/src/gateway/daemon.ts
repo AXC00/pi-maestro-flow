@@ -1,7 +1,7 @@
 /** Lifecycle owner for the one packaged Gateway daemon. */
 import { dirname, join } from "node:path";
 import type { GatewayConfig } from "./config.ts";
-import { loadGatewayConfig } from "./config.ts";
+import { gatewayTunnelProfileInput, loadGatewayConfig } from "./config.ts";
 import { GATEWAY_PROTOCOL_VERSION, type GatewayOwnerRecord } from "./contracts.ts";
 import type { GatewayHttpServerHandle } from "./http-server.ts";
 import { isLoopbackHost } from "./auth.ts";
@@ -13,6 +13,7 @@ import type { GatewayTunnelProvider } from "./tunnel/contracts.ts";
 import { GatewayTunnelManager } from "./tunnel/provider.ts";
 import { CloudflareQuickTunnelProvider } from "./tunnel/providers/cloudflare.ts";
 import { OpenAiTunnelProvider } from "./tunnel/providers/openai.ts";
+import { SshReverseTunnelProvider } from "./tunnel/providers/ssh-reverse.ts";
 
 export interface GatewayDaemonOptions extends Omit<GatewayRuntimeOptions, "config"> {
   config?: GatewayConfig;
@@ -69,7 +70,7 @@ export class GatewayDaemon {
       const localTunnelPort = this.options.httpPort ?? config.transport.http.port;
       const openAiConfig = config.tunnels.openai;
       const tunnelProviders = this.options.tunnelProviders ?? [
-        new CloudflareQuickTunnelProvider({ defaultLocalPort: localTunnelPort }),
+        new CloudflareQuickTunnelProvider({ defaultLocalPort: localTunnelPort, probePath: config.transport.http.path }),
         // Registered after Cloudflare and kept experimental/disabled unless the
         // administrator explicitly configures the supported external CLI and
         // credential references. This provider never downloads or provisions.
@@ -93,9 +94,18 @@ export class GatewayDaemon {
           }),
           revokeGatewayCredential: async (id) => { await runtime.pairingStore.revoke(id, { revokedBy: "openai-tunnel-provider" }); },
         }),
+        new SshReverseTunnelProvider({ defaultLocalPort: localTunnelPort, mcpPath: config.transport.http.path }),
       ];
+      const tunnelProfiles = config.tunnels.profiles.map((profile) => ({
+        id: profile.id,
+        provider: profile.provider,
+        lifecycle: profile.lifecycle,
+        enabled: profile.enabled,
+        input: gatewayTunnelProfileInput(profile, { port: localTunnelPort, path: config.transport.http.path }),
+      }));
       const tunnelManager = this.options.tunnelManager ?? new GatewayTunnelManager({
         providers: tunnelProviders,
+        profiles: tunnelProfiles,
         stateRoot: this.options.tunnelStateRoot ?? (config.state.ownerPath ? join(dirname(config.state.ownerPath), "tunnels") : undefined),
         observer: runtime.observer,
       });
@@ -159,9 +169,15 @@ export class GatewayDaemon {
           "workspace-remove": (data) => runtime.workspace.control("workspace-remove", data),
           ...(tunnelManager ? {
             "tunnel-status": (data: Record<string, unknown> | undefined) => tunnelManager.control("tunnel-status", data),
-            "tunnel-start": (data: Record<string, unknown> | undefined) => tunnelManager.control("tunnel-start", data),
+            "tunnel-start": (data: Record<string, unknown> | undefined) => {
+              assertLivePublicTunnelConfig(config, tunnelManager, data);
+              return tunnelManager.control("tunnel-start", data);
+            },
             "tunnel-stop": (data: Record<string, unknown> | undefined) => tunnelManager.control("tunnel-stop", data),
-            "tunnel-restart": (data: Record<string, unknown> | undefined) => tunnelManager.control("tunnel-restart", data),
+            "tunnel-restart": (data: Record<string, unknown> | undefined) => {
+              assertLivePublicTunnelConfig(config, tunnelManager, data);
+              return tunnelManager.control("tunnel-restart", data);
+            },
           } : {}),
           ...this.options.tunnelControlHandlers,
         },
@@ -226,4 +242,24 @@ export class GatewayDaemon {
 
 export async function startGatewayDaemon(options: GatewayDaemonOptions = {}): Promise<GatewayDaemon> {
   return new GatewayDaemon(options).start();
+}
+
+function assertLivePublicTunnelConfig(
+  config: GatewayConfig,
+  manager: GatewayTunnelManager,
+  data?: Record<string, unknown>,
+): void {
+  const profile = typeof data?.profile === "string" ? manager.profile(data.profile) : undefined;
+  const rawInput = profile?.input ?? (data?.input && typeof data.input === "object" && !Array.isArray(data.input)
+    ? data.input as Readonly<Record<string, unknown>>
+    : undefined);
+  const publicUrl = rawInput?.publicUrl;
+  if (publicUrl === undefined) return;
+  if (typeof publicUrl !== "string"
+    || (config.auth.mode !== "oauth" && config.auth.mode !== "dual")
+    || config.auth.oauth?.serverUrl !== publicUrl
+    || !config.server.disableLocalhostProtection
+    || !config.server.trustProxyHeaders) {
+    throw new Error("Public tunnel start requires the live Gateway to use the matching OAuth origin and trusted reverse-proxy settings");
+  }
 }

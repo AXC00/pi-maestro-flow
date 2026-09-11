@@ -2993,6 +2993,10 @@ When NOT to use:
       await openGatewayOverlay(ctx, page);
     },
   });
+  pi.registerCommand("gateway-config", {
+    description: "Open the dedicated Pi Maestro Gateway configuration TUI. Standalone: pi-maestro-gateway config [--config PATH]",
+    async handler(_args, ctx) { await openGatewayOverlay(ctx, "config"); },
+  });
   pi.registerCommand("maestro-knowledge", {
     description: "Open the Knowledge center — review session candidates, reconciliation matches, and corpus health",
     async handler(args, ctx) { await openKnowledgeOverlay(ctx, args); },

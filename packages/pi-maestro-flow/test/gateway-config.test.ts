@@ -7,6 +7,7 @@ import {
   GatewayConfigValidationError,
   applyGatewayConfigPatch,
   defaultGatewayConfig,
+  gatewayTunnelProfileInput,
   loadGatewayConfig,
   normalizeGatewayConfig,
   parseGatewayConfigDocument,
@@ -63,6 +64,36 @@ test("Gateway config normalizes legacy snake-case sections and rejects invalid k
   });
   assert.throws(() => normalizeGatewayConfig({ tunnels: { openai: { runtime_key: "literal-secret" } } }), /not a recognized field/);
   assert.throws(() => normalizeGatewayConfig({ tunnels: { openai: { runtime_key_env: "bad-name" } } }), /environment variable name/);
+  const tunnelProfiles = normalizeGatewayConfig({
+    auth: { mode: "oauth", oauth: { server_url: "https://mcp.example.com" } },
+    tunnels: { profiles: [
+      { id: "quick", provider: "cloudflare", mode: "quick", enabled: true },
+      { id: "production", provider: "cloudflare", mode: "named", enabled: true, public_url: "https://mcp.example.com", tunnel_id: "8c4a2d42-5ac8-4bf8-a0f1-4ebd8e59e101", credentials_file: "/secure/cloudflared.json", local_port: 9191 },
+    ] },
+  }).tunnels.profiles;
+  assert.deepEqual(tunnelProfiles, [
+    { id: "quick", provider: "cloudflare", mode: "quick", enabled: true, lifecycle: "ephemeral" },
+    { id: "production", provider: "cloudflare", mode: "named", enabled: true, lifecycle: "persistent", publicUrl: "https://mcp.example.com", tunnelId: "8c4a2d42-5ac8-4bf8-a0f1-4ebd8e59e101", credentialsFile: "/secure/cloudflared.json", localPort: 9191 },
+  ]);
+  const openAiProfile = normalizeGatewayConfig({
+    auth: { mode: "oauth", oauth: { server_url: "https://openai.example.com" } },
+    tunnels: { profiles: [{ id: "openai-prod", provider: "openai", mode: "secure", enabled: true, public_url: "https://openai.example.com" }] },
+  }).tunnels.profiles[0];
+  assert.deepEqual(openAiProfile, {
+    id: "openai-prod", provider: "openai", mode: "secure", lifecycle: "persistent", enabled: true,
+    publicUrl: "https://openai.example.com", tunnelIdEnv: "CONTROL_PLANE_TUNNEL_ID", runtimeKeyEnv: "CONTROL_PLANE_API_KEY", credentialTtlMs: 300_000,
+  });
+  assert.throws(() => normalizeGatewayConfig({ tunnels: { profiles: [{ id: "bad", provider: "cloudflare", mode: "named", public_url: "https://mcp.example.com", tunnel_id: "prod", token: "literal-secret" }] } }), /not a recognized field/);
+  assert.throws(() => normalizeGatewayConfig({ tunnels: { profiles: [{ id: "bad", provider: "cloudflare", mode: "named", public_url: "https://mcp.example.com", tunnel_id: "prod" }] } }), /exactly one/);
+  assert.throws(() => normalizeGatewayConfig({ tunnels: { profiles: [{ id: "bad-quick", provider: "cloudflare", mode: "quick", runtime_key_env: "RUNTIME_KEY" }] } }), /persistent-provider fields/);
+  assert.throws(() => normalizeGatewayConfig({ tunnels: { profiles: [{ id: "bad-named", provider: "cloudflare", mode: "named", enabled: false, public_url: "https://mcp.example.com", tunnel_id: "prod", token_file: "/secure/token", runtime_key_env: "RUNTIME_KEY" }] } }), /cannot define OpenAI fields/);
+  assert.throws(() => normalizeGatewayConfig({ tunnels: { profiles: [{ id: "bad-openai", provider: "openai", mode: "secure", enabled: false, public_url: "https://openai.example.com", token_file: "/secure/token" }] } }), /cannot define Cloudflare Named fields/);
+  assert.throws(() => normalizeGatewayConfig({ auth: { mode: "oauth", oauth: { server_url: "https://other.example.com" } }, tunnels: { profiles: [{ id: "bad", provider: "cloudflare", mode: "named", public_url: "https://mcp.example.com", tunnel_id: "prod", token_file: "/secure/token" }] } }), /must match/);
+  assert.throws(() => normalizeGatewayConfig({ auth: { mode: "oauth", oauth: { server_url: "https://openai.example.com" } }, tunnels: { profiles: [{ id: "openai-fast", provider: "openai", mode: "secure", public_url: "https://openai.example.com", credential_ttl_ms: 1_000 }] } }), /credentialTtlMs/);
+  assert.throws(() => normalizeGatewayConfig({ auth: { mode: "oauth", oauth: { server_url: "https://one.example.com" } }, tunnels: { profiles: [
+    { id: "one", provider: "cloudflare", mode: "named", public_url: "https://one.example.com", tunnel_id: "one", token_file: "/secure/one" },
+    { id: "two", provider: "openai", mode: "secure", public_url: "https://two.example.com" },
+  ] } }), /Only one persistent/);
   assert.equal(normalizeGatewayConfig({ state: { sessions_root: ".pi/gateway/v1/sessions" } }).state.sessionsRoot, ".pi/gateway/v1/sessions");
   const governed = normalizeGatewayConfig({
     auth: { mode: "bearer", token: "secret" },
@@ -138,6 +169,104 @@ test("Gateway config normalizes legacy snake-case sections and rejects invalid k
   assert.throws(() => normalizeGatewayConfig({ auth: { oauth_client_typo: "no" } }), /auth\.oauth_client_typo is not a recognized field/);
 });
 
+test("Gateway config validates and projects persistent SSH Reverse profiles", () => {
+  const identityFile = join(tmpdir(), "id_ed25519");
+  const config = normalizeGatewayConfig({
+    auth: { mode: "oauth", oauth: { server_url: "https://mcp.example.com" } },
+    tunnels: { profiles: [{
+      id: "ssh-prod",
+      provider: "ssh",
+      mode: "reverse",
+      lifecycle: "persistent",
+      enabled: true,
+      public_url: "https://mcp.example.com",
+      host: "gateway-edge.example.net",
+      user: "tunnel",
+      port: 2222,
+      remote_bind_host: "127.0.0.1",
+      remote_port: 19090,
+      local_host: "127.0.0.1",
+      identity_file: identityFile,
+      connect_timeout_seconds: 20,
+      server_alive_interval_seconds: 30,
+      server_alive_count_max: 4,
+    }] },
+  });
+  const profile = config.tunnels.profiles[0];
+  assert.deepEqual(profile, {
+    id: "ssh-prod",
+    provider: "ssh",
+    mode: "reverse",
+    lifecycle: "persistent",
+    enabled: true,
+    publicUrl: "https://mcp.example.com",
+    host: "gateway-edge.example.net",
+    user: "tunnel",
+    port: 2222,
+    remoteBindHost: "127.0.0.1",
+    remotePort: 19090,
+    localHost: "127.0.0.1",
+    identityFile,
+    connectTimeoutSeconds: 20,
+    serverAliveIntervalSeconds: 30,
+    serverAliveCountMax: 4,
+  });
+  assert.deepEqual(gatewayTunnelProfileInput(profile!, { port: 9090, path: "/mcp" }), {
+    mode: "reverse",
+    localPort: 9090,
+    mcpPath: "/mcp",
+    publicUrl: "https://mcp.example.com",
+    host: "gateway-edge.example.net",
+    user: "tunnel",
+    port: 2222,
+    remoteBindHost: "127.0.0.1",
+    remotePort: 19090,
+    localHost: "127.0.0.1",
+    identityFile,
+    connectTimeoutSeconds: 20,
+    serverAliveIntervalSeconds: 30,
+    serverAliveCountMax: 4,
+  });
+
+  const base = { tunnels: { profiles: [{ id: "bad", provider: "ssh", mode: "reverse", enabled: false, public_url: "https://mcp.example.com", host: "edge", remote_port: 19090 }] } };
+  assert.throws(() => normalizeGatewayConfig({ tunnels: { profiles: [{ ...base.tunnels.profiles[0], lifecycle: "ephemeral" }] } }), /must be persistent/u);
+  assert.throws(() => normalizeGatewayConfig({ tunnels: { profiles: [{ ...base.tunnels.profiles[0], host: "-oProxyCommand=bad" }] } }), /safe SSH host/u);
+  assert.throws(() => normalizeGatewayConfig({ tunnels: { profiles: [{ ...base.tunnels.profiles[0], remote_bind_host: "0.0.0.0" }] } }), /must be loopback/u);
+  assert.throws(() => normalizeGatewayConfig({ tunnels: { profiles: [{ ...base.tunnels.profiles[0], identity_file: "relative/id" }] } }), /absolute path/u);
+  assert.throws(() => normalizeGatewayConfig({ tunnels: { profiles: [{ ...base.tunnels.profiles[0], public_url: "https://mcp.example.com/mcp" }] } }), /exact credential-free HTTPS origin/u);
+  assert.throws(() => normalizeGatewayConfig({ tunnels: { profiles: [{ ...base.tunnels.profiles[0], tunnel_id: "wrong-provider" }] } }), /another provider/u);
+});
+
+test("Gateway config writes SSH Reverse profile fields in canonical snake case", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "gateway-config-ssh-reverse-"));
+  t.after(async () => { await import("node:fs/promises").then(({ rm }) => rm(root, { recursive: true, force: true })); });
+  const path = join(root, "config.yaml");
+  const identityFile = join(root, "id_ed25519");
+  const updated = await writeGatewayConfigPatch(path, { tunnels: { profiles: [{
+    id: "ssh-prod",
+    provider: "ssh",
+    mode: "reverse",
+    lifecycle: "persistent",
+    enabled: false,
+    publicUrl: "https://mcp.example.com",
+    host: "edge",
+    remoteBindHost: "127.0.0.1",
+    remotePort: 19090,
+    localHost: "127.0.0.1",
+    identityFile,
+    port: 22,
+    connectTimeoutSeconds: 10,
+    serverAliveIntervalSeconds: 15,
+    serverAliveCountMax: 3,
+  }] } });
+  assert.equal(updated.config.tunnels.profiles[0]?.provider, "ssh");
+  assert.match(updated.raw, /remote_bind_host: 127\.0\.0\.1/u);
+  assert.match(updated.raw, /remote_port: 19090/u);
+  assert.match(updated.raw, /identity_file:/u);
+  assert.match(updated.raw, /server_alive_interval_seconds: 15/u);
+  assert.equal((await loadGatewayConfig(path)).tunnels.profiles[0]?.mode, "reverse");
+});
+
 test("Gateway config patch distinguishes omitted preserve, array replace, object merge, and null clear", async (t) => {
   const root = await mkdtemp(join(tmpdir(), "gateway-config-"));
   t.after(async () => { await import("node:fs/promises").then(({ rm }) => rm(root, { recursive: true, force: true })); });
@@ -171,6 +300,14 @@ test("Gateway config patch distinguishes omitted preserve, array replace, object
   const native = await writeGatewayConfigPatch(nativePath, { server: { port: 9393 } as never });
   assert.equal(native.config.version, 2);
   assert.match(await readFile(nativePath, "utf8"), /^version: 2$/m);
+
+  const withProfile = await writeGatewayConfigPatch(nativePath, { tunnels: { profiles: [{
+    id: "production", provider: "cloudflare", mode: "named", lifecycle: "persistent", enabled: false,
+    publicUrl: "https://mcp.example.com", tunnelId: "production", tokenFile: "/secure/cloudflared.token",
+  }] } as never });
+  assert.equal(withProfile.config.tunnels.profiles[0]?.id, "production");
+  assert.match(withProfile.raw, /public_url: https:\/\/mcp\.example\.com/u);
+  assert.match(withProfile.raw, /token_file: \/secure\/cloudflared\.token/u);
 });
 
 test("default config is canonical and patch application keeps omitted values", () => {
@@ -178,6 +315,7 @@ test("default config is canonical and patch application keeps omitted values", (
   assert.equal(base.version, 2);
   assert.equal(base.tunnels.openai.enabled, false, "OpenAI Tunnel remains experimental/disabled by default");
   assert.equal(base.tunnels.openai.runtimeKeyEnv, "CONTROL_PLANE_API_KEY");
+  assert.deepEqual(base.tunnels.profiles, []);
   assert.equal(base.limits.maxBoardTasks, 1024);
   assert.ok(base.retention.boardTasksMs > 0);
   const paths = createGatewayStatePaths(process.cwd(), tmpdir());
@@ -191,4 +329,17 @@ test("default config is canonical and patch application keeps omitted values", (
   const cleared = applyGatewayConfigPatch(patched, { logging: null, server: { port: null } as never });
   assert.equal(cleared.logging.level, "info");
   assert.equal(cleared.server.port, 9090);
+});
+
+test("Gateway tunnel guide YAML examples parse and linked entry points resolve", async () => {
+  const guidePath = join(import.meta.dirname, "../../../docs/gateway-tunnel-configuration.md");
+  const guide = await readFile(guidePath, "utf8");
+  const examples = [...guide.matchAll(/```yaml\n([\s\S]*?)```/gu)].map((match) => match[1]!);
+  assert.equal(examples.length, 5);
+  for (const example of examples) assert.equal(parseGatewayConfigDocument(example).config.version, 2);
+
+  const gatewayDesign = await readFile(join(import.meta.dirname, "../../../docs/gateway-command-mcp-tool-design.md"), "utf8");
+  const fabricReadme = await readFile(join(import.meta.dirname, "../../../docs/fabric/README.md"), "utf8");
+  assert.match(gatewayDesign, /\[Gateway Tunnel 配置指南\]\(\.\/gateway-tunnel-configuration\.md\)/u);
+  assert.match(fabricReadme, /\[Current Gateway tunnel configuration\]\(\.\.\/gateway-tunnel-configuration\.md\)/u);
 });

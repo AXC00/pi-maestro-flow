@@ -7,9 +7,10 @@ import { PassThrough } from "node:stream";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
 import { main } from "../src/gateway/cli.ts";
-import { locateGatewayBinary, resetGatewayBinaryCache } from "../src/gateway/control-client.ts";
+import { locateGatewayBinary, resetGatewayBinaryCache, type GatewayControlClient } from "../src/gateway/control-client.ts";
 import { requestGatewayIpcControl } from "../src/gateway/ipc.ts";
 import { GatewayDaemon } from "../src/gateway/daemon.ts";
+import { loadGatewayConfig } from "../src/gateway/config.ts";
 
 const packageRoot = fileURLToPath(new URL("../", import.meta.url));
 const bin = join(packageRoot, "bin", "pi-maestro-gateway.mjs");
@@ -121,10 +122,14 @@ test("service help documents ensure and Windows Startup persistence", async () =
   assert.match(output, /next interactive sign-in/u);
   assert.match(output, /not a Windows Service/u);
   assert.match(output, /non-interactive SSH session/u);
+  assert.match(output, /config \[--config PATH\]/u);
+  assert.match(output, /standalone terminal UI/u);
   assert.match(output, /workspace list/u);
   assert.match(output, /workspace register/u);
   assert.match(output, /workspace renew/u);
   assert.match(output, /workspace remove/u);
+  assert.match(output, /tunnel profile list\|status\|start\|stop\|restart/u);
+  assert.match(output, /Managed OpenSSH Reverse/u);
   assert.match(output, /migrate-legacy --dry-run\|--apply/u);
 });
 
@@ -223,7 +228,7 @@ test("workspace CLI emits redacted machine JSON and enforces generation fences t
   assert.deepEqual(JSON.parse(removed.output), { removed: true });
 });
 
-test("tunnel CLI exposes the built-in Cloudflare provider through native supervisor state", async (t) => {
+test("tunnel CLI exposes all built-in providers through native supervisor state", async (t) => {
   const root = await mkdtemp(join(tmpdir(), "gateway-cli-tunnel-"));
   const configPath = join(root, "config.yaml");
   const ownerPath = join(root, "owner.json");
@@ -242,6 +247,11 @@ test("tunnel CLI exposes the built-in Cloudflare provider through native supervi
   const daemon = new GatewayDaemon({ configPath, cwd: root, http: false });
   await daemon.start();
   t.after(async () => { await daemon.stop(); await rm(root, { recursive: true, force: true }); });
+  assert.deepEqual(daemon.tunnelManager?.registry.list().map((provider) => provider.name), ["cloudflare", "openai", "ssh"]);
+  await assert.rejects(
+    () => daemon.controlDispatcher!.dispatch("tunnel-start", { provider: "ssh", input: { publicUrl: "https://mcp.example.com" } }),
+    /live Gateway.*matching OAuth origin/u,
+  );
 
   const stdout = new PassThrough();
   const stderr = new PassThrough();
@@ -268,6 +278,140 @@ test("tunnel CLI validates Cloudflare Quick Tunnel flags before IPC", async () =
   assert.equal(await main(["tunnel", "start", "cloudflare", "--local-port", "70000", "--json"], { stdout, stderr }), 1);
   assert.equal(output, "");
   assert.match(errors, /local-port must be in \[1, 65535\]/u);
+});
+
+test("tunnel profile list reads canonical persisted profiles without contacting the daemon", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "gateway-cli-profiles-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const configPath = join(root, "config.yaml");
+  await writeFile(configPath, [
+    "tunnels:",
+    "  profiles:",
+    "    - id: quick",
+    "      provider: cloudflare",
+    "      mode: quick",
+    "      lifecycle: ephemeral",
+    "      enabled: true",
+    "    - id: ssh-prod",
+    "      provider: ssh",
+    "      mode: reverse",
+    "      lifecycle: persistent",
+    "      enabled: false",
+    "      public_url: https://mcp.example.com",
+    "      host: gateway-edge.example.net",
+    "      remote_port: 19090",
+    "",
+  ].join("\n"));
+  const stdout = new PassThrough();
+  const stderr = new PassThrough();
+  let output = "";
+  let errors = "";
+  stdout.on("data", (chunk) => { output += chunk.toString(); });
+  stderr.on("data", (chunk) => { errors += chunk.toString(); });
+  assert.equal(await main(["tunnel", "profile", "list", "--config", configPath, "--json"], { stdout, stderr }), 0, errors);
+  assert.deepEqual(JSON.parse(output), [
+    { id: "quick", enabled: true, provider: "cloudflare", mode: "quick", lifecycle: "ephemeral" },
+    {
+      id: "ssh-prod",
+      enabled: false,
+      provider: "ssh",
+      mode: "reverse",
+      lifecycle: "persistent",
+      publicUrl: "https://mcp.example.com",
+      host: "gateway-edge.example.net",
+      port: 22,
+      remoteBindHost: "127.0.0.1",
+      remotePort: 19090,
+      localHost: "127.0.0.1",
+      connectTimeoutSeconds: 10,
+      serverAliveIntervalSeconds: 15,
+      serverAliveCountMax: 3,
+    },
+  ]);
+});
+
+test("SSH tunnel profile enable and disable persist intent and control the configured instance", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "gateway-cli-profile-toggle-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const configPath = join(root, "config.yaml");
+  await writeFile(configPath, [
+    "transport:",
+    "  http:",
+    "    enabled: false",
+    "logging:",
+    "  level: silent",
+    "tunnels:",
+    "  profiles:",
+    "    - id: production",
+    "      provider: ssh",
+    "      mode: reverse",
+    "      lifecycle: persistent",
+    "      enabled: false",
+    "      public_url: https://mcp.example.com",
+    "      host: gateway-edge.example.net",
+    "      user: tunnel",
+    "      port: 22",
+    "      remote_bind_host: 127.0.0.1",
+    "      remote_port: 19090",
+    "      local_host: 127.0.0.1",
+    "",
+  ].join("\n"));
+  let starts = 0;
+  let stops = 0;
+  let restarts = 0;
+  const order: string[] = [];
+  const readyState = { provider: "ssh", instance: "production", desiredState: "running", observed: { phase: "ready" } };
+  const controlClient = {
+    async status() { order.push("status"); return { online: true }; },
+    async restart() { restarts += 1; order.push("restart"); return { online: true }; },
+    async tunnelStart(provider: string, options: { instance?: string }) {
+      starts += 1;
+      order.push("start");
+      assert.equal(provider, "ssh");
+      assert.equal(options.instance, "production");
+      return readyState;
+    },
+    async tunnelStop(provider: string, options: { instance?: string }) {
+      stops += 1;
+      order.push("stop");
+      assert.equal(provider, "ssh");
+      assert.equal(options.instance, "production");
+      return { ...readyState, desiredState: "stopped", observed: { phase: "stopped" } };
+    },
+  } as unknown as GatewayControlClient;
+
+  const invoke = async (action: "enable" | "disable") => {
+    const stdout = new PassThrough();
+    const stderr = new PassThrough();
+    let output = "";
+    let errors = "";
+    stdout.on("data", (chunk) => { output += chunk.toString(); });
+    stderr.on("data", (chunk) => { errors += chunk.toString(); });
+    const code = await main(["tunnel", "profile", action, "production", "--config", configPath, "--json"], {
+      stdout,
+      stderr,
+      createControlClient: () => controlClient,
+    });
+    return { code, output, errors };
+  };
+
+  const enabled = await invoke("enable");
+  assert.equal(enabled.code, 0, enabled.errors);
+  assert.equal(starts, 1);
+  assert.equal(restarts, 1, "online daemon is restarted before public ingress starts");
+  assert.deepEqual(order, ["status", "restart", "start"]);
+  assert.equal((JSON.parse(enabled.output) as { state: { observed: { phase: string } } }).state.observed.phase, "ready");
+  let config = await loadGatewayConfig(configPath);
+  assert.equal(config.tunnels.profiles[0]?.enabled, true);
+  assert.equal(config.auth.mode, "oauth");
+  assert.equal(config.auth.oauth?.serverUrl, "https://mcp.example.com");
+
+  const disabled = await invoke("disable");
+  assert.equal(disabled.code, 0, disabled.errors);
+  assert.equal(stops, 1);
+  assert.deepEqual(order, ["status", "restart", "start", "status", "stop"]);
+  config = await loadGatewayConfig(configPath);
+  assert.equal(config.tunnels.profiles[0]?.enabled, false);
 });
 
 test("package manifest exposes the CLI and stable v1 API without removing source compatibility", async () => {

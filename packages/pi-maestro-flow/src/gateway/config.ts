@@ -1,7 +1,8 @@
 /** Native Pi agent Gateway configuration reader and writer. */
 import { readFile } from "node:fs/promises";
 import { existsSync, readFileSync } from "node:fs";
-import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
+import { isAbsolute } from "node:path";
+import { isMap, parse as parseYaml, parseDocument, stringify as stringifyYaml } from "yaml";
 import {
   GATEWAY_CONFIG_VERSION,
   GATEWAY_DEFAULT_LIMITS,
@@ -69,12 +70,20 @@ export interface GatewayMaestroCliSecurityConfig {
   allowLoad: boolean;
   allowStage: boolean;
 }
+export type GatewayBrowserChannel = "managed" | "profile" | "cdp" | "extension";
+export interface GatewayBrowserSecurityConfig {
+  enabled: boolean;
+  allowedChannels: GatewayBrowserChannel[];
+  allowedOrigins: string[];
+  maxTabsPerPrincipal: number;
+}
 export interface GatewaySecurityConfig {
   commands: GatewayCommandSecurityConfig;
   files: GatewayFileSecurityConfig;
   trustedFullAccess: GatewayTrustedFullAccessConfig;
   skills: GatewaySkillSecurityConfig;
   maestroCli: GatewayMaestroCliSecurityConfig;
+  browser: GatewayBrowserSecurityConfig;
 }
 export interface GatewayWorkspaceConfig {
   path: string;
@@ -154,8 +163,118 @@ export interface GatewayOpenAiTunnelConfig {
   minimumVersion: string;
   credentialTtlMs: number;
 }
+interface GatewayTunnelProfileBase {
+  id: string;
+  enabled: boolean;
+  binaryPath?: string;
+  localPort?: number;
+  publicUrl?: string;
+}
+export interface GatewayCloudflareQuickTunnelProfileConfig extends GatewayTunnelProfileBase {
+  provider: "cloudflare";
+  mode: "quick";
+  lifecycle: "ephemeral";
+}
+export interface GatewayCloudflareNamedTunnelProfileConfig extends GatewayTunnelProfileBase {
+  provider: "cloudflare";
+  mode: "named";
+  lifecycle: "persistent";
+  publicUrl: string;
+  tunnelId: string;
+  credentialsFile?: string;
+  tokenFile?: string;
+}
+export interface GatewayOpenAiSecureTunnelProfileConfig extends GatewayTunnelProfileBase {
+  provider: "openai";
+  mode: "secure";
+  lifecycle: "persistent";
+  publicUrl: string;
+  tunnelIdEnv: string;
+  runtimeKeyEnv: string;
+  credentialTtlMs: number;
+}
+export interface GatewaySshReverseTunnelProfileConfig extends GatewayTunnelProfileBase {
+  provider: "ssh";
+  mode: "reverse";
+  lifecycle: "persistent";
+  publicUrl: string;
+  host: string;
+  user?: string;
+  port: number;
+  remoteBindHost: "127.0.0.1" | "::1";
+  remotePort: number;
+  localHost: "127.0.0.1" | "::1";
+  identityFile?: string;
+  configFile?: string;
+  knownHostsFile?: string;
+  connectTimeoutSeconds: number;
+  serverAliveIntervalSeconds: number;
+  serverAliveCountMax: number;
+}
+export type GatewayTunnelProfileConfig =
+  | GatewayCloudflareQuickTunnelProfileConfig
+  | GatewayCloudflareNamedTunnelProfileConfig
+  | GatewayOpenAiSecureTunnelProfileConfig
+  | GatewaySshReverseTunnelProfileConfig;
 export interface GatewayTunnelsConfig {
+  /** Legacy OpenAI defaults retained for existing configuration and UI callers. */
   openai: GatewayOpenAiTunnelConfig;
+  profiles: GatewayTunnelProfileConfig[];
+}
+
+export function gatewayTunnelProfileInput(
+  profile: GatewayTunnelProfileConfig,
+  http: Pick<GatewayTransportConfig["http"], "port" | "path">,
+): Readonly<Record<string, unknown>> {
+  if (profile.provider === "cloudflare" && profile.mode === "quick") {
+    return {
+      mode: "quick",
+      localPort: profile.localPort ?? http.port,
+      ...(profile.binaryPath ? { binaryPath: profile.binaryPath } : {}),
+    };
+  }
+  if (profile.provider === "cloudflare") {
+    return {
+      mode: "named",
+      localPort: profile.localPort ?? http.port,
+      publicUrl: profile.publicUrl,
+      tunnelId: profile.tunnelId,
+      ...(profile.binaryPath ? { binaryPath: profile.binaryPath } : {}),
+      ...(profile.credentialsFile ? { credentialsFile: profile.credentialsFile } : { tokenFile: profile.tokenFile }),
+    };
+  }
+  if (profile.provider === "ssh") {
+    return {
+      mode: "reverse",
+      localPort: profile.localPort ?? http.port,
+      mcpPath: http.path,
+      publicUrl: profile.publicUrl,
+      host: profile.host,
+      ...(profile.user ? { user: profile.user } : {}),
+      port: profile.port,
+      remoteBindHost: profile.remoteBindHost,
+      remotePort: profile.remotePort,
+      localHost: profile.localHost,
+      ...(profile.binaryPath ? { binaryPath: profile.binaryPath } : {}),
+      ...(profile.identityFile ? { identityFile: profile.identityFile } : {}),
+      ...(profile.configFile ? { configFile: profile.configFile } : {}),
+      ...(profile.knownHostsFile ? { knownHostsFile: profile.knownHostsFile } : {}),
+      connectTimeoutSeconds: profile.connectTimeoutSeconds,
+      serverAliveIntervalSeconds: profile.serverAliveIntervalSeconds,
+      serverAliveCountMax: profile.serverAliveCountMax,
+    };
+  }
+  return {
+    mode: "secure",
+    experimental: true,
+    localPort: profile.localPort ?? http.port,
+    mcpPath: http.path,
+    publicUrl: profile.publicUrl,
+    tunnelIdEnv: profile.tunnelIdEnv,
+    runtimeKeyEnv: profile.runtimeKeyEnv,
+    credentialTtlMs: profile.credentialTtlMs,
+    ...(profile.binaryPath ? { binaryPath: profile.binaryPath } : {}),
+  };
 }
 
 export interface GatewayConfig {
@@ -172,8 +291,15 @@ export interface GatewayConfig {
   tunnels: GatewayTunnelsConfig;
 }
 
+export type GatewayConfigPatchValue<T> =
+  T extends readonly unknown[]
+    ? T
+    : T extends object
+      ? { [K in keyof T]?: GatewayConfigPatchValue<T[K]> | null }
+      : T;
+
 export type GatewayConfigPatch = {
-  [K in keyof GatewayConfig]?: GatewayConfig[K] | null;
+  [K in keyof GatewayConfig]?: GatewayConfigPatchValue<GatewayConfig[K]> | null;
 } & Record<string, unknown>;
 
 export interface GatewayConfigDocument {
@@ -209,6 +335,7 @@ const DEFAULT_SECURITY: GatewaySecurityConfig = {
   trustedFullAccess: { enabled: false, workspaceRoots: [] },
   skills: { enabled: false, workspaceRoots: [], externalSkillRoots: [], externalReferenceRoots: [] },
   maestroCli: { enabled: false, allowSearch: false, allowLoad: false, allowStage: false },
+  browser: { enabled: true, allowedChannels: ["managed", "profile", "cdp", "extension"], allowedOrigins: [], maxTabsPerPrincipal: 8 },
 };
 const DEFAULT_TRANSPORT: GatewayTransportConfig = {
   stdio: { enabled: true },
@@ -223,6 +350,7 @@ const DEFAULT_TUNNELS: GatewayTunnelsConfig = {
     minimumVersion: "0.0.14",
     credentialTtlMs: 5 * 60_000,
   },
+  profiles: [],
 };
 const DEFAULT_RETENTION: GatewayRetentionConfig = {
   jobsMs: 7 * 24 * 60 * 60 * 1000,
@@ -358,7 +486,7 @@ export function normalizeGatewayConfig(value: unknown): GatewayConfig {
   };
 
   const securityRaw = optionalObject(root.security, "security");
-  knownKeys(securityRaw, ["commands", "files", "trustedFullAccess", "trusted_full_access", "skills", "maestroCli", "maestro_cli"], "security");
+  knownKeys(securityRaw, ["commands", "files", "trustedFullAccess", "trusted_full_access", "skills", "maestroCli", "maestro_cli", "browser"], "security");
   const commandsRaw = optionalObject(securityRaw.commands, "security.commands");
   knownKeys(commandsRaw, ["default", "allow", "confirm", "deny", "auto_allow_readonly", "autoAllowReadonly"], "security.commands");
   const commandDefault = commandsRaw.default === undefined ? DEFAULT_SECURITY.commands.default : commandsRaw.default;
@@ -405,6 +533,30 @@ export function normalizeGatewayConfig(value: unknown): GatewayConfig {
     allowSearch: bool(maestroRaw.allowSearch ?? maestroRaw.allow_search, "security.maestroCli.allowSearch", DEFAULT_SECURITY.maestroCli.allowSearch),
     allowLoad: bool(maestroRaw.allowLoad ?? maestroRaw.allow_load, "security.maestroCli.allowLoad", DEFAULT_SECURITY.maestroCli.allowLoad),
     allowStage: bool(maestroRaw.allowStage ?? maestroRaw.allow_stage, "security.maestroCli.allowStage", DEFAULT_SECURITY.maestroCli.allowStage),
+  };
+  const browserRaw = optionalObject(securityRaw.browser, "security.browser");
+  knownKeys(browserRaw, ["enabled", "allowedChannels", "allowed_channels", "allowedOrigins", "allowed_origins", "maxTabsPerPrincipal", "max_tabs_per_principal"], "security.browser");
+  const allowedChannels = stringList(browserRaw.allowedChannels ?? browserRaw.allowed_channels, "security.browser.allowedChannels", 4);
+  const normalizedChannels = allowedChannels.length === 0 ? [...DEFAULT_SECURITY.browser.allowedChannels] : allowedChannels;
+  for (const channel of normalizedChannels) {
+    if (channel !== "managed" && channel !== "profile" && channel !== "cdp" && channel !== "extension") throw new GatewayConfigValidationError("security.browser.allowedChannels contains an unsupported channel");
+  }
+  if (new Set(normalizedChannels).size !== normalizedChannels.length) throw new GatewayConfigValidationError("security.browser.allowedChannels must not contain duplicates");
+  const allowedOrigins = stringList(browserRaw.allowedOrigins ?? browserRaw.allowed_origins, "security.browser.allowedOrigins", 128).map((origin, index) => {
+    let parsed: URL;
+    try { parsed = new URL(origin); }
+    catch { throw new GatewayConfigValidationError(`security.browser.allowedOrigins[${index}] must be an absolute HTTP(S) origin`); }
+    if ((parsed.protocol !== "http:" && parsed.protocol !== "https:") || parsed.origin !== origin || parsed.pathname !== "/" || parsed.search || parsed.hash) {
+      throw new GatewayConfigValidationError(`security.browser.allowedOrigins[${index}] must be an exact HTTP(S) origin`);
+    }
+    return parsed.origin;
+  });
+  if (new Set(allowedOrigins).size !== allowedOrigins.length) throw new GatewayConfigValidationError("security.browser.allowedOrigins must not contain duplicates");
+  const browser: GatewayBrowserSecurityConfig = {
+    enabled: bool(browserRaw.enabled, "security.browser.enabled", DEFAULT_SECURITY.browser.enabled),
+    allowedChannels: normalizedChannels as GatewayBrowserChannel[],
+    allowedOrigins,
+    maxTabsPerPrincipal: integer(browserRaw.maxTabsPerPrincipal ?? browserRaw.max_tabs_per_principal, "security.browser.maxTabsPerPrincipal", 1, 32, DEFAULT_SECURITY.browser.maxTabsPerPrincipal),
   };
   if ((skills.enabled || maestroCli.enabled) && authMode === "open") throw new GatewayConfigValidationError("Gateway skill and Maestro CLI surfaces require authenticated HTTP (auth.mode cannot be open)");
 
@@ -540,7 +692,7 @@ export function normalizeGatewayConfig(value: unknown): GatewayConfig {
   };
 
   const tunnelsRaw = optionalObject(root.tunnels, "tunnels");
-  knownKeys(tunnelsRaw, ["openai"], "tunnels");
+  knownKeys(tunnelsRaw, ["openai", "profiles"], "tunnels");
   const openaiRaw = optionalObject(tunnelsRaw.openai, "tunnels.openai");
   knownKeys(openaiRaw, ["enabled", "binaryPath", "binary_path", "tunnelIdEnv", "tunnel_id_env", "runtimeKeyEnv", "runtime_key_env", "minimumVersion", "minimum_version", "credentialTtlMs", "credential_ttl_ms"], "tunnels.openai");
   const environmentName = (value: unknown, path: string, fallback: string): string => {
@@ -549,23 +701,163 @@ export function normalizeGatewayConfig(value: unknown): GatewayConfig {
     return result;
   };
   const minimumVersion = openaiRaw.minimumVersion ?? openaiRaw.minimum_version;
-  const tunnels: GatewayTunnelsConfig = {
-    openai: {
-      enabled: bool(openaiRaw.enabled, "tunnels.openai.enabled", DEFAULT_TUNNELS.openai.enabled),
-      ...(optionalString(openaiRaw.binaryPath ?? openaiRaw.binary_path, "tunnels.openai.binaryPath", 4096) === undefined ? {} : { binaryPath: optionalString(openaiRaw.binaryPath ?? openaiRaw.binary_path, "tunnels.openai.binaryPath", 4096) }),
-      tunnelIdEnv: environmentName(openaiRaw.tunnelIdEnv ?? openaiRaw.tunnel_id_env, "tunnels.openai.tunnelIdEnv", DEFAULT_TUNNELS.openai.tunnelIdEnv),
-      runtimeKeyEnv: environmentName(openaiRaw.runtimeKeyEnv ?? openaiRaw.runtime_key_env, "tunnels.openai.runtimeKeyEnv", DEFAULT_TUNNELS.openai.runtimeKeyEnv),
-      minimumVersion: minimumVersion === undefined ? DEFAULT_TUNNELS.openai.minimumVersion : stringValue(minimumVersion, "tunnels.openai.minimumVersion", 64),
-      credentialTtlMs: integer(openaiRaw.credentialTtlMs ?? openaiRaw.credential_ttl_ms, "tunnels.openai.credentialTtlMs", 1_000, 60 * 60_000, DEFAULT_TUNNELS.openai.credentialTtlMs),
-    },
+  const openai: GatewayOpenAiTunnelConfig = {
+    enabled: bool(openaiRaw.enabled, "tunnels.openai.enabled", DEFAULT_TUNNELS.openai.enabled),
+    ...(optionalString(openaiRaw.binaryPath ?? openaiRaw.binary_path, "tunnels.openai.binaryPath", 4096) === undefined ? {} : { binaryPath: optionalString(openaiRaw.binaryPath ?? openaiRaw.binary_path, "tunnels.openai.binaryPath", 4096) }),
+    tunnelIdEnv: environmentName(openaiRaw.tunnelIdEnv ?? openaiRaw.tunnel_id_env, "tunnels.openai.tunnelIdEnv", DEFAULT_TUNNELS.openai.tunnelIdEnv),
+    runtimeKeyEnv: environmentName(openaiRaw.runtimeKeyEnv ?? openaiRaw.runtime_key_env, "tunnels.openai.runtimeKeyEnv", DEFAULT_TUNNELS.openai.runtimeKeyEnv),
+    minimumVersion: minimumVersion === undefined ? DEFAULT_TUNNELS.openai.minimumVersion : stringValue(minimumVersion, "tunnels.openai.minimumVersion", 64),
+    credentialTtlMs: integer(openaiRaw.credentialTtlMs ?? openaiRaw.credential_ttl_ms, "tunnels.openai.credentialTtlMs", 1_000, 60 * 60_000, DEFAULT_TUNNELS.openai.credentialTtlMs),
   };
-  if (!/^\d+\.\d+\.\d+$/u.test(tunnels.openai.minimumVersion)) throw new GatewayConfigValidationError("tunnels.openai.minimumVersion must be a semantic version triplet");
+  if (!/^\d+\.\d+\.\d+$/u.test(openai.minimumVersion)) throw new GatewayConfigValidationError("tunnels.openai.minimumVersion must be a semantic version triplet");
+
+  const profilesRaw = tunnelsRaw.profiles;
+  if (profilesRaw !== undefined && !Array.isArray(profilesRaw)) throw new GatewayConfigValidationError("tunnels.profiles must be a list");
+  if ((profilesRaw?.length ?? 0) > 32) throw new GatewayConfigValidationError("tunnels.profiles must contain at most 32 entries");
+  const profileIds = new Set<string>();
+  const profiles: GatewayTunnelProfileConfig[] = (profilesRaw ?? []).map((entry, index) => {
+    const path = `tunnels.profiles[${index}]`;
+    const item = object(entry, path);
+    knownKeys(item, [
+      "id", "enabled", "provider", "mode", "lifecycle", "binaryPath", "binary_path", "localPort", "local_port",
+      "publicUrl", "public_url", "tunnelId", "tunnel_id", "credentialsFile", "credentials_file", "tokenFile", "token_file",
+      "tunnelIdEnv", "tunnel_id_env", "runtimeKeyEnv", "runtime_key_env", "credentialTtlMs", "credential_ttl_ms",
+      "host", "user", "port", "remoteBindHost", "remote_bind_host", "remotePort", "remote_port",
+      "localHost", "local_host", "identityFile", "identity_file", "configFile", "config_file",
+      "knownHostsFile", "known_hosts_file", "connectTimeoutSeconds", "connect_timeout_seconds",
+      "serverAliveIntervalSeconds", "server_alive_interval_seconds", "serverAliveCountMax", "server_alive_count_max",
+    ], path);
+    const id = stringValue(item.id, `${path}.id`, 128);
+    if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u.test(id)) throw new GatewayConfigValidationError(`${path}.id must be a safe identifier`);
+    if (profileIds.has(id)) throw new GatewayConfigValidationError(`Duplicate tunnel profile id: ${id}`);
+    profileIds.add(id);
+    const provider = item.provider;
+    const mode = item.mode;
+    const enabled = bool(item.enabled, `${path}.enabled`, true);
+    const lifecycle = item.lifecycle ?? (mode === "quick" ? "ephemeral" : "persistent");
+    const binaryPath = optionalString(item.binaryPath ?? item.binary_path, `${path}.binaryPath`, 4096);
+    const localPort = item.localPort ?? item.local_port;
+    const common = {
+      id,
+      enabled,
+      ...(binaryPath === undefined ? {} : { binaryPath }),
+      ...(localPort === undefined ? {} : { localPort: integer(localPort, `${path}.localPort`, 1, 65_535) }),
+    };
+    const rawPublicUrl = optionalString(item.publicUrl ?? item.public_url, `${path}.publicUrl`, 2048);
+    const publicUrl = rawPublicUrl === undefined ? undefined : (() => {
+      let parsed: URL;
+      try { parsed = new URL(rawPublicUrl); } catch { throw new GatewayConfigValidationError(`${path}.publicUrl must be an HTTPS origin`); }
+      if (parsed.protocol !== "https:" || parsed.origin !== rawPublicUrl || parsed.pathname !== "/" || parsed.username || parsed.password || parsed.search || parsed.hash) {
+        throw new GatewayConfigValidationError(`${path}.publicUrl must be an exact credential-free HTTPS origin`);
+      }
+      return parsed.origin;
+    })();
+    const hasNamedFields = item.tunnelId !== undefined || item.tunnel_id !== undefined
+      || item.credentialsFile !== undefined || item.credentials_file !== undefined || item.tokenFile !== undefined || item.token_file !== undefined;
+    const hasOpenAiFields = item.tunnelIdEnv !== undefined || item.tunnel_id_env !== undefined
+      || item.runtimeKeyEnv !== undefined || item.runtime_key_env !== undefined || item.credentialTtlMs !== undefined || item.credential_ttl_ms !== undefined;
+    const hasSshFields = item.host !== undefined || item.user !== undefined || item.port !== undefined
+      || item.remoteBindHost !== undefined || item.remote_bind_host !== undefined || item.remotePort !== undefined || item.remote_port !== undefined
+      || item.localHost !== undefined || item.local_host !== undefined || item.identityFile !== undefined || item.identity_file !== undefined
+      || item.configFile !== undefined || item.config_file !== undefined || item.knownHostsFile !== undefined || item.known_hosts_file !== undefined
+      || item.connectTimeoutSeconds !== undefined || item.connect_timeout_seconds !== undefined
+      || item.serverAliveIntervalSeconds !== undefined || item.server_alive_interval_seconds !== undefined
+      || item.serverAliveCountMax !== undefined || item.server_alive_count_max !== undefined;
+    if (provider === "cloudflare" && mode === "quick") {
+      if (lifecycle !== "ephemeral") throw new GatewayConfigValidationError(`${path}.lifecycle must be ephemeral for Cloudflare Quick Tunnel`);
+      if (publicUrl !== undefined || hasNamedFields || hasOpenAiFields || hasSshFields) {
+        throw new GatewayConfigValidationError(`${path} Quick Tunnel cannot define persistent-provider fields`);
+      }
+      return { ...common, provider, mode, lifecycle };
+    }
+    if (provider === "cloudflare" && mode === "named") {
+      if (lifecycle !== "persistent") throw new GatewayConfigValidationError(`${path}.lifecycle must be persistent for Cloudflare Named Tunnel`);
+      if (hasOpenAiFields) throw new GatewayConfigValidationError(`${path} Cloudflare Named Tunnel cannot define OpenAI fields`);
+      if (hasSshFields) throw new GatewayConfigValidationError(`${path} Cloudflare Named Tunnel cannot define SSH fields`);
+      if (!publicUrl) throw new GatewayConfigValidationError(`${path}.publicUrl is required`);
+      const tunnelId = stringValue(item.tunnelId ?? item.tunnel_id, `${path}.tunnelId`, 128);
+      if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u.test(tunnelId)) throw new GatewayConfigValidationError(`${path}.tunnelId must be a safe name or UUID`);
+      const credentialsFile = optionalString(item.credentialsFile ?? item.credentials_file, `${path}.credentialsFile`, 4096);
+      const tokenFile = optionalString(item.tokenFile ?? item.token_file, `${path}.tokenFile`, 4096);
+      if (Boolean(credentialsFile) === Boolean(tokenFile)) throw new GatewayConfigValidationError(`${path} requires exactly one of credentialsFile or tokenFile`);
+      return { ...common, provider, mode, lifecycle, publicUrl, tunnelId, ...(credentialsFile ? { credentialsFile } : { tokenFile: tokenFile! }) };
+    }
+    if (provider === "openai" && mode === "secure") {
+      if (lifecycle !== "persistent") throw new GatewayConfigValidationError(`${path}.lifecycle must be persistent for OpenAI Secure Tunnel`);
+      if (hasNamedFields) throw new GatewayConfigValidationError(`${path} OpenAI Secure Tunnel cannot define Cloudflare Named fields`);
+      if (hasSshFields) throw new GatewayConfigValidationError(`${path} OpenAI Secure Tunnel cannot define SSH fields`);
+      if (!publicUrl) throw new GatewayConfigValidationError(`${path}.publicUrl is required`);
+      return {
+        ...common,
+        provider,
+        mode,
+        lifecycle,
+        publicUrl,
+        tunnelIdEnv: environmentName(item.tunnelIdEnv ?? item.tunnel_id_env, `${path}.tunnelIdEnv`, openai.tunnelIdEnv),
+        runtimeKeyEnv: environmentName(item.runtimeKeyEnv ?? item.runtime_key_env, `${path}.runtimeKeyEnv`, openai.runtimeKeyEnv),
+        credentialTtlMs: integer(item.credentialTtlMs ?? item.credential_ttl_ms, `${path}.credentialTtlMs`, 60_000, 60 * 60_000, openai.credentialTtlMs),
+      };
+    }
+    if (provider === "ssh" && mode === "reverse") {
+      if (lifecycle !== "persistent") throw new GatewayConfigValidationError(`${path}.lifecycle must be persistent for SSH Reverse Tunnel`);
+      if (hasNamedFields || hasOpenAiFields) throw new GatewayConfigValidationError(`${path} SSH Reverse Tunnel cannot define fields for another provider`);
+      if (!publicUrl) throw new GatewayConfigValidationError(`${path}.publicUrl is required`);
+      const host = stringValue(item.host, `${path}.host`, 255);
+      if (host.startsWith("-") || !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,254}$/u.test(host)) {
+        throw new GatewayConfigValidationError(`${path}.host must be a safe SSH host or config alias`);
+      }
+      const user = optionalString(item.user, `${path}.user`, 64);
+      if (user !== undefined && (user.startsWith("-") || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/u.test(user))) {
+        throw new GatewayConfigValidationError(`${path}.user must be a safe SSH user name`);
+      }
+      const port = integer(item.port, `${path}.port`, 1, 65_535, 22);
+      const remoteBindHost = optionalString(item.remoteBindHost ?? item.remote_bind_host, `${path}.remoteBindHost`, 64) ?? "127.0.0.1";
+      if (remoteBindHost !== "127.0.0.1" && remoteBindHost !== "::1") throw new GatewayConfigValidationError(`${path}.remoteBindHost must be loopback`);
+      const remotePort = integer(item.remotePort ?? item.remote_port, `${path}.remotePort`, 1, 65_535);
+      const localHost = optionalString(item.localHost ?? item.local_host, `${path}.localHost`, 64) ?? "127.0.0.1";
+      if (localHost !== "127.0.0.1" && localHost !== "::1") throw new GatewayConfigValidationError(`${path}.localHost must be loopback`);
+      const identityFile = optionalString(item.identityFile ?? item.identity_file, `${path}.identityFile`, 4096);
+      const configFile = optionalString(item.configFile ?? item.config_file, `${path}.configFile`, 4096);
+      const knownHostsFile = optionalString(item.knownHostsFile ?? item.known_hosts_file, `${path}.knownHostsFile`, 4096);
+      for (const [filePath, value] of [[`${path}.identityFile`, identityFile], [`${path}.configFile`, configFile], [`${path}.knownHostsFile`, knownHostsFile]] as const) {
+        if (value !== undefined && !isAbsolute(value)) throw new GatewayConfigValidationError(`${filePath} must be an absolute path`);
+      }
+      return {
+        ...common,
+        provider,
+        mode,
+        lifecycle,
+        publicUrl,
+        host,
+        ...(user === undefined ? {} : { user }),
+        port,
+        remoteBindHost,
+        remotePort,
+        localHost,
+        ...(identityFile === undefined ? {} : { identityFile }),
+        ...(configFile === undefined ? {} : { configFile }),
+        ...(knownHostsFile === undefined ? {} : { knownHostsFile }),
+        connectTimeoutSeconds: integer(item.connectTimeoutSeconds ?? item.connect_timeout_seconds, `${path}.connectTimeoutSeconds`, 1, 120, 10),
+        serverAliveIntervalSeconds: integer(item.serverAliveIntervalSeconds ?? item.server_alive_interval_seconds, `${path}.serverAliveIntervalSeconds`, 5, 300, 15),
+        serverAliveCountMax: integer(item.serverAliveCountMax ?? item.server_alive_count_max, `${path}.serverAliveCountMax`, 1, 10, 3),
+      };
+    }
+    throw new GatewayConfigValidationError(`${path} has an unsupported provider/mode combination`);
+  });
+  const activePersistent = profiles.filter((profile) => profile.enabled && profile.lifecycle === "persistent");
+  if (activePersistent.length > 1) throw new GatewayConfigValidationError("Only one persistent tunnel profile may be enabled");
+  if (activePersistent.length === 1) {
+    const profile = activePersistent[0]!;
+    if (auth.mode !== "oauth" && auth.mode !== "dual") throw new GatewayConfigValidationError("An enabled persistent tunnel profile requires auth.mode oauth or dual");
+    if (auth.oauth?.serverUrl !== profile.publicUrl) throw new GatewayConfigValidationError("auth.oauth.serverUrl must match the enabled persistent tunnel profile publicUrl");
+  }
+  const tunnels: GatewayTunnelsConfig = { openai, profiles };
 
   return {
     version: GATEWAY_CONFIG_VERSION,
     server,
     auth,
-    security: { commands, files, trustedFullAccess, skills, maestroCli },
+    security: { commands, files, trustedFullAccess, skills, maestroCli, browser },
     workspaces,
     transport,
     limits,
@@ -597,7 +889,11 @@ function parseRawDocument(text: string): Record<string, unknown> {
     const parsed = parseYaml(text);
     return object(parsed ?? {}, "config");
   } catch (error) {
-    throw new GatewayConfigValidationError(`Invalid config YAML: ${error instanceof Error ? error.message : String(error)}`);
+    const position = (error as { linePos?: readonly { line?: unknown; col?: unknown }[] } | undefined)?.linePos?.[0];
+    const location = typeof position?.line === "number" && typeof position.col === "number"
+      ? ` at line ${position.line}, column ${position.col}`
+      : "";
+    throw new GatewayConfigValidationError(`Invalid config YAML${location}`);
   }
 }
 
@@ -695,17 +991,37 @@ function canonicalYamlSection(key: string, value: unknown): unknown {
   if (key === "tunnels") {
     const v = value as Record<string, unknown>;
     const rawOpenAi = v.openai;
-    if (!rawOpenAi || typeof rawOpenAi !== "object" || Array.isArray(rawOpenAi)) return value;
-    const o = rawOpenAi as Record<string, unknown>;
-    const { binaryPath, tunnelIdEnv, runtimeKeyEnv, minimumVersion, credentialTtlMs, ...rest } = o;
-    return { ...v, openai: {
-      ...rest,
-      ...(binaryPath === undefined ? {} : { binary_path: binaryPath }),
-      ...(tunnelIdEnv === undefined ? {} : { tunnel_id_env: tunnelIdEnv }),
-      ...(runtimeKeyEnv === undefined ? {} : { runtime_key_env: runtimeKeyEnv }),
-      ...(minimumVersion === undefined ? {} : { minimum_version: minimumVersion }),
-      ...(credentialTtlMs === undefined ? {} : { credential_ttl_ms: credentialTtlMs }),
-    } };
+    let openai: unknown = rawOpenAi;
+    if (rawOpenAi && typeof rawOpenAi === "object" && !Array.isArray(rawOpenAi)) {
+      const o = rawOpenAi as Record<string, unknown>;
+      const { binaryPath, tunnelIdEnv, runtimeKeyEnv, minimumVersion, credentialTtlMs, ...rest } = o;
+      openai = {
+        ...rest,
+        ...(binaryPath === undefined ? {} : { binary_path: binaryPath }),
+        ...(tunnelIdEnv === undefined ? {} : { tunnel_id_env: tunnelIdEnv }),
+        ...(runtimeKeyEnv === undefined ? {} : { runtime_key_env: runtimeKeyEnv }),
+        ...(minimumVersion === undefined ? {} : { minimum_version: minimumVersion }),
+        ...(credentialTtlMs === undefined ? {} : { credential_ttl_ms: credentialTtlMs }),
+      };
+    }
+    const profiles = Array.isArray(v.profiles) ? v.profiles.map((profile) => {
+      if (!profile || typeof profile !== "object" || Array.isArray(profile)) return profile;
+      const p = profile as Record<string, unknown>;
+      const { binaryPath, localPort, publicUrl, tunnelId, credentialsFile, tokenFile, tunnelIdEnv, runtimeKeyEnv, credentialTtlMs, ...rest } = p;
+      return {
+        ...rest,
+        ...(binaryPath === undefined ? {} : { binary_path: binaryPath }),
+        ...(localPort === undefined ? {} : { local_port: localPort }),
+        ...(publicUrl === undefined ? {} : { public_url: publicUrl }),
+        ...(tunnelId === undefined ? {} : { tunnel_id: tunnelId }),
+        ...(credentialsFile === undefined ? {} : { credentials_file: credentialsFile }),
+        ...(tokenFile === undefined ? {} : { token_file: tokenFile }),
+        ...(tunnelIdEnv === undefined ? {} : { tunnel_id_env: tunnelIdEnv }),
+        ...(runtimeKeyEnv === undefined ? {} : { runtime_key_env: runtimeKeyEnv }),
+        ...(credentialTtlMs === undefined ? {} : { credential_ttl_ms: credentialTtlMs }),
+      };
+    }) : v.profiles;
+    return { ...v, ...(openai === undefined ? {} : { openai }), ...(profiles === undefined ? {} : { profiles }) };
   }
   return value;
 }
@@ -721,6 +1037,12 @@ export function applyGatewayConfigPatch(base: GatewayConfig, patch: GatewayConfi
   return normalizeGatewayConfig(raw);
 }
 
+function mergeKeyAliases(key: string): string[] {
+  const snake = key.replace(/[A-Z]/g, (letter) => `_${letter.toLowerCase()}`);
+  const camel = key.replace(/_([a-z])/g, (_match, letter: string) => letter.toUpperCase());
+  return [...new Set([key, snake, camel])];
+}
+
 function mergeRawValue(base: unknown, patch: unknown): unknown {
   if (patch === null) return undefined;
   if (Array.isArray(patch) || patch === undefined || typeof patch !== "object" || patch === null) return structuredClone(patch);
@@ -729,10 +1051,62 @@ function mergeRawValue(base: unknown, patch: unknown): unknown {
     : {};
   for (const [key, value] of Object.entries(patch as Record<string, unknown>)) {
     if (value === undefined) continue;
-    const next = mergeRawValue(result[key], value);
-    if (next === undefined) delete result[key]; else result[key] = next;
+    const aliases = mergeKeyAliases(key);
+    const existingKey = aliases.find((alias) => Object.prototype.hasOwnProperty.call(result, alias));
+    const existing = existingKey === undefined ? undefined : result[existingKey];
+    for (const alias of aliases) delete result[alias];
+    const next = mergeRawValue(existing, value);
+    if (next !== undefined) result[key] = next;
   }
   return result;
+}
+
+function yamlDocumentPatchKey(
+  document: ReturnType<typeof parseDocument>,
+  parent: readonly string[],
+  key: string,
+): { key: string; aliases: string[]; canonicalKeys: boolean } {
+  const rootKey = parent[0] ?? topLevelRawKey(key);
+  const canonicalKeys = KNOWN_SECTIONS.has(rootKey);
+  const aliases = canonicalKeys ? mergeKeyAliases(key) : [key];
+  const existing = aliases.find((alias) => document.hasIn([...parent, alias]));
+  return { key: existing ?? (canonicalKeys ? topLevelRawKey(key) : key), aliases, canonicalKeys };
+}
+
+function canonicalYamlPatchValue(value: unknown, canonicalKeys: boolean): unknown {
+  if (Array.isArray(value)) return value.map((item) => canonicalYamlPatchValue(item, canonicalKeys));
+  if (!value || typeof value !== "object") return structuredClone(value);
+  return Object.fromEntries(Object.entries(value as Record<string, unknown>).map(([key, child]) => [
+    canonicalKeys ? topLevelRawKey(key) : key,
+    canonicalYamlPatchValue(child, canonicalKeys),
+  ]));
+}
+
+function applyYamlDocumentPatch(
+  document: ReturnType<typeof parseDocument>,
+  parent: readonly string[],
+  key: string,
+  patch: unknown,
+): void {
+  if (patch === undefined) return;
+  const resolved = yamlDocumentPatchKey(document, parent, key);
+  for (const alias of resolved.aliases) {
+    if (alias !== resolved.key) document.deleteIn([...parent, alias]);
+  }
+  const path = [...parent, resolved.key];
+  if (patch === null) {
+    document.deleteIn(path);
+    return;
+  }
+  if (Array.isArray(patch) || typeof patch !== "object") {
+    document.setIn(path, canonicalYamlPatchValue(patch, resolved.canonicalKeys));
+    return;
+  }
+  const existing = document.getIn(path);
+  if (!isMap(existing)) document.setIn(path, document.createNode({}));
+  for (const [childKey, childValue] of Object.entries(patch as Record<string, unknown>)) {
+    applyYamlDocumentPatch(document, path, childKey, childValue);
+  }
 }
 
 function replaceSections(text: string, changed: Record<string, unknown>): string {
@@ -770,10 +1144,12 @@ export async function writeGatewayConfigPatch(
   // Validate the effective result before committing, so malformed known fields
   // never reach the native Gateway config.
   const current = parseRawDocument(existing);
-  const changed: Record<string, unknown> = {};
+  const document = parseDocument(existing);
+  let changed = false;
   if (current.version === undefined) {
     current.version = GATEWAY_CONFIG_VERSION;
-    changed.version = GATEWAY_CONFIG_VERSION;
+    document.set("version", GATEWAY_CONFIG_VERSION);
+    changed = true;
   }
   for (const [key, value] of Object.entries(patch)) {
     if (value === undefined) continue;
@@ -783,16 +1159,13 @@ export async function writeGatewayConfigPatch(
     }
     const yamlKey = topLevelRawKey(key);
     const next = mergeRawValue(current[yamlKey], value);
-    if (next === undefined) {
-      delete current[yamlKey];
-      changed[yamlKey] = undefined;
-    } else {
-      current[yamlKey] = next;
-      changed[yamlKey] = next;
-    }
+    if (next === undefined) delete current[yamlKey];
+    else current[yamlKey] = next;
+    applyYamlDocumentPatch(document, [], key, value);
+    changed = true;
   }
   normalizeGatewayConfig(current);
-  const nextText = Object.keys(changed).length === 0 ? existing : replaceSections(existing, changed);
+  const nextText = changed ? document.toString({ lineWidth: 0 }) : existing;
   await writeGatewayFileAtomic(path, nextText, { mode: 0o600, maximumBytes: MAX_CONFIG_BYTES });
   return parseGatewayConfigDocument(nextText, path);
 }

@@ -17,6 +17,7 @@ import { GatewayTunnelStateConflictError, GatewayTunnelStateStore, type GatewayT
 import type { GatewayObservationSink } from "../observability.ts";
 
 const DEFAULT_OPERATION_TIMEOUT_MS = 30_000;
+const STARTUP_CLEANUP_TIMEOUT_MS = 5_000;
 const DEFAULT_RESTART_BUDGET: GatewayTunnelRestartBudget = { maxRestarts: 3, windowMs: 60_000 };
 
 export interface GatewayTunnelSupervisorOptions {
@@ -90,8 +91,8 @@ export class GatewayTunnelSupervisor {
     return this.start({ ...options, deadlineAt });
   }
 
-  quiesce(deadlineAt: number): Promise<GatewayTunnelState> {
-    return this.stop({ deadlineAt, reason: "shutdown" });
+  quiesce(deadlineAt: number, input?: Readonly<Record<string, unknown>>): Promise<GatewayTunnelState> {
+    return this.serial(() => this.quiesceOnce({ deadlineAt, ...(input ? { input } : {}) }));
   }
 
   /** Recover desired=running without ever trusting a PID by itself. */
@@ -119,6 +120,16 @@ export class GatewayTunnelSupervisor {
         }
         const request = this.requestFor(state, options.input);
         const adopted = await runWithinTunnelDeadline(deadline, "adopt", () => this.provider.adopt?.(deadline, identity, request));
+        if (this.provider.adopt && !adopted) {
+          await runWithinTunnelDeadline(deadline, "adopt", () => this.provider.stop(deadline, identity, { ...request, reason: "restart" }));
+          const restarting = await this.saveSameGeneration(state, {
+            ...withoutProcess(state),
+            observed: { phase: "degraded", changedAt: this.now(), detail: "Provider requires a fresh process after Gateway restart" },
+            updatedAt: this.now(),
+          });
+          queueMicrotask(() => { void this.start({ ...options, input: options.input }).catch(() => undefined); });
+          return restarting;
+        }
         const process: GatewayTunnelStartResult = adopted ?? {
           pid: identity.pid,
           executablePath: identity.executableRealpath,
@@ -147,9 +158,14 @@ export class GatewayTunnelSupervisor {
     });
   }
 
-  async close(deadlineAt = this.now() + this.operationTimeoutMs): Promise<void> {
+  async close(
+    deadlineAt = this.now() + this.operationTimeoutMs,
+    input?: Readonly<Record<string, unknown>>,
+    preserveRunningIntent = false,
+  ): Promise<void> {
     this.closed = true;
-    await this.quiesce(deadlineAt).catch(() => undefined);
+    if (preserveRunningIntent) await this.quiesce(deadlineAt, input).catch(() => undefined);
+    else await this.stop({ deadlineAt, reason: "shutdown", ...(input ? { input } : {}) }).catch(() => undefined);
   }
 
   private async startOnce(options: InternalStartOptions): Promise<GatewayTunnelState> {
@@ -247,10 +263,22 @@ export class GatewayTunnelSupervisor {
       return ready;
     } catch (error) {
       const latest = await this.stateStore.read().catch(() => undefined);
-      if (started && latest && latest.generation === generation && latest.ownerToken === ownerToken && hasIdentity(latest)) {
-        await this.stopOwned(deadline, latest, "startup-failed", options.input).catch(() => undefined);
+      let cleaned = false;
+      if (started) {
+        const cleanupDeadline = createGatewayTunnelDeadline(STARTUP_CLEANUP_TIMEOUT_MS, { now: this.now });
+        try {
+          if (latest && latest.generation === generation && latest.ownerToken === ownerToken && hasIdentity(latest)) {
+            await this.stopOwned(cleanupDeadline, latest, "startup-failed", options.input);
+            cleaned = true;
+          } else if (started.child) {
+            cleaned = started.child.kill("SIGKILL");
+          }
+        } catch { /* retain published identity for a later verified stop */ }
+        finally { cleanupDeadline.close(); }
       }
-      if (latest && latest.generation === generation && latest.ownerToken === ownerToken) await this.saveFailure(latest, error).catch(() => undefined);
+      if (latest && latest.generation === generation && latest.ownerToken === ownerToken) {
+        await this.saveFailure(cleaned ? withoutProcess(latest) : latest, error).catch(() => undefined);
+      }
       throw error;
     } finally { deadline.close(); }
   }
@@ -289,6 +317,35 @@ export class GatewayTunnelSupervisor {
     } finally { deadline.close(); }
   }
 
+  /** Stop the owned process for daemon shutdown without changing configured intent. */
+  private async quiesceOnce(options: GatewayTunnelOperationOptions): Promise<GatewayTunnelState> {
+    const current = await this.stateStore.read();
+    if (!current || current.desiredState === "stopped") return current ?? this.initialStopped();
+    const quiescing: GatewayTunnelState = {
+      ...current,
+      observed: { ...current.observed, phase: "quiescing", changedAt: this.now(), detail: "Gateway shutdown" },
+      updatedAt: this.now(),
+    };
+    await this.saveState(quiescing, { expectedGeneration: current.generation, expectedOwnerToken: current.ownerToken });
+    const deadline = this.createDeadline(options);
+    try {
+      if (hasIdentity(quiescing)) {
+        const ownership = await runWithinTunnelDeadline(deadline, "stop", () => this.processOwner.verify(identityFromState(quiescing), quiescing.generation));
+        if (ownership.alive && !ownership.owned) throw tunnelError("tunnel_ownership_denied", `Refused to stop tunnel process: ${ownership.reason}`);
+        if (ownership.owned) await runWithinTunnelDeadline(deadline, "stop", () => this.provider.stop(deadline, identityFromState(quiescing), { ...this.requestFor(quiescing, options.input), reason: "shutdown" }));
+      }
+      return await this.saveState({
+        ...withoutProcess(quiescing),
+        desiredState: "running",
+        observed: { phase: "stopped", changedAt: this.now(), detail: "Suspended for Gateway shutdown" },
+        updatedAt: this.now(),
+      }, { expectedGeneration: quiescing.generation, expectedOwnerToken: quiescing.ownerToken });
+    } catch (error) {
+      await this.saveFailure(quiescing, error).catch(() => undefined);
+      throw error;
+    } finally { deadline.close(); }
+  }
+
   private async stopOwned(deadline: GatewayTunnelDeadline, state: GatewayTunnelState, reason: "startup-failed", input?: Readonly<Record<string, unknown>>): Promise<void> {
     const identity = identityFromState(state);
     const ownership = await runWithinTunnelDeadline(deadline, "stop", () => this.processOwner.verify(identity, state.generation));
@@ -308,7 +365,7 @@ export class GatewayTunnelSupervisor {
     const current = await this.stateStore.read();
     if (!current || current.generation !== generation || current.ownerToken !== ownerToken) return;
     const at = exit.at ?? this.now();
-    if (current.desiredState === "stopped" || current.observed.phase === "quiescing") {
+    if (this.closed || current.desiredState === "stopped" || current.observed.phase === "quiescing") {
       await this.saveState({ ...withoutProcess(current), observed: { phase: "stopped", changedAt: at, lastExit: { ...exit, at } }, updatedAt: at }, { expectedGeneration: generation, expectedOwnerToken: ownerToken });
       return;
     }

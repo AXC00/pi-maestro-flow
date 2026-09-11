@@ -21,6 +21,7 @@ export * from "./tunnel/provider.ts";
 export * from "./tunnel/providers/cloudflare.ts";
 export * from "./tunnel/providers/openai-client-contract.ts";
 export * from "./tunnel/providers/openai.ts";
+export * from "./tunnel/providers/ssh-reverse.ts";
 export * from "./contracts.ts";
 export * from "./event-contracts.ts";
 export * from "./event-journal.ts";

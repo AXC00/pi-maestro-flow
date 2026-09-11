@@ -111,7 +111,7 @@ export interface GatewayTunnelProvider {
   start(context: GatewayTunnelDeadlineContext, request: GatewayTunnelProviderRequest): Promise<GatewayTunnelStartResult>;
   probe(context: GatewayTunnelDeadlineContext, process: GatewayTunnelStartResult, request: GatewayTunnelProviderRequest): Promise<GatewayTunnelProbeResult>;
   stop(context: GatewayTunnelDeadlineContext, process: GatewayTunnelProcessIdentity, request: GatewayTunnelStopRequest): Promise<void>;
-  /** Called only after the persisted process identity has been independently verified. */
+  /** Called only after identity verification. Returning undefined requests a verified stop and fresh start. */
   adopt?(context: GatewayTunnelDeadlineContext, process: GatewayTunnelProcessIdentity, request: GatewayTunnelProviderRequest): Promise<GatewayTunnelStartResult | undefined>;
 }
 

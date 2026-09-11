@@ -34,6 +34,7 @@ The companion plugins are dependencies and **auto-register on postinstall** — 
 - 📝 **Durable Plan mode** — read-only Markdown draft, approve-before-act, dedicated Plan model
 - 🧠 **Persistent knowledge system** — semantic search · specs · knowhow, survives across sessions
 - 🔌 **Full protocol connectivity** — MCP (OAuth auto-auth) · LSP · Browser (CDP) · Smart Search · source verification
+- 🌉 **Native Gateway ingress** — standalone configuration TUI plus managed Cloudflare Quick/Named, experimental OpenAI Secure, and persistent OpenSSH Reverse tunnel profiles
 - 🛰️ **Live cockpit visualization** — running teammates & todo plan in real time, 9 built-in themes
 - 🧐 **Turn-level Advisor** — optional second-model quality reviewer (`/advisor on`); raises `concern`/`blocker` notes into the session, throttled by the shared supervision gate
 - 👁️ **Unified supervision telemetry** — goal/monitor/advisor events on one bus; cockpit `SUP` footer segment + `/supervision` command
@@ -91,7 +92,16 @@ After installation:
 
 ### Gateway cutover
 
-The built-in Gateway is configured through `/gateway` and the `pi-maestro-gateway` CLI. Its supported package API is `pi-maestro-flow/gateway/v1`; the unrelated `pi-maestro-flow/src/*` wildcard export remains available.
+The built-in Gateway is managed through `/gateway` and the `pi-maestro-gateway` CLI. Its supported package API is `pi-maestro-flow/gateway/v1`; the unrelated `pi-maestro-flow/src/*` wildcard export remains available.
+
+Gateway configuration can also be edited without starting Pi:
+
+```bash
+pi-maestro-gateway config
+pi-maestro-gateway config --config /secure/gateway.yaml
+```
+
+The standalone TUI edits the listener, transport switches, command policy, localhost/proxy guards, and log level. It deliberately does not display or modify credentials or tunnel-profile lifecycle. Persistent profiles are managed with `pi-maestro-gateway tunnel profile enable|disable|status|restart`; only one persistent profile may be enabled, and its HTTPS `publicUrl` must match the OAuth server origin. See the [Gateway Tunnel configuration guide](../../docs/gateway-tunnel-configuration.md) for complete Cloudflare Quick/Named, OpenAI Secure, and Managed OpenSSH Reverse examples and server-side TLS/reverse-proxy requirements.
 
 The MCPX compatibility facade, `/mcpx` command, legacy deep-import files, and `PI_MCPX_BRIDGE`, `MCPX_BIN`, and `MCPX_TUNNEL_*` environment variables have been removed. Existing legacy state is read only by the explicit offline migration command:
 
@@ -109,6 +119,7 @@ Normal Gateway startup does not read legacy state. Calls that can safely replay 
 | Command | Description |
 |---------|-------------|
 | `/permissions` | Inspect and manage permission rules; `/permissions yolo` enables bypass mode |
+| `/gateway` | Open the native Gateway management overlay; `/gateway wizard` opens guided setup |
 | `/plan`, `Alt+Shift+P` | Enter durable Plan mode |
 | `/plan-model` | Select or disable a dedicated Plan model |
 | `/goal` | Goal lifecycle: `/goal stop`, `/goal resume`, `/goal clear` |
