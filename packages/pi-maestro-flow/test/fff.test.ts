@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -131,9 +131,10 @@ test("FFF destroys an initializing finder when the session shuts down", async ()
   assert.equal(destroyCount, 1);
 });
 
-test("FFF loads its native index and searches a root workspace", async () => {
+test("FFF loads its native index and searches a selected workspace subdirectory", async () => {
   const root = await mkdtemp(join(tmpdir(), "pi-fff-"));
-  await writeFile(join(root, "needle.ts"), "export const FFF_INTEGRATION_NEEDLE = true;\n");
+  await mkdir(join(root, "src"));
+  await writeFile(join(root, "src", "needle.ts"), "export const FFF_INTEGRATION_NEEDLE = true;\n");
   const tools: ToolDefinition[] = [];
   const handlers = new Map<string, Array<(...args: unknown[]) => unknown>>();
   const register = {
@@ -157,7 +158,7 @@ test("FFF loads its native index and searches a root workspace", async () => {
     assert.ok(grep);
     const result = await grep.execute(
       "fff-smoke",
-      { pattern: "FFF_INTEGRATION_NEEDLE", limit: 10 },
+      { pattern: "FFF_INTEGRATION_NEEDLE", path: "src", limit: 10 },
       new AbortController().signal,
       undefined,
       ctx,
@@ -168,7 +169,7 @@ test("FFF loads its native index and searches a root workspace", async () => {
     assert.ok(find);
     const found = await find.execute(
       "fff-find-smoke",
-      { pattern: "needle", limit: 10 },
+      { pattern: "needle", path: "src", limit: 10 },
       new AbortController().signal,
       undefined,
       ctx,

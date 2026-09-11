@@ -6,6 +6,7 @@ import { parse, resolve } from "node:path";
 import { toolCallLine, toolResultLine, resultSummary } from "../quiet-render.ts";
 import { FileFinder, type FileFinderApi } from "@ff-labs/fff-node";
 import { Type } from "typebox";
+import { resolveSearchScopePath } from "./search-scope-guard.ts";
 
 const SCAN_TIMEOUT_MS = 15_000;
 // Keep at most this many indexed workspaces alive. Each finder owns a native
@@ -42,12 +43,14 @@ function evictOldestFinder(finders: Map<string, FileFinderApi>): void {
 
 const FffGrepParams = Type.Object({
   pattern: Type.String({ minLength: 1, description: "Literal text to search for" }),
+  path: Type.Optional(Type.String({ description: "Directory to search relative to the workspace (default: workspace root)" })),
   context: Type.Optional(Type.Integer({ minimum: 0, maximum: 20, description: "Lines of context before and after each match (default: 0)" })),
   limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 100, description: "Maximum number of matches to return (default: 20)" })),
 });
 
 const FffFindParams = Type.Object({
   pattern: Type.String({ minLength: 1, description: "Fuzzy file-path query" }),
+  path: Type.Optional(Type.String({ description: "Directory to search relative to the workspace (default: workspace root)" })),
   limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 100, description: "Maximum number of files to return (default: 30)" })),
 });
 
@@ -131,12 +134,12 @@ export function registerFff(pi: ExtensionAPI, options: RegisterFffOptions = {}):
   pi.registerTool({
     name: "ffgrep",
     label: "FFF Grep",
-    description: "Fast FFF-backed literal content search in the current workspace.",
+    description: "Fast FFF-backed literal content search in the current workspace or a selected subdirectory.",
     promptSnippet: "Search workspace file contents with FFF.",
     parameters: FffGrepParams,
     async execute(_id, params, signal, _onUpdate, ctx): Promise<AgentToolResult<unknown>> {
       if (signal?.aborted) throw abortError();
-      const activeFinder = await ensureFinder(ctx.cwd);
+      const activeFinder = await ensureFinder(resolveSearchScopePath(params.path, ctx.cwd));
       if (signal?.aborted) throw abortError();
       const result = activeFinder.grep(params.pattern, {
         mode: "plain",
@@ -172,12 +175,12 @@ export function registerFff(pi: ExtensionAPI, options: RegisterFffOptions = {}):
   pi.registerTool({
     name: "fffind",
     label: "FFF Find",
-    description: "Fast FFF-backed fuzzy file-path search in the current workspace.",
+    description: "Fast FFF-backed fuzzy file-path search in the current workspace or a selected subdirectory.",
     promptSnippet: "Find workspace files by fuzzy path with FFF.",
     parameters: FffFindParams,
     async execute(_id, params, signal, _onUpdate, ctx): Promise<AgentToolResult<unknown>> {
       if (signal?.aborted) throw abortError();
-      const activeFinder = await ensureFinder(ctx.cwd);
+      const activeFinder = await ensureFinder(resolveSearchScopePath(params.path, ctx.cwd));
       if (signal?.aborted) throw abortError();
       const result = activeFinder.fileSearch(params.pattern, { pageSize: params.limit ?? 30 });
       if (!result.ok) throw new Error(`FFF file search failed: ${result.error}`);

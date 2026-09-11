@@ -1115,7 +1115,7 @@ test("teammate child registers interaction, local Bash, and parent-permission su
     "session_compact",
     "session_compact_failed",
   ]);
-  assert.equal(handlers.get("tool_call")?.length, 2, "compaction guard precedes child permission handling");
+  assert.equal(handlers.get("tool_call")?.length, 3, "compaction and search guards precede child permission handling");
   assert.equal(handlers.get("before_agent_start")?.length, 1, "child only uses before_agent_start to sync the gated new-context tool");
   let providerAborts = 0;
   const providerCtx = {

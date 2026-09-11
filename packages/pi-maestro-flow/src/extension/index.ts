@@ -258,6 +258,7 @@ import { lspManager } from "../tools/lsp/manager.ts";
 import { registerSmartSearchTool } from "../tools/smart-search.ts";
 import { createSourceCheckTool } from "../tools/web-access/source-check-tool.ts";
 import { registerFff } from "../tools/fff.ts";
+import { registerSearchScopeGuard } from "../tools/search-scope-guard.ts";
 import { registerBashBg } from "../tools/bash-bg.ts";
 import { registerLoop } from "../tools/loop.ts";
 import { registerFlowSchedule } from "../flow-schedule/register.ts";
@@ -3858,6 +3859,7 @@ When NOT to use:
   // Keep the tool panel stable for prompt-cache reuse; this hook enforces the hard
   // read-only boundary until Plan approval, before the interactive permission chain.
   pi.on("tool_call", (event) => onToolCallPlan(event, approvalMode === "bypassPermissions"));
+  registerSearchScopeGuard(pi);
 
   pi.on("before_agent_start", async (event, ctx) => {
     // This is Pi's strongest public session-input boundary. It is correlated by
@@ -4482,6 +4484,7 @@ function registerMaestroChildSurface(pi: ExtensionAPI): void {
   });
   // Child sessions share the same hard-threshold gate: block+terminate, never abort.
   pi.on("tool_call", (_event, ctx) => autoCompaction.onToolCall(ctx));
+  registerSearchScopeGuard(pi);
   pi.on("context", async (event, ctx) => {
     try {
       const messages = await autoCompaction.evaluate(event.messages, ctx);
