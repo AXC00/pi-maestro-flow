@@ -362,6 +362,27 @@ test("a dead owner can recover an abandoned token-specific reclaim marker but no
   }
 });
 
+test("release retries transient rename contention without abandoning the owned lock", async () => {
+  const { root, agent } = await fixture();
+  let renameAttempts = 0;
+  const rename = (async (...args: Parameters<typeof fsRename>) => {
+    if (String(args[0]).endsWith(".probe.lock") && renameAttempts++ < 2) {
+      throw Object.assign(new Error("simulated Windows directory contention"), { code: "EPERM" });
+    }
+    return fsRename(...args);
+  }) as typeof fsRename;
+  const owned = await acquirePrivateStateLock({
+    directory: agent, name: ".probe.lock", heartbeatMs: 1000,
+    processIdentity: async () => "birth:self", processLiveness: async () => true,
+    enforcePrivate: async () => undefined, durability: { async syncFile() {}, async syncDirectory() {} },
+    fs: { rename },
+  });
+  assert.equal(await owned.release(), true);
+  assert.equal(renameAttempts, 3);
+  assert.deepEqual(await readdir(agent), []);
+  await rm(root, { recursive: true, force: true });
+});
+
 test("release refuses a successor identity and leaves its canonical directory untouched", async () => {
   const { root, agent } = await fixture();
   const owned = await acquirePrivateStateLock({

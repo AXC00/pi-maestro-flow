@@ -140,9 +140,21 @@ export async function acquirePrivateStateLock(options: PrivateStateLockOptions):
         // Windows does not allow the directory rename while this handle is open.
         // The immutable release marker fences reclaim before the retained handle closes.
         await retained.close();
-        if (!(await exactOwner(lockPath, owner, fs))) return false;
         await options.fault?.("lock:release-before-quarantine");
-        await fs.rename(lockPath, quarantine);
+        let quarantined = false;
+        for (let attempt = 0; attempt < 20; attempt += 1) {
+          if (!(await exactOwner(lockPath, owner, fs))) return false;
+          try {
+            await fs.rename(lockPath, quarantine);
+            quarantined = true;
+            break;
+          } catch (error) {
+            const code = (error as NodeJS.ErrnoException).code;
+            if (!new Set(["EACCES", "EBUSY", "EPERM"]).has(code ?? "") || attempt === 19) return false;
+            await wait(Math.min(5 * (attempt + 1), 50));
+          }
+        }
+        if (!quarantined) return false;
         await options.durability.syncDirectory(options.directory);
         if (!(await exactOwner(quarantine, owner, fs))) return false;
         await fs.rm(quarantine, { recursive: true, force: false });

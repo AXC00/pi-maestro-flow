@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -107,4 +107,35 @@ test("usageTotals over persisted records sums cost correctly", async () => {
 	// round4(0.02025) = Math.round(0.02025*10000)/10000 = 0.0203
 	assert.equal(totals.totalCost, 0.0203);
 	assert.equal(totals.totalTokens, 1500);
+});
+
+test("recordUsage serializes concurrent writers and releases the owner lock", async () => {
+	const sid = "e2e-concurrent-writers";
+	await Promise.all(Array.from({ length: 12 }, (_, index) => recordUsage(
+		makeAssistantMessage({ timestamp: 10_000 + index }),
+		sid,
+		"/tmp/ws",
+	)));
+
+	const records = await readHistory({ kind: "session", sessionId: sid });
+	assert.equal(records.length, 12);
+	assert.deepEqual(records.map((record) => record.ts), Array.from({ length: 12 }, (_, index) => 10_000 + index));
+	assert.equal(existsSync(join(tmpRoot, "usage-history", ".usage-history-store.lock")), false);
+});
+
+test("recordUsage waits for a live legacy proper-lockfile directory", async () => {
+	const sid = "e2e-legacy-lock";
+	const lockPath = join(tmpRoot, "usage-history", ".usage-history-store.lock");
+	mkdirSync(lockPath, { recursive: true });
+	const releaseLegacyLock = setTimeout(() => rmSync(lockPath, { recursive: true, force: true }), 100);
+	try {
+		await recordUsage(makeAssistantMessage({ timestamp: 20_000 }), sid, "/tmp/ws");
+	} finally {
+		clearTimeout(releaseLegacyLock);
+		rmSync(lockPath, { recursive: true, force: true });
+	}
+
+	const records = await readHistory({ kind: "session", sessionId: sid });
+	assert.equal(records.length, 1);
+	assert.equal(records[0].ts, 20_000);
 });

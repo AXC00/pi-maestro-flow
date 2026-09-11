@@ -18,7 +18,12 @@ import { mkdir, appendFile, lstat, readFile, rename, readdir, unlink, writeFile 
 import { existsSync, statSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { TextDecoder } from "node:util";
-import { lockSettingsResource } from "../settings/resource-lock.ts";
+import {
+	acquirePrivateStateLock,
+	defaultProcessIdentity,
+	type PrivateStateLock,
+	type ProcessIdentity,
+} from "../gateway/private-state-transaction.ts";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -107,24 +112,46 @@ function indexPath(): string {
 	return join(usageHistoryDir(), "index.json");
 }
 
-function storeLockPath(): string {
-	return join(usageHistoryDir(), ".usage-history-store");
-}
+const STORE_LOCK_NAME = ".usage-history-store.lock";
+const STORE_LOCK_DURABILITY = {
+	async syncFile(_path: string): Promise<void> {},
+	async syncDirectory(_path: string): Promise<void> {},
+};
+let currentProcessIdentity: Promise<string | null> | undefined;
 
-async function withUsageHistoryLock<T>(operation: () => Promise<T>): Promise<T> {
-	await mkdir(usageHistoryDir(), { recursive: true });
-	const release = await lockSettingsResource(storeLockPath());
+const resolveUsageHistoryProcessIdentity: ProcessIdentity = async (pid, platform) => {
+	if (pid !== process.pid || platform !== process.platform) return defaultProcessIdentity(pid, platform);
+	const pending = currentProcessIdentity ??= defaultProcessIdentity(pid, platform);
+	const identity = await pending;
+	if (!identity && currentProcessIdentity === pending) currentProcessIdentity = undefined;
+	return identity;
+};
+
+async function withUsageHistoryLock<T>(operation: (lock: PrivateStateLock) => Promise<T>): Promise<T> {
+	const directory = usageHistoryDir();
+	await mkdir(directory, { recursive: true });
+	const lock = await acquirePrivateStateLock({
+		directory,
+		name: STORE_LOCK_NAME,
+		processIdentity: resolveUsageHistoryProcessIdentity,
+		enforcePrivate: async () => {},
+		durability: STORE_LOCK_DURABILITY,
+	});
 	try {
-		return await operation();
+		await lock.assertOwned();
+		const result = await operation(lock);
+		await lock.assertOwned();
+		return result;
 	} finally {
-		await release();
+		await lock.release();
 	}
 }
 
-async function atomicWrite(path: string, contents: string): Promise<void> {
+async function atomicWrite(path: string, contents: string, lock: PrivateStateLock): Promise<void> {
 	const temporary = `${path}.tmp-${process.pid}-${randomUUID()}`;
 	try {
 		await writeFile(temporary, contents, "utf8");
+		await lock.assertOwned();
 		await rename(temporary, path);
 	} catch (error) {
 		await unlink(temporary).catch(() => undefined);
@@ -145,10 +172,11 @@ async function atomicWrite(path: string, contents: string): Promise<void> {
 export async function recordUsage(message: AssistantMessage, sessionId: string, cwd: string): Promise<void> {
 	const record = toRecord(message, sessionId, cwd);
 	try {
-		await withUsageHistoryLock(async () => {
-			await migrateSessionLocked(sessionId);
+		await withUsageHistoryLock(async (lock) => {
+			await migrateSessionLocked(sessionId, lock);
+			await lock.assertOwned();
 			await appendFile(usageSessionFile(sessionId), `${JSON.stringify(record)}\n`, "utf8");
-			await refreshIndexEntryLocked(sessionId);
+			await refreshIndexEntryLocked(sessionId, lock);
 		});
 	} catch {
 		// Disk failure, permission, etc. — usage tracking is best-effort.
@@ -203,7 +231,7 @@ function indexEntryFor(sessionId: string, records: readonly UsageRecord[]): Sess
 	};
 }
 
-async function refreshIndexEntryLocked(sessionId: string): Promise<void> {
+async function refreshIndexEntryLocked(sessionId: string, lock: PrivateStateLock): Promise<void> {
 	const current = await readIndex();
 	const records = (await readSessionRecordsLocked(sessionId)).filter((record) => record.sessionId === sessionId);
 	const next = indexEntryFor(sessionId, records);
@@ -211,7 +239,7 @@ async function refreshIndexEntryLocked(sessionId: string): Promise<void> {
 	if (next && index >= 0) current.sessions[index] = next;
 	else if (next) current.sessions.push(next);
 	else if (index >= 0) current.sessions.splice(index, 1);
-	await atomicWrite(indexPath(), `${JSON.stringify(current, null, 2)}\n`);
+	await atomicWrite(indexPath(), `${JSON.stringify(current, null, 2)}\n`, lock);
 }
 
 // ---------------------------------------------------------------------------
@@ -223,7 +251,7 @@ export async function readHistory(scope: ReadScope, opts: ReadOptions = {}): Pro
 	let files: string[];
 	if (scope.kind === "session") {
 		try {
-			await withUsageHistoryLock(() => migrateSessionLocked(scope.sessionId));
+			await withUsageHistoryLock((lock) => migrateSessionLocked(scope.sessionId, lock));
 		} catch {
 			// Reads degrade to the canonical/legacy files that remain.
 		}
@@ -324,7 +352,7 @@ async function readSessionRecordsLocked(sessionId: string): Promise<UsageRecord[
 	return records;
 }
 
-async function migrateSessionLocked(sessionId: string): Promise<void> {
+async function migrateSessionLocked(sessionId: string, lock: PrivateStateLock): Promise<void> {
 	const legacy = legacySessionFile(sessionId);
 	const canonical = usageSessionFile(sessionId);
 	if (legacy === canonical) return;
@@ -362,10 +390,11 @@ async function migrateSessionLocked(sessionId: string): Promise<void> {
 		merged.push(record);
 	}
 	merged.sort((a, b) => a.ts - b.ts);
-	await atomicWrite(canonical, merged.map((record) => JSON.stringify(record)).join("\n") + (merged.length ? "\n" : ""));
+	await atomicWrite(canonical, merged.map((record) => JSON.stringify(record)).join("\n") + (merged.length ? "\n" : ""), lock);
 	// Canonical persistence succeeded; only now may the fully parsed legacy file disappear.
+	await lock.assertOwned();
 	await unlink(legacy);
-	await refreshIndexEntryLocked(sessionId);
+	await refreshIndexEntryLocked(sessionId, lock);
 }
 
 export async function readSessionIndex(): Promise<SessionIndex> {
@@ -534,12 +563,12 @@ export async function inventoryUsageHistory(
 	currentSessionId?: string,
 	liveProtection: UsageLiveSessionProtection = {},
 ): Promise<UsageHistoryInventoryEntry[]> {
-	return withUsageHistoryLock(async () => {
+	return withUsageHistoryLock(async (lock) => {
 		const initial = await scanUsageFilesLocked(cwd, currentSessionId, liveProtection);
 		for (const entry of initial) {
 			if (entry.sessionIds.length !== 1) continue;
 			const sessionId = entry.sessionIds[0]!;
-			if (resolve(entry.path) !== resolve(usageSessionFile(sessionId))) await migrateSessionLocked(sessionId);
+			if (resolve(entry.path) !== resolve(usageSessionFile(sessionId))) await migrateSessionLocked(sessionId, lock);
 		}
 		return scanUsageFilesLocked(cwd, currentSessionId, liveProtection);
 	});
@@ -562,7 +591,7 @@ export interface DeleteUsageHistoryResult {
 /** Delete only a still-identical, regular, purely current-workspace usage file. */
 export async function guardedDeleteUsageHistory(request: DeleteUsageHistoryRequest): Promise<DeleteUsageHistoryResult> {
 	try {
-		return await withUsageHistoryLock(async () => {
+		return await withUsageHistoryLock(async (lock) => {
 			const entry = (await scanUsageFilesLocked(
 				request.cwd,
 				request.currentSessionId,
@@ -574,9 +603,10 @@ export async function guardedDeleteUsageHistory(request: DeleteUsageHistoryReque
 				return { status: "protected", message: entry.protectionReason ?? "ownership is not cleanup-eligible" };
 			}
 			const sessionId = entry.sessionIds[0]!;
+			await lock.assertOwned();
 			await unlink(entry.path);
 			try {
-				await refreshIndexEntryLocked(sessionId);
+				await refreshIndexEntryLocked(sessionId, lock);
 				return { status: "deleted", reclaimedBytes: entry.sizeBytes };
 			} catch (error) {
 				const detail = error instanceof Error ? error.message : String(error);
@@ -814,10 +844,10 @@ async function readBackfillCache(): Promise<BackfillCache> {
 	}
 }
 
-async function writeBackfillCache(cache: BackfillCache): Promise<void> {
+async function writeBackfillCache(cache: BackfillCache, lock: PrivateStateLock): Promise<void> {
 	try {
 		await mkdir(usageHistoryDir(), { recursive: true });
-		await atomicWrite(backfillCachePath(), `${JSON.stringify(cache, null, 2)}\n`);
+		await atomicWrite(backfillCachePath(), `${JSON.stringify(cache, null, 2)}\n`, lock);
 	} catch {
 		// Best-effort cache.
 	}
@@ -898,7 +928,7 @@ async function parseSessionFile(file: string): Promise<UsageRecord[]> {
 export async function backfillFromSessions(): Promise<{ newRecords: number; newFiles: number }> {
 	const sessionsDir = join(getAgentDir(), "sessions");
 	if (!existsSync(sessionsDir)) return { newRecords: 0, newFiles: 0 };
-	return withUsageHistoryLock(async () => {
+	return withUsageHistoryLock(async (lock) => {
 		const cache = await readBackfillCache();
 		// Ignore legacy basename cache entries: rescanning once is safe because timestamps dedupe.
 		const scanned = new Set(cache.scannedFiles.filter((key) => /^[a-f0-9]{64}$/.test(key)));
@@ -927,11 +957,12 @@ export async function backfillFromSessions(): Promise<{ newRecords: number; newF
 				bySession.set(record.sessionId, list);
 			}
 			for (const [sessionId, sessionRecords] of bySession) {
-				await migrateSessionLocked(sessionId);
+				await migrateSessionLocked(sessionId, lock);
 				const existing = await readExistingTimestamps(sessionId);
 				const fresh = sessionRecords.filter((record) => !existing.has(record.ts));
 				if (fresh.length === 0) continue;
 				try {
+					await lock.assertOwned();
 					await appendFile(usageSessionFile(sessionId), fresh.map((record) => JSON.stringify(record)).join("\n") + "\n", "utf8");
 					totalNew += fresh.length;
 					changedSessions.add(sessionId);
@@ -943,10 +974,10 @@ export async function backfillFromSessions(): Promise<{ newRecords: number; newF
 			}
 			scanned.add(backfillPathKey(file));
 		}
-		for (const sessionId of changedSessions) await refreshIndexEntryLocked(sessionId);
+		for (const sessionId of changedSessions) await refreshIndexEntryLocked(sessionId, lock);
 		const currentKeys = new Set(files.map(backfillPathKey));
 		cache.scannedFiles = [...scanned].filter((key) => currentKeys.has(key)).slice(-5000);
-		await writeBackfillCache(cache);
+		await writeBackfillCache(cache, lock);
 		return { newRecords: totalNew, newFiles: newFiles.length };
 	});
 }
