@@ -21,6 +21,14 @@ import { WorkspaceRegistry } from "./workspace-registry.ts";
 import { GatewayFabricStore } from "./fabric/store.ts";
 import { GatewayFabricEventAdapter } from "./fabric/event-adapter.ts";
 import { recoverGatewayFabric } from "./fabric/recovery.ts";
+import {
+  FabricEndpointDispatcher,
+  type FabricEndpointDirectory,
+  type FabricEndpointRegistration,
+  type FabricRouteAuthority,
+} from "./fabric/endpoint-dispatcher.ts";
+import { FabricHttpChannelServer } from "./fabric/http-channel-server.ts";
+import { McpEndpointBridge, type FabricMcpSourceRegistration } from "./fabric/mcp-endpoint.ts";
 import { ExecService } from "./services/exec-service.ts";
 import { FileService } from "./services/file-service.ts";
 import { HostService } from "./services/host-service.ts";
@@ -57,6 +65,15 @@ export interface GatewayRuntimeOptions {
   operationReceiptStore?: GatewayOperationReceiptStore;
   fabricStore?: GatewayFabricStore;
   fabricEventAdapter?: GatewayFabricEventAdapter;
+  fabricRouteAuthority?: FabricRouteAuthority;
+  fabricEndpointDirectory?: FabricEndpointDirectory;
+  fabricEndpointRegistrations?: readonly FabricEndpointRegistration[];
+  fabricEndpointDispatcher?: FabricEndpointDispatcher;
+  /** Explicitly enable auto-wiring of the native-TLS Fabric HTTP data plane. Default: false. */
+  fabricHttpChannelEnabled?: boolean;
+  fabricHttpChannelServer?: FabricHttpChannelServer;
+  fabricMcpEndpoint?: McpEndpointBridge;
+  fabricMcpSources?: readonly FabricMcpSourceRegistration[];
   warningSink?: (message: string) => void;
   maestroRunner?: RunCliRunner;
   maestroEnvironment?: NodeJS.ProcessEnv;
@@ -98,6 +115,9 @@ export class GatewayRuntime {
   readonly operationReceipts: GatewayOperationReceiptStore;
   readonly fabricStore: GatewayFabricStore;
   readonly fabricEvents: GatewayFabricEventAdapter;
+  readonly fabricEndpointDispatcher?: FabricEndpointDispatcher;
+  readonly fabricHttpChannelServer?: FabricHttpChannelServer;
+  readonly fabricMcpEndpoint?: McpEndpointBridge;
   readonly session: GatewaySessionService;
   readonly todo: GatewayTodoService;
   readonly board: BoardService;
@@ -204,6 +224,47 @@ export class GatewayRuntime {
     if (this.fabricEvents.store !== this.fabricStore || this.fabricEvents.journal !== this.teammate.eventJournal) {
       throw new Error("Gateway Fabric event adapter must use the runtime Fabric store and event journal");
     }
+    this.fabricMcpEndpoint = options.fabricMcpEndpoint ?? (options.fabricMcpSources === undefined ? undefined : new McpEndpointBridge({
+      registry: this.registry,
+      policy: this.policy,
+      registrations: options.fabricMcpSources,
+      maxOutputBytes: config.limits.maxOutputBytes,
+    }));
+    const endpointRegistrations = [
+      ...(options.fabricEndpointRegistrations ?? []),
+      ...(this.fabricMcpEndpoint === undefined ? [] : (options.fabricMcpSources ?? []).map((source): FabricEndpointRegistration => ({
+        endpointId: source.endpointId,
+        kind: "mcp",
+        handler: this.fabricMcpEndpoint!,
+      }))),
+    ];
+    this.fabricEndpointDispatcher = options.fabricEndpointDispatcher ?? (
+      options.fabricRouteAuthority !== undefined && options.fabricEndpointDirectory !== undefined
+        ? new FabricEndpointDispatcher({
+          routes: options.fabricRouteAuthority,
+          endpoints: options.fabricEndpointDirectory,
+          registrations: endpointRegistrations,
+          maxPendingRequests: config.limits.maxConcurrentRequests,
+          maxRequestBytes: config.limits.maxRequestBytes,
+          maxResultBytes: config.limits.maxOutputBytes,
+        })
+        : options.fabricHttpChannelServer?.dispatcher
+    );
+    if (options.fabricHttpChannelServer !== undefined && this.fabricEndpointDispatcher !== options.fabricHttpChannelServer.dispatcher) {
+      throw new Error("Gateway Fabric HTTP channel server must use the runtime Endpoint dispatcher");
+    }
+    const fabricHttpEnabled = options.fabricHttpChannelEnabled ?? (options.fabricHttpChannelServer !== undefined);
+    if (fabricHttpEnabled && this.fabricEndpointDispatcher === undefined) {
+      throw new Error("Gateway Fabric HTTP routes require an Endpoint dispatcher");
+    }
+    this.fabricHttpChannelServer = options.fabricHttpChannelServer ?? (!fabricHttpEnabled ? undefined : new FabricHttpChannelServer({
+      dispatcher: this.fabricEndpointDispatcher!,
+      limits: {
+        maxRequestBytes: config.limits.maxRequestBytes,
+        maxResultBytes: config.limits.maxOutputBytes,
+        maxPendingRequests: config.limits.maxConcurrentRequests,
+      },
+    }));
     this.eventStream = new GatewayEventStream(this.teammate.eventJournal, { observer: this.observer });
     this.session = new GatewaySessionService({ store: this.sessionStore, todos: this.todoStore, teammate: this.teammate, receipts: this.operationReceipts, authMode: config.auth.mode, policy: this.policy, stream: this.eventStream });
     this.todo = new GatewayTodoService({ store: this.todoStore, sessions: this.sessionStore, authMode: config.auth.mode });
@@ -451,7 +512,7 @@ export class GatewayRuntime {
     this.phase = "closed";
     for (const resolve of this.drainWaiters) resolve();
     this.drainWaiters.clear();
-    await Promise.allSettled([this.job.shutdown(), this.teammate.shutdown(), this.browser.shutdown()]);
+    await Promise.allSettled([this.job.shutdown(), this.teammate.shutdown(), this.browser.shutdown(), this.fabricMcpEndpoint?.close()]);
   }
 }
 

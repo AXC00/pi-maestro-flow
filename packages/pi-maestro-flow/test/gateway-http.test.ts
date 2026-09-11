@@ -5,6 +5,7 @@ import { join } from "node:path";
 import test from "node:test";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
+import type { EndpointRecord, EndpointRouteHandle } from "pi-maestro-fabric-core/v1";
 import { startGatewayHttpServer } from "../src/gateway/http-server.ts";
 import { GatewayRuntime } from "../src/gateway/runtime.ts";
 import { createGatewayPrincipal } from "../src/gateway/principal.ts";
@@ -24,6 +25,58 @@ test("rejects open authentication on a non-loopback HTTP listener", async (t) =>
   await assert.rejects(() => startGatewayHttpServer(runtime, { host: "0.0.0.0", port: 0 }), /open is allowed only on loopback/);
   runtime.config.server.disableLocalhostProtection = true;
   await assert.rejects(() => startGatewayHttpServer(runtime, { host: "127.0.0.1", port: 0 }), /open is allowed only on loopback/);
+});
+
+test("non-HTTP Fabric dispatcher inputs preserve the legacy plaintext MCP server", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "gateway-http-legacy-fabric-"));
+  const config = createTestGatewayConfig(root, { mode: "bearer", token: "test-bearer-token" });
+  config.transport.http.enabled = true;
+  const endpoint: EndpointRecord = {
+    endpointId: "non-http-agent", deviceId: "device-1", connectorId: "connector-1", scope: { kind: "device" },
+    generation: 1, contractHash: "e".repeat(64), status: "online", revision: 1, kind: "agent", agentName: "non-http",
+    protocolVersion: "1", durableDeduplication: false,
+  };
+  const route: EndpointRouteHandle = {
+    routeId: "non-http-route", connectionId: "connection-1", endpointId: endpoint.endpointId,
+    connectionGeneration: 1, endpointGeneration: 1, issuedAt: Date.now() - 1, expiresAt: Date.now() + 60_000, state: "open", revision: 1,
+  };
+  const runtime = await GatewayRuntime.create({
+    config,
+    cwd: root,
+    fabricRouteAuthority: { validateRoute: () => ({ ...route }) },
+    fabricEndpointDirectory: { getEndpoint: () => ({ ...endpoint }) },
+  });
+  assert.equal(runtime.fabricEndpointDispatcher !== undefined, true);
+  assert.equal(runtime.fabricHttpChannelServer, undefined);
+  const server = await startGatewayHttpServer(runtime, { host: "127.0.0.1", port: 0 });
+  t.after(async () => { await server.close(); await runtime.close(); await rm(root, { recursive: true, force: true }); });
+  const response = await fetch(new URL("/healthz", server.url));
+  assert.equal(response.status, 200);
+  assert.equal(server.secure, false);
+});
+
+test("explicit Fabric HTTP enablement still requires native TLS", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "gateway-http-fabric-tls-"));
+  const config = createTestGatewayConfig(root, { mode: "bearer", token: "test-bearer-token" });
+  config.transport.http.enabled = true;
+  const endpoint: EndpointRecord = {
+    endpointId: "http-agent", deviceId: "device-1", connectorId: "connector-1", scope: { kind: "device" },
+    generation: 1, contractHash: "f".repeat(64), status: "online", revision: 1, kind: "agent", agentName: "http",
+    protocolVersion: "1", durableDeduplication: false,
+  };
+  const route: EndpointRouteHandle = {
+    routeId: "http-route", connectionId: "connection-1", endpointId: endpoint.endpointId,
+    connectionGeneration: 1, endpointGeneration: 1, issuedAt: Date.now() - 1, expiresAt: Date.now() + 60_000, state: "open", revision: 1,
+  };
+  const runtime = await GatewayRuntime.create({
+    config,
+    cwd: root,
+    fabricHttpChannelEnabled: true,
+    fabricRouteAuthority: { validateRoute: () => ({ ...route }) },
+    fabricEndpointDirectory: { getEndpoint: () => ({ ...endpoint }) },
+  });
+  t.after(async () => { await runtime.close(); await rm(root, { recursive: true, force: true }); });
+  await assert.rejects(() => startGatewayHttpServer(runtime, { host: "127.0.0.1", port: 0 }), /Fabric HTTP routes require native HTTPS/);
 });
 
 test("rejects authenticated plaintext on a non-loopback listener", async (t) => {

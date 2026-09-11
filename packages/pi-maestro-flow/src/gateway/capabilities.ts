@@ -42,3 +42,17 @@ export function principalHasGatewayAction(
 export function isPrimaryGatewayScope(scope: string): boolean {
   return scope === "*" || scope === "gateway" || scope === "gateway.*";
 }
+
+export const FABRIC_DATA_SCOPE = "fabric.data" as const;
+export type FabricDataAction = "exchange" | "events";
+
+/**
+ * Fabric data-plane grants are intentionally disjoint from legacy Gateway tool
+ * grants. Open auth, `gateway`, `gateway.*`, and an empty authenticated scope
+ * never imply paired-Gateway route access.
+ */
+export function principalHasFabricDataPlane(principal: GatewayPrincipal, action: FabricDataAction): boolean {
+  if (principal.authenticated !== true) return false;
+  const requested = `${FABRIC_DATA_SCOPE}.${action}`;
+  return principal.scopes.some((scope) => scope === FABRIC_DATA_SCOPE || scope === `${FABRIC_DATA_SCOPE}.*` || scope === requested);
+}

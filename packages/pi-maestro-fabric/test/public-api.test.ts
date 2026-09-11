@@ -16,6 +16,8 @@ const publicFiles = [
   "presence-manager.ts",
   "invocation-manager.ts",
   "fixed-ssh-channel.ts",
+  "stream-channel.ts",
+  "channel-router.ts",
 ];
 const runtimeFiles = [...publicFiles, "directory-authority.ts"];
 

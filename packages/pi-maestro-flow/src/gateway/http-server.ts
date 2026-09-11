@@ -7,6 +7,8 @@ import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/
 import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
 import type { Server as McpServer } from "@modelcontextprotocol/sdk/server/index.js";
 import { GatewayHttpAuth, validateGatewayHttpSecurity } from "./auth.ts";
+import { principalHasFabricDataPlane } from "./capabilities.ts";
+import { FABRIC_HTTPS_EVENTS_PATH, FABRIC_HTTPS_EXCHANGE_PATH } from "./fabric/https-transport.ts";
 import { principalKey } from "./principal.ts";
 import type { GatewayPrincipal } from "./contracts.ts";
 import type { GatewayRuntime } from "./runtime.ts";
@@ -43,6 +45,9 @@ export async function startGatewayHttpServer(runtime: GatewayRuntime, options: G
   const sessions = new Map<string, HttpSession>();
   let ready = true;
   const tls = runtime.config.transport.http.tls;
+  if (runtime.fabricHttpChannelServer !== undefined && tls?.enabled !== true) {
+    throw new Error("Gateway Fabric HTTP routes require native HTTPS");
+  }
   const listener = (request: IncomingMessage, response: ServerResponse): void => {
     void handleRequest(request, response).catch((error) => {
       if (!response.headersSent) {
@@ -63,6 +68,39 @@ export async function startGatewayHttpServer(runtime: GatewayRuntime, options: G
       const body = JSON.stringify({ status: healthy ? "ok" : "shutting_down" });
       response.writeHead(healthy ? 200 : 503, { "content-type": "application/json", "cache-control": "no-store", "content-length": Buffer.byteLength(body) });
       response.end(body);
+      return;
+    }
+    const fabricServer = runtime.fabricHttpChannelServer;
+    if (fabricServer?.handles(url.pathname)) {
+      if (request.method === "OPTIONS") {
+        applyCors(runtime, request, response);
+        response.writeHead(204, {
+          "access-control-allow-methods": url.pathname === FABRIC_HTTPS_EXCHANGE_PATH ? "POST, OPTIONS" : "GET, OPTIONS",
+          "access-control-allow-headers": "authorization, content-type",
+        });
+        response.end();
+        return;
+      }
+      if (!originAllowed(runtime, request)) {
+        fabricAuthError(response, 403, "Origin is not allowed");
+        return;
+      }
+      const authenticated = await auth.authenticate(request, `${baseUrl}/.well-known/oauth-protected-resource${path}`);
+      if (!authenticated.principal) {
+        response.writeHead(authenticated.status ?? 401, {
+          "content-type": "application/json",
+          ...(authenticated.wwwAuthenticate ? { "www-authenticate": authenticated.wwwAuthenticate } : {}),
+        });
+        response.end(JSON.stringify({ error: { code: "unauthorized", message: authenticated.message ?? "Unauthorized" } }));
+        return;
+      }
+      const action = url.pathname === FABRIC_HTTPS_EVENTS_PATH ? "events" : "exchange";
+      if (!principalHasFabricDataPlane(authenticated.principal, action)) {
+        fabricAuthError(response, 403, `Fabric principal lacks required capability: fabric.data.${action}`);
+        return;
+      }
+      applyCors(runtime, request, response);
+      await fabricServer.handle(request, response, url, authenticated.principal);
       return;
     }
     if (await auth.handleOAuthRoute(request, response, url, baseUrl, path)) return;
@@ -246,6 +284,12 @@ async function readJsonBody(request: IncomingMessage, maximum: number): Promise<
 
 class HttpBodyError extends Error {
   constructor(readonly status: number, message: string) { super(message); }
+}
+
+function fabricAuthError(response: ServerResponse, status: number, message: string): void {
+  const body = JSON.stringify({ error: { code: status === 401 ? "unauthorized" : "capability_denied", message } });
+  response.writeHead(status, { "content-type": "application/json", "cache-control": "no-store", "content-length": Buffer.byteLength(body) });
+  response.end(body);
 }
 
 function jsonRpcError(response: ServerResponse, status: number, code: number, message: string): void {

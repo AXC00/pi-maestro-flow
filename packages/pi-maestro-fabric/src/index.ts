@@ -6,3 +6,5 @@ export * from "./store-coordinator.ts";
 export * from "./presence-manager.ts";
 export * from "./invocation-manager.ts";
 export * from "./fixed-ssh-channel.ts";
+export * from "./stream-channel.ts";
+export * from "./channel-router.ts";

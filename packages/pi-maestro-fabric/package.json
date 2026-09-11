@@ -20,7 +20,9 @@
     "./store-coordinator": "./src/store-coordinator.ts",
     "./presence-manager": "./src/presence-manager.ts",
     "./invocation-manager": "./src/invocation-manager.ts",
-    "./fixed-ssh-channel": "./src/fixed-ssh-channel.ts"
+    "./fixed-ssh-channel": "./src/fixed-ssh-channel.ts",
+    "./stream-channel": "./src/stream-channel.ts",
+    "./channel-router": "./src/channel-router.ts"
   },
   "files": [
     "src/**/*.ts"
