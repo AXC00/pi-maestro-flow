@@ -49,6 +49,65 @@ function isKittyImageLine(line: string | undefined): boolean {
 	return typeof line === "string" && line.includes("\x1b_G");
 }
 
+const ANSI_ESCAPE = /\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))/g;
+
+function plainLine(line: string | undefined): string {
+	return line?.replace(ANSI_ESCAPE, "").trim() ?? "";
+}
+
+function uniqueLinePositions(lines: readonly string[]): Map<string, number> {
+	const positions = new Map<string, number>();
+	const duplicates = new Set<string>();
+	for (let index = 0; index < lines.length; index += 1) {
+		const key = plainLine(lines[index]);
+		if (!key || duplicates.has(key)) continue;
+		if (positions.has(key)) {
+			positions.delete(key);
+			duplicates.add(key);
+		} else {
+			positions.set(key, index);
+		}
+	}
+	return positions;
+}
+
+function mutableLineIdentity(line: string | undefined): string {
+	return plainLine(line).toLowerCase().replace(/\d+(?:\.\d+)?/g, "#");
+}
+
+function mutableRowsCrossViewportBoundary(
+	previousLines: readonly string[],
+	nextLines: readonly string[],
+	hiddenEnd: number,
+): boolean {
+	if (hiddenEnd <= 0 || hiddenEnd >= previousLines.length || hiddenEnd >= nextLines.length) return false;
+	const previousHidden = mutableLineIdentity(previousLines[hiddenEnd - 1]);
+	const previousVisible = mutableLineIdentity(previousLines[hiddenEnd]);
+	const nextHidden = mutableLineIdentity(nextLines[hiddenEnd - 1]);
+	const nextVisible = mutableLineIdentity(nextLines[hiddenEnd]);
+	return previousHidden !== ""
+		&& previousVisible !== ""
+		&& previousHidden !== previousVisible
+		&& previousHidden === nextVisible
+		&& previousVisible === nextHidden;
+}
+
+function crossesViewportBoundary(
+	previousLines: readonly string[],
+	nextLines: readonly string[],
+	hiddenEnd: number,
+): boolean {
+	if (mutableRowsCrossViewportBoundary(previousLines, nextLines, hiddenEnd)) return true;
+	const previousPositions = uniqueLinePositions(previousLines);
+	const nextPositions = uniqueLinePositions(nextLines);
+	for (const [key, previousIndex] of previousPositions) {
+		const nextIndex = nextPositions.get(key);
+		if (nextIndex === undefined) continue;
+		if ((previousIndex < hiddenEnd) !== (nextIndex < hiddenEnd)) return true;
+	}
+	return false;
+}
+
 function prototypeMethodSlot(target: object): ApplyLineResetsSlot | undefined {
 	const seen = new WeakSet<object>();
 	let owner = Object.getPrototypeOf(target) as object | null;
@@ -135,7 +194,10 @@ export function attachViewportStability(tui: TUI): ViewportStabilityPatch {
 				const hiddenEnd = Math.min(previousLines.length, Math.trunc(viewportTop));
 				const hiddenHasKittyImage = previousLines.slice(0, hiddenEnd).some(isKittyImageLine)
 					|| nextLines.slice(0, hiddenEnd).some(isKittyImageLine);
-				if (!hiddenHasKittyImage) {
+				// Equal total height does not prove row identity. If a stable row crossed
+				// the viewport boundary, freezing by index would duplicate it across the
+				// hidden and visible regions; retain pi-tui's canonical full redraw instead.
+				if (!hiddenHasKittyImage && !crossesViewportBoundary(previousLines, nextLines, hiddenEnd)) {
 					for (let index = 0; index < hiddenEnd; index += 1) {
 						const previous = previousLines[index];
 						if (previous !== undefined) nextLines[index] = previous;

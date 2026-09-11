@@ -59,6 +59,12 @@ function renderHarness(initialLines: string[]) {
 	};
 }
 
+const ANSI_ESCAPE = /\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))/g;
+
+function plainLines(lines: readonly string[]): string[] {
+	return lines.map((line) => line.replace(ANSI_ESCAPE, ""));
+}
+
 test("equal-height hidden Agent Bar changes stay frozen without replaying scrollback", () => {
 	const h = renderHarness(["▸ @main  @builder · teammate •2", "one", "two", "three", "four"]);
 	const patch = attachViewportStability(h.tui);
@@ -91,6 +97,38 @@ test("a hidden Agent Bar change does not block a visible differential update", (
 	assert.equal(h.terminal.writes.some((value) => value.includes("FOUR")), true);
 	assert.ok(h.internals.previousLines[0]?.startsWith("▸ @main  @builder · teammate •2\x1b[0m"));
 	assert.ok(h.internals.previousLines[4]?.startsWith("FOUR\x1b[0m"));
+});
+
+test("same-height rows crossing the viewport boundary retain the native canonical redraw", () => {
+	const initial = ["agent one", "agent two", "todo", "editor", "footer"];
+	const shifted = ["agent new", "agent one", "agent two", "editor", "footer"];
+	const h = renderHarness(initial);
+	attachViewportStability(h.tui);
+	h.render();
+	assert.equal(h.internals.previousViewportTop, 2);
+	h.terminal.writes.length = 0;
+
+	h.setLines(shifted);
+	h.render();
+	assert.equal(h.tui.fullRedraws, 2, "a stable row crossing into the viewport requires canonical reflow");
+	assert.equal(h.terminal.writes.some((value) => value.includes("\x1b[3J")), true);
+	assert.deepEqual(plainLines(h.internals.previousLines), shifted);
+});
+
+test("mutable rows interleaved across the viewport boundary retain the native canonical redraw", () => {
+	const initial = ["history", "Todo 1/2", "@main · 9s", "editor", "footer"];
+	const interleaved = ["history", "@main · 10s", "Todo 2/2", "editor", "footer"];
+	const h = renderHarness(initial);
+	attachViewportStability(h.tui);
+	h.render();
+	assert.equal(h.internals.previousViewportTop, 2);
+	h.terminal.writes.length = 0;
+
+	h.setLines(interleaved);
+	h.render();
+	assert.equal(h.tui.fullRedraws, 2, "an ambiguous boundary change must not combine old and new rows");
+	assert.equal(h.terminal.writes.some((value) => value.includes("\x1b[3J")), true);
+	assert.deepEqual(plainLines(h.internals.previousLines), interleaved);
 });
 
 test("changes at the first visible line remain live", () => {
