@@ -1,0 +1,40 @@
+{
+  "name": "pi-maestro-fabric-core",
+  "version": "0.1.0",
+  "description": "Versioned pure contracts and state validation for the Pi Maestro multi-device Fabric.",
+  "type": "module",
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "scripts": {
+    "test": "node --experimental-transform-types --test \"test/*.test.ts\"",
+    "typecheck": "tsc --noEmit -p tsconfig.json"
+  },
+  "main": "./src/index.ts",
+  "exports": {
+    ".": "./src/index.ts",
+    "./v1": "./src/public/v1/index.ts",
+    "./v1/common": "./src/public/v1/common.ts",
+    "./v1/device": "./src/public/v1/device.ts",
+    "./v1/connection": "./src/public/v1/connection.ts",
+    "./v1/workspace": "./src/public/v1/workspace.ts",
+    "./v1/endpoint": "./src/public/v1/endpoint.ts",
+    "./v1/capability": "./src/public/v1/capability.ts",
+    "./v1/route": "./src/public/v1/route.ts",
+    "./v1/invocation": "./src/public/v1/invocation.ts",
+    "./v1/protocol": "./src/public/v1/protocol.ts",
+    "./v1/transport": "./src/public/v1/transport.ts",
+    "./v1/validation": "./src/public/v1/validation.ts",
+    "./v1/projection": "./src/public/v1/projection.ts"
+  },
+  "files": [
+    "src/**/*.ts"
+  ],
+  "keywords": [
+    "pi",
+    "maestro",
+    "fabric",
+    "multi-device"
+  ],
+  "license": "ISC"
+}
