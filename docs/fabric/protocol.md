@@ -1,6 +1,6 @@
 # Multi-Device Fabric Protocol v1
 
-> Status: v1 semantic and framing baseline. It defines contracts only; WSS, authentication, signing, and storage implementations are deferred.
+> Status: v1 semantics and public framing contracts frozen. WSS, authentication, signing, storage, MCP, and teammate runtime implementations remain outside Fabric Core.
 
 ## 1. Protocol families
 
@@ -72,14 +72,17 @@ interface FabricProtocolLimits {
 | `heartbeat_ack` | Hub | connection + generation + correlation | sequence, lease expiry | ready |
 | `workspace_bind` | either request/response | connection + generation + correlation | Device/Workspace IDs, generations, policy digest, expiry/result | ready |
 | `route_open` | either request/response | connection + generation + correlation | Endpoint, binding when scoped, generations, operation class, expiry/result | ready/bound |
+| `control_request` / `control_response` | caller / Hub | correlation + deadline | `FabricControlRequestV1` / safe bounded result | admitted state required by action |
+| `stream` | either | connection + generation + operation | `FabricStreamFrameV1`, route, stream and sequence identity | route open |
 | `invoke` | either request/event | connection + generation + operation + deadline | route identity and protocol-specific request/event | route open |
+| `artifact` | source / caller | connection + generation + operation | descriptor or bounded base64 chunk | route open |
 | `cancel` | either request/ack | connection + generation + operation + correlation | route ID, reason or acknowledgement state | operation known or unknown |
 | `receipt` | either | connection + generation + operation | receipt revision, state, endpoint receipt/result reference | operation known |
 | `drain` | either | connection + generation | reason, deadline | connected/ready |
 | `close` | either | connection + generation | reason | any admitted state |
 | `error` | either | correlation when available | stable code, safe message, optional path/retryable | any |
 
-Unknown optional fields in `fabric.v1` may be ignored. Missing required fields are rejected. Legacy Gateway/SSH/MCP envelopes remain unchanged at their existing entry points; Fabric identity fields opt a request into strict Fabric validation and cannot be silently ignored.
+Unknown optional fields in `fabric.v1` may be ignored. Missing required fields are rejected. Each nested contract rejects an unknown version discriminant. Legacy Gateway/SSH/MCP envelopes remain unchanged at their existing entry points; Fabric identity fields opt a request into strict Fabric validation and cannot be silently ignored.
 
 ## 4. Pairing and handshake
 

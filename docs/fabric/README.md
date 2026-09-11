@@ -1,8 +1,6 @@
 # Pi Maestro Multi-Device Fabric
 
-> Status: initial architecture draft, revised after an Astra architecture review. This directory defines a target model for incremental refinement; it is not an implementation claim.
->
-> Review result: **REVISE incorporated**. The first review tightened legacy connection entry points, outer Fabric versus inner MCP leases, Hub/local workspace identity, teammate recovery authority, MCP replay rules, the three task authorities, fixed SSH protocol boundaries, and dependency notation.
+> Status: Phase 3-6 additive v1 public contracts are frozen in `pi-maestro-fabric-core`. Runtime stores, handlers, network transports, MCP clients, and teammate execution remain intentionally unimplemented here.
 
 ## Purpose
 
@@ -58,14 +56,11 @@ No remote `teammate` dispatch or MCP call may implicitly connect, change devices
 - [Protocol v1](./protocol.md) — WSS framing, handshake, heartbeat, generation fencing, route admission, execution, cancellation, and recovery.
 - [Persistence v1](./persistence.md) — registry, lease, presence, binding, route, mount, receipt, event, and atomicity boundaries.
 - [Package boundaries](./package-boundaries.md) — isolated packages, dependency direction, compatibility adapters, and phased extraction.
+- [Security v1](./security.md) — pairing, route tickets, local reauthorization, credential rotation, and trust boundaries.
+- [Edge v1](./edge.md) — allow-listed Edge-managed devices, direct routes, relay fallback, and stream channels.
+- [MCP federation v1](./mcp-federation.md) — route-bound per-session mounts, metadata, replay, and artifacts.
+- [Teammate placement v1](./teammate-placement.md) — backend adaptation, qualified task references, recovery, and completion authority.
 - [Current Gateway tunnel configuration](../gateway-tunnel-configuration.md) — existing Cloudflare, OpenAI, and Managed OpenSSH ingress setup; not a Fabric transport contract.
-
-Future documents should be added only when their contracts stabilize:
-
-- `security.md` — pairing, route tickets, local reauthorization, and credential rotation.
-- `edge.md` — LAN discovery, Edge-managed devices, direct routes, and relay fallback.
-- `mcp-federation.md` — remote MCP mounting, metadata cache, content conversion, and artifacts.
-- `teammate-placement.md` — remote placement, task ownership, completion, and monitoring.
 
 ## Existing capabilities to reuse
 

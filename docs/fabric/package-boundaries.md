@@ -1,6 +1,6 @@
 # Multi-Device Fabric Package Boundaries
 
-> Status: Phase 2 connection kernel implemented. `pi-maestro-fabric-core` contains the v1 pure contract baseline and `pi-maestro-fabric` now provides the host-independent in-memory connection kernel; Flow integration and Phase 3+ work remain future work.
+> Status: Phase 2 connection kernel implemented and Phase 3-6 additive public contracts frozen. Runtime Flow, MCP, teammate, WSS, Edge, and artifact integrations remain later implementation tasks.
 
 ## 1. Why isolate the feature
 
@@ -42,9 +42,18 @@ pi-maestro-fabric-core/v1/connection
 pi-maestro-fabric-core/v1/workspace
 pi-maestro-fabric-core/v1/endpoint
 pi-maestro-fabric-core/v1/capability
+pi-maestro-fabric-core/v1/control
+pi-maestro-fabric-core/v1/store
+pi-maestro-fabric-core/v1/mount
+pi-maestro-fabric-core/v1/placement
+pi-maestro-fabric-core/v1/artifact
+pi-maestro-fabric-core/v1/security
 pi-maestro-fabric-core/v1/route
 pi-maestro-fabric-core/v1/invocation
+pi-maestro-fabric-core/v1/protocol
 pi-maestro-fabric-core/v1/transport
+pi-maestro-fabric-core/v1/validation
+pi-maestro-fabric-core/v1/projection
 ```
 
 This follows the existing `pi-maestro-backend-core` and `pi-maestro-settings-core` pattern: versioned public types are stable while implementations evolve independently.
@@ -226,7 +235,7 @@ No package may write another package's private state files directly.
 - finalize vocabulary and invariants;
 - inventory existing Gateway-control, teammate-runtime, SSH, and MCP data-channel contracts in a capability matrix;
 - define workspace ID mapping, three task authorities, and per-entry compatibility mappings;
-- resolve open decisions before creating runtime code.
+- lock authority and compatibility decisions before creating runtime code.
 
 ### Phase 1 — `pi-maestro-fabric-core` (implemented baseline)
 
@@ -242,8 +251,8 @@ No package may write another package's private state files directly.
 - revision-fenced Device/Connector authority and generation-high-water Workspace/Endpoint read models;
 - separate generic adapters that preserve the actual host-owned Gateway-control and teammate-runtime fixed SSH handles;
 - do not claim a generic remote MCP data path until its framing, identity, and route fencing are verified;
-- freeze only Device/Connection/Workspace/Endpoint/Route MVP contracts; Artifact and Edge contracts remain provisional;
-- no WSS and no Edge yet.
+- Device/Connection/Workspace/Endpoint/Route runtime behavior remains the implemented Phase 2 boundary;
+- no WSS and no Edge runtime yet.
 
 ### Phase 3 — Flow control surfaces
 
@@ -303,14 +312,14 @@ Each package owns tests at its boundary:
 
 Passing evidence is reused across package gates unless relevant code, config, dependencies, generated declarations, or fixtures changed.
 
-## 10. Decisions still deferred
+## 10. Locked boundaries for subsequent implementation
 
-- Final package names and whether Fabric Runtime ships independently in the first implementation release.
-- Storage implementation for a VPS Hub deployment.
-- Wire framing and WSS protocol version.
-- Route ticket signature and direct-route transport security.
-- Per-session versus shared MCP mount lifetime.
-- Artifact caching policy.
-- Multi-user/tenant authorization; the initial target remains one owner with multiple devices.
+- Package names and dependency direction are fixed: pure public contracts live in `pi-maestro-fabric-core`; runtime adapters must not introduce reverse imports.
+- Store technology is intentionally substitutable, but all adapters implement the five store authorities and canonical `shapeVersion: 1` read-boundary migration contract.
+- Fabric wire envelopes remain `fabric.v1`; control, stream, mount, placement, artifact, store, and ticket shapes carry their own additive v1 discriminants.
+- Direct routes require TLS and an opaque signed route-ticket proof. Cryptographic algorithms and key IO belong to host security adapters.
+- Mount lifetime is one Pi session plus one route; reconnect or generation change revokes it.
+- Artifacts are source-local unless admission explicitly selects `hub-cache`; fallback never changes this silently.
+- V1 authorization targets one owner across multiple devices. Multi-tenant semantics require a future protocol version rather than optional ambiguous fields.
 
-The next refinement should resolve the protocol and persistence decisions, not start by moving existing SSH or teammate files.
+Later tasks implement these contracts; they do not reopen their authority, lifetime, replay, or trust decisions.

@@ -1,4 +1,5 @@
 import type { JsonValue, OperationId } from "./common.ts";
+import type { QualifiedTaskReferenceV1, TeammatePlacementV1 } from "./placement.ts";
 import type { EndpointRouteHandle } from "./route.ts";
 
 export const FABRIC_REPLAY_CLASSES = ["readonly", "durable-dedup", "non-replayable"] as const;
@@ -9,6 +10,9 @@ export interface AgentPlacementRequest {
   attemptId: string;
   route: EndpointRouteHandle;
   deadlineAt: number;
+  /** Additive Phase 5 authority and recovery metadata. */
+  task?: QualifiedTaskReferenceV1;
+  placement?: TeammatePlacementV1;
 }
 
 export interface McpInvocationRequest {

@@ -1,6 +1,6 @@
 # Multi-Device Fabric Architecture
 
-> Status: initial target architecture. Names and wire schemas remain provisional until the contract package is introduced.
+> Status: additive Fabric v1 contract architecture. Phase 3-6 public shapes are frozen in `pi-maestro-fabric-core`; runtime implementations remain phase-specific.
 
 ## 1. Architectural layers
 
@@ -362,14 +362,14 @@ The hub first establishes the logical connection and issues a short-lived, subje
 15. Legacy SSH/MCP entry points may keep legacy lazy connection only in their old schema; any Fabric device/workspace/route field opts into strict connection-first validation, and unsupported consumers fail closed.
 16. Pi Todo, Gateway Todo, and Board remain three distinct authorities; links carry qualified identity and never imply shared ownership.
 
-## 9. Open decisions
+## 9. Locked v1 decisions
 
-- Whether the first WSS Connector terminates in the existing Gateway daemon or a dedicated Fabric service.
-- Storage implementation for Fabric-owned presence evidence; `persistence.md` fixes the authority semantics and permits a Gateway journal adapter.
-- Whether a later version should allow cross-session MCP mount sharing; v1 fixes lifetime to one Pi session and route.
-- Artifact MVP: online source streaming only versus optional Hub cache.
-- Edge service discovery: explicit allow-listed configuration first; automatic LAN discovery is deferred.
-- Route-ticket signing format and whether direct routes require mutual TLS.
-- How a central Board task references device-local Todo snapshots without merging authorities.
+- WSS termination is a host adapter concern. Core exposes versioned envelopes and channels and does not select Gateway-daemon versus dedicated-service deployment.
+- The five logical store authorities are `registry`, `lease`, `presence`, `invocation`, and `event`; implementations are replaceable. Persisted shapes write `shapeVersion: 1` and legacy shapes migrate only at the read boundary.
+- MCP mounts are scoped to exactly one Pi session and one route. Cross-session sharing requires a later contract version.
+- Artifact bytes remain source-local by default. `hub-cache` is an explicit descriptor value, never an implicit fallback.
+- Edge discovery is explicit allow-list configuration in v1. Automatic LAN discovery is outside v1.
+- LAN direct paths require TLS plus a short-lived signed route ticket. The signature proof is opaque to Core and supplied by a registered security adapter; no raw key material enters public contracts.
+- Cross-authority tasks use `(authority, workspaceId, taskId)` and optional bounded read-only snapshots. Equal-looking IDs never merge Pi Todo, Gateway Todo, or Board ownership.
 
-These decisions should be resolved in protocol-specific documents before implementation.
+The protocol-specific details are fixed by `security.md`, `edge.md`, `mcp-federation.md`, and `teammate-placement.md`; runtime implementation may vary only behind these boundaries.

@@ -8,6 +8,7 @@ import {
   projectEndpoint,
   projectFabricSnapshot,
   projectWorkspace,
+  sanitizeFabricProjectionText,
   type AgentRuntimeEndpoint,
   type CapabilityBinding,
   type ConnectionLease,
@@ -113,6 +114,11 @@ test("capability projection allowlists fields and deeply clones validated JSON",
   assert.notEqual(projection.inputSchema, input.inputSchema);
   (projection.inputSchema as { properties: { value: { type: string } } }).properties.value.type = "number";
   assert.equal((input.inputSchema as { properties: { value: { type: string } } }).properties.value.type, "string");
+});
+
+test("display projections replace line breaks and strip remaining C0 controls", () => {
+  assert.equal(sanitizeFabricProjectionText("one\r\ntwo\u001b[31m\t"), "one two[31m");
+  assert.equal(projectConnector({ ...connector, label: "Office\nedge\u0000" }).label, "Office edge");
 });
 
 test("snapshot projection preserves source records", () => {

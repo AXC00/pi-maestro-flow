@@ -33,7 +33,13 @@ EventStore
   append-only bounded events and consumer cursors
 ```
 
-The first implementation may co-locate stores in one atomic JSON document, but APIs must preserve these authority boundaries.
+The first implementation may co-locate stores in one atomic JSON document, but APIs must preserve these authority boundaries. `FabricStoreKind` freezes their API names as `registry`, `lease`, `presence`, `invocation`, and `event`. Every mutation is expressed as a `FabricStoreTransactionV1`; safe redacted changes use `FabricStoreEventV1`, and consumers checkpoint with `FabricStoreCursorV1`.
+
+### 2.1 Persisted shape migration
+
+Canonical persisted state writes `shapeVersion: 1`, `storeKind`, `revision`, `events`, and `cursors`. `migrateFabricPersistedStoreState` is the read boundary: it accepts the Phase 0-2 legacy single `cursor` field, validates every nested event/cursor, and returns a fresh canonical v1 shape. Writers never emit the legacy form.
+
+Update semantics distinguish omitted, empty, and invalid values. An omitted legacy cursor migrates to `cursors: []`; an explicitly present cursor is preserved as the single array element. V1 requires the `cursors` array even when empty. Unknown `shapeVersion`, missing required fields, store-kind disagreement, invalid revision/sequence, and out-of-bound JSON fail closed. No adapter may repair malformed state after it has crossed the read boundary.
 
 ## 3. Registry records
 
