@@ -573,6 +573,36 @@ test("window rendering strips terminal control sequences from remote data", asyn
   assert.doesNotMatch(rendered, /\x1b\[2J/);
 });
 
+test("Gateway renders Fabric health separately and revokes the Cockpit projection on close", async () => {
+  const { GatewayOverlay } = await import("../src/tui/gateway-overlay.ts");
+  const projections: unknown[] = [];
+  const overlay = new GatewayOverlay({
+    cwd: "D:/fabric-view",
+    requestRender: () => undefined,
+    initialRefresh: false,
+    close: () => undefined,
+    onFabricProjection: (snapshot) => projections.push(snapshot),
+  });
+  overlay["snapshot"] = {
+    refreshing: false, endpoint: "online", workspaces: [], cwdRegistered: false, thread: [], mcpServers: [], windows: [],
+    fabric: {
+      version: 1, sourceId: "source-1", revision: 3, capturedAt: 10, truncated: false, itemCount: 3,
+      cursors: [{ handle: "fabric:registry", storeKind: "registry", cursor: 4 }],
+      connectors: [{ kind: "connector", connectorId: "connector-1", label: "Connector", transport: "direct-https", health: "online", enabled: true, revision: 1 }],
+      devices: [{ kind: "device", deviceId: "device-1", connectorId: "connector-1", label: "Device", health: "online", enabled: true, revision: 1 }],
+      endpoints: [{ kind: "endpoint", endpointId: "mcp-1", deviceId: "device-1", connectorId: "connector-1", endpointKind: "mcp", label: "Files", health: "online", status: "online", generation: 1, revision: 1 }],
+    },
+  } satisfies GatewaySnapshot;
+
+  const rendered = overlay.render(100).join("\n");
+  assert.match(rendered, /Fabric · revision 3 · 3 items/);
+  assert.match(rendered, /Connectors 1 · online 1/);
+  assert.match(rendered, /Devices 1 · online 1/);
+  assert.match(rendered, /Endpoints 1 · agent 0 · MCP 1 · online 1/);
+  overlay.markClosed();
+  assert.deepEqual(projections, [undefined]);
+});
+
 test("Gateway install prompt covers missing and verified built-in binaries", async () => {
   const { GatewayOverlay } = await import("../src/tui/gateway-overlay.ts");
   const overlay = new GatewayOverlay({

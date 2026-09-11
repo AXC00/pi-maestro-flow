@@ -1,6 +1,7 @@
 /** Workspace-scoped Board authority for work intake, claims, and collaboration bindings. */
 import { createHash, randomUUID } from "node:crypto";
 import { mkdir } from "node:fs/promises";
+import type { QualifiedTaskReferenceV1 } from "pi-maestro-fabric-core/v1";
 import { createRequire } from "node:module";
 import { dirname } from "node:path";
 import {
@@ -92,6 +93,7 @@ export interface CreateBoardTaskInput {
   priority?: BoardTaskV1["priority"];
   labels?: string[];
   dependencyIds?: string[];
+  taskReferences?: QualifiedTaskReferenceV1[];
   completionPolicy?: Partial<BoardCompletionPolicyV1>;
 }
 
@@ -102,6 +104,7 @@ export interface UpdateBoardTaskInput {
   priority?: BoardTaskV1["priority"];
   labels?: string[];
   dependencyIds?: string[];
+  taskReferences?: QualifiedTaskReferenceV1[];
   completionPolicy?: BoardCompletionPolicyV1;
 }
 
@@ -260,6 +263,7 @@ export class BoardStore {
         priority: input.priority ?? "normal",
         labels: input.labels ?? [],
         dependencyIds: input.dependencyIds ?? [],
+        ...(input.taskReferences === undefined ? {} : { taskReferences: input.taskReferences }),
         createdBy: actor,
         completionPolicy: {
           requireLinkedTodosCompleted: input.completionPolicy?.requireLinkedTodosCompleted ?? true,
@@ -289,6 +293,7 @@ export class BoardStore {
       if (patch.priority !== undefined) nextValue.priority = patch.priority;
       if (patch.labels !== undefined) nextValue.labels = patch.labels;
       if (patch.dependencyIds !== undefined) nextValue.dependencyIds = patch.dependencyIds;
+      if (patch.taskReferences !== undefined) nextValue.taskReferences = patch.taskReferences;
       if (patch.completionPolicy !== undefined) nextValue.completionPolicy = patch.completionPolicy;
       const next = parseBoardTask(nextValue);
       this.replace(context.state, next);

@@ -34,6 +34,8 @@ export * from "./fabric/device-service.ts";
 export * from "./fabric/workspace-service.ts";
 export * from "./fabric/endpoint-service.ts";
 export * from "./fabric/route-service.ts";
+export * from "./fabric/monitor-projection.ts";
+export * from "./fabric/task-reference-service.ts";
 export * from "./fabric/endpoint-dispatcher.ts";
 export * from "./fabric/http-channel-server.ts";
 export * from "./fabric/https-transport.ts";

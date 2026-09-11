@@ -33,6 +33,64 @@ export const EXPERT_LEADER_NAME = "expert-leader";
 // appendEntry customType the todo tool persists after every mutation (tools/todo.ts:145).
 export const TODO_STATE_ENTRY_TYPE = "todo-state";
 
+export type FabricHealth = "online" | "degraded" | "offline" | "disabled" | "unknown";
+export type FabricStoreKind = "registry" | "lease" | "presence" | "invocation" | "event";
+export type FabricEndpointStatus = "unknown" | "online" | "offline" | "disabled";
+
+export interface FabricMonitorCursor {
+	readonly handle: string;
+	readonly storeKind: FabricStoreKind;
+	readonly cursor: number;
+}
+
+export interface FabricMonitorConnector {
+	readonly kind: "connector";
+	readonly connectorId: string;
+	readonly label: string;
+	readonly transport: string;
+	readonly health: FabricHealth;
+	readonly enabled: boolean;
+	readonly revision: number;
+	readonly connectionId?: string;
+	readonly connectionGeneration?: number;
+}
+
+export interface FabricMonitorDevice {
+	readonly kind: "device";
+	readonly deviceId: string;
+	readonly connectorId: string;
+	readonly label: string;
+	readonly health: FabricHealth;
+	readonly enabled: boolean;
+	readonly revision: number;
+}
+
+export interface FabricMonitorEndpoint {
+	readonly kind: "endpoint";
+	readonly endpointId: string;
+	readonly deviceId: string;
+	readonly connectorId: string;
+	readonly endpointKind: "agent" | "mcp";
+	readonly label: string;
+	readonly health: FabricHealth;
+	readonly status: FabricEndpointStatus;
+	readonly generation: number;
+	readonly revision: number;
+}
+
+export interface FabricMonitorSnapshot {
+	readonly version: 1;
+	readonly sourceId: string;
+	readonly revision: number;
+	readonly capturedAt: number;
+	readonly truncated: boolean;
+	readonly itemCount: number;
+	readonly cursors: readonly FabricMonitorCursor[];
+	readonly connectors: readonly FabricMonitorConnector[];
+	readonly devices: readonly FabricMonitorDevice[];
+	readonly endpoints: readonly FabricMonitorEndpoint[];
+}
+
 export type AgentStatus = "pending" | "running" | "retrying" | "sleeping" | "done" | "failed" | "terminated";
 
 export interface AgentLastOutcome {

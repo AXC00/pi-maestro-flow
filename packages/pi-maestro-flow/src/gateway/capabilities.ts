@@ -76,3 +76,14 @@ export function principalHasFabricControlPlane(
     || scope === `${toolScope}.*`
     || scope === requested);
 }
+
+/** Fabric inventory projected through Monitor remains disjoint from legacy Gateway grants. */
+export function principalHasFabricMonitorProjection(principal: GatewayPrincipal): boolean {
+  if (principal.transport === "stdio") return true;
+  if (principal.authenticated !== true) return false;
+  return principal.scopes.some((scope) => scope === FABRIC_CONTROL_SCOPE
+    || scope === `${FABRIC_CONTROL_SCOPE}.*`
+    || scope === `${FABRIC_CONTROL_SCOPE}.monitor`
+    || scope === `${FABRIC_CONTROL_SCOPE}.monitor.*`
+    || scope === `${FABRIC_CONTROL_SCOPE}.monitor.read`);
+}

@@ -4,6 +4,8 @@ import type { GatewayAuthMode } from "../config.ts";
 import type { GatewayPrincipal, GatewayResult } from "../contracts.ts";
 import type { GatewayEventNotification } from "../event-contracts.ts";
 import { GatewayEventStream } from "../event-stream.ts";
+import { principalHasFabricMonitorProjection } from "../capabilities.ts";
+import type { GatewayFabricMonitorProjection } from "../fabric/monitor-projection.ts";
 import { assertSessionScope, type SessionIdentityContext } from "../identity-store.ts";
 import { hashGatewayOperationPayload, type GatewayOperationReceiptV1, type GatewayOperationResultV1, type GatewayReceiptAction } from "../operation-contracts.ts";
 import { GatewayOperationOutcomeUnknownError, GatewayOperationReceiptCapacityError, GatewayOperationReceiptConflictError, GatewayOperationReceiptStore } from "../operation-receipt-store.ts";
@@ -15,8 +17,14 @@ import { GatewayTeammateService, type GatewayTeammateSendMode } from "./teammate
 export type GatewayMonitorAction = "list" | "observe" | "wait" | "message" | "cancel" | "result" | "subscribe" | "unsubscribe";
 export interface GatewayMonitorRequest { action: GatewayMonitorAction; requestId?: string; [key: string]: unknown; }
 export interface GatewayMonitorStreamContext { connectionId: string; write(notification: GatewayEventNotification): Promise<void>; }
-export interface GatewayMonitorServiceOptions { sessions: SessionStore; teammate: GatewayTeammateService; receipts: GatewayOperationReceiptStore; authMode: GatewayAuthMode; stream: GatewayEventStream; }
+export interface GatewayMonitorServiceOptions { sessions: SessionStore; teammate: GatewayTeammateService; receipts: GatewayOperationReceiptStore; authMode: GatewayAuthMode; stream: GatewayEventStream; fabric?: GatewayFabricMonitorProjection; }
+const FABRIC_MONITOR_HANDLE = /^fabric:(registry|lease|presence|invocation|event)$/u;
 function id(value: unknown, label: string): string { if (typeof value !== "string" || !value.trim()) throw new Error(`${label} must be non-empty`); return value.trim(); }
+function isFabricMonitorHandle(value: string): boolean { return FABRIC_MONITOR_HANDLE.test(value); }
+function requireFabricMonitorAccess(principal: GatewayPrincipal): void {
+  if (principalHasFabricMonitorProjection(principal)) return;
+  throw Object.assign(new Error("Gateway principal lacks required capability: fabric.control.monitor.read"), { code: "capability_denied" });
+}
 function cursor(value: unknown): number { if (value === undefined) return 0; const parsed = typeof value === "string" && /^\d+$/.test(value) ? Number(value) : value; if (!Number.isSafeInteger(parsed) || (parsed as number) < 0) throw new Error("cursor must be a non-negative integer"); return parsed as number; }
 function limit(value: unknown): number { if (value === undefined) return 64; if (!Number.isSafeInteger(value) || (value as number) < 1 || (value as number) > 512) throw new Error("limit must be in [1, 512]"); return value as number; }
 
@@ -31,14 +39,39 @@ export class GatewayMonitorService {
       const member = assertSessionScope(state.session, state.members, identity, scope);
       let data: unknown;
       switch (request.action) {
-        case "list": data = { monitors: (await this.options.teammate.monitorList(sessionId)).map((task) => ({ handle: task.id, task })) }; break;
-        case "observe": data = { handle: id(request.handle, "handle"), ...(await this.options.teammate.monitorObserve(sessionId, id(request.handle, "handle"), cursor(request.cursor), limit(request.limit))) }; break;
+        case "list": data = {
+          monitors: (await this.options.teammate.monitorList(sessionId)).map((task) => ({ handle: task.id, task })),
+          ...(this.options.fabric === undefined || !principalHasFabricMonitorProjection(principal) ? {} : { fabric: this.options.fabric.snapshot() }),
+        }; break;
+        case "observe": {
+          const handle = id(request.handle, "handle");
+          if (!isFabricMonitorHandle(handle)) {
+            data = { handle, ...(await this.options.teammate.monitorObserve(sessionId, handle, cursor(request.cursor), limit(request.limit))) };
+            break;
+          }
+          requireFabricMonitorAccess(principal);
+          const page = this.options.stream.journal.page(handle, cursor(request.cursor), limit(request.limit));
+          data = {
+            handle,
+            events: page.events,
+            nextCursor: page.nextCursor,
+            oldestCursor: page.oldestCursor,
+            latestCursor: page.latestCursor,
+            hasMore: page.nextCursor < page.latestCursor,
+            gap: page.gap !== undefined,
+            ...(page.gap === undefined ? {} : { gapDetail: page.gap }),
+          };
+          break;
+        }
         case "wait": data = { handle: id(request.handle, "handle"), ...(await this.options.teammate.monitorWait(sessionId, id(request.handle, "handle"), request.timeoutMs as number | undefined)) }; break;
         case "subscribe": {
           if (!streamContext) throw new Error("Monitor subscriptions require an MCP connection");
           const handle = id(request.handle, "handle");
-          // Fail before installing a listener when the execution is not in the authorized session.
-          await this.options.teammate.monitorObserve(sessionId, handle, cursor(request.cursor), 1);
+          // Fail before installing a listener when the handle is not in the authorized session or Fabric journal.
+          if (isFabricMonitorHandle(handle)) {
+            requireFabricMonitorAccess(principal);
+            this.options.stream.journal.page(handle, cursor(request.cursor), 1);
+          } else await this.options.teammate.monitorObserve(sessionId, handle, cursor(request.cursor), 1);
           data = this.options.stream.subscribe({
             connectionId: streamContext.connectionId,
             workspaceId: state.session.workspaceId,
@@ -88,11 +121,12 @@ export class GatewayMonitorService {
       return gatewayOk(data, { requestId, principalId });
     } catch (error) {
       const denied = error && typeof error === "object" && (error as { name?: string }).name === "SessionAuthorizationError";
+      const declaredCode = error && typeof error === "object" && typeof (error as { code?: unknown }).code === "string" ? String((error as { code: string }).code) : undefined;
       const code = denied ? "session_scope_denied"
-        : error instanceof GatewayOperationReceiptConflictError ? "operation_receipt_conflict"
+        : declaredCode ?? (error instanceof GatewayOperationReceiptConflictError ? "operation_receipt_conflict"
           : error instanceof GatewayOperationReceiptCapacityError ? "operation_receipt_capacity"
             : error instanceof GatewayOperationOutcomeUnknownError ? "operation_outcome_unknown"
-              : "monitor_action_failed";
+              : "monitor_action_failed");
       return gatewayError({ code, message: error instanceof Error ? error.message : String(error) }, { requestId, principalId });
     }
   }

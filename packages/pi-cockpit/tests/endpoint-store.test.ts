@@ -8,11 +8,12 @@ import {
 } from "pi-maestro-teammate/v1/sessions";
 import {
 	EndpointStore,
+	FABRIC_MONITOR_SNAPSHOT_EVENT,
 	LEGACY_MAIN_ENDPOINT_ID,
 	SESSION_HOST_REGISTRY_EVENT,
 	type SessionEventSource,
 } from "../src/endpoint-store.ts";
-import type { AgentRow } from "../src/types.ts";
+import type { AgentRow, FabricMonitorSnapshot } from "../src/types.ts";
 
 function agent(overrides: Partial<AgentRow> = {}): AgentRow {
 	return {
@@ -86,6 +87,51 @@ class Events implements SessionEventSource {
 	emit(event: string, payload: unknown): void {
 		for (const handler of this.handlers.get(event) ?? []) handler(payload);
 	}
+}
+
+function fabricSnapshot(overrides: Partial<FabricMonitorSnapshot> = {}): FabricMonitorSnapshot {
+	return {
+		version: 1,
+		sourceId: "fabric-source-a",
+		revision: 1,
+		capturedAt: 10,
+		truncated: false,
+		itemCount: 3,
+		cursors: [{ handle: "fabric:registry", storeKind: "registry", cursor: 4 }],
+		connectors: [{
+			kind: "connector",
+			connectorId: "connector-1",
+			label: "Connector\u001b[31m red\n",
+			transport: "stdio\tlocal",
+			health: "online",
+			enabled: true,
+			revision: 2,
+			connectionId: "connection-1",
+			connectionGeneration: 1,
+		}],
+		devices: [{
+			kind: "device",
+			deviceId: "device-1",
+			connectorId: "connector-1",
+			label: "Device\n one",
+			health: "degraded",
+			enabled: true,
+			revision: 3,
+		}],
+		endpoints: [{
+			kind: "endpoint",
+			endpointId: "mcp-1",
+			deviceId: "device-1",
+			connectorId: "connector-1",
+			endpointKind: "mcp",
+			label: "MCP\t server",
+			health: "offline",
+			status: "offline",
+			generation: 1,
+			revision: 4,
+		}],
+		...overrides,
+	};
 }
 
 test("EndpointStore falls back to stable main/start-order agent ids and hides graph containers", () => {
@@ -248,6 +294,117 @@ test("EndpointStore accepts versioned session events and hides unknown legacy ag
 	assert.equal(events.handlers.get(SESSION_HOST_REGISTRY_EVENT)?.size, 1);
 	store.disconnect();
 	assert.equal(events.handlers.get(SESSION_HOST_REGISTRY_EVENT)?.size, 0);
+});
+
+test("EndpointStore stores a sanitized immutable Fabric snapshot without creating selectable endpoints", () => {
+	const events = new Events();
+	const store = new EndpointStore({ getLegacyAgents: () => [] });
+	store.connect({ events });
+	const beforeRevision = store.snapshot().contentRevision;
+	const payload = {
+		...fabricSnapshot(),
+		secretPath: "C:/private/token.txt",
+		connectors: fabricSnapshot().connectors.map((connector) => ({
+			...connector,
+			credential: "do-not-store",
+		})),
+	};
+	events.emit(FABRIC_MONITOR_SNAPSHOT_EVENT, payload);
+
+	const snapshot = store.snapshot();
+	assert.notEqual(snapshot.contentRevision, beforeRevision);
+	assert.equal(snapshot.fabric?.connectors[0]?.label, "Connector red");
+	assert.equal(snapshot.fabric?.connectors[0]?.transport, "stdio local");
+	assert.equal(snapshot.fabric?.devices[0]?.label, "Device one");
+	assert.equal(snapshot.fabric?.endpoints[0]?.label, "MCP server");
+	assert.equal("secretPath" in (snapshot.fabric as unknown as object), false);
+	assert.equal("credential" in (snapshot.fabric?.connectors[0] as unknown as object), false);
+	assert.equal(Object.isFrozen(snapshot.fabric), true);
+	assert.equal(Object.isFrozen(snapshot.fabric?.connectors), true);
+	assert.equal(Object.isFrozen(snapshot.fabric?.connectors[0]), true);
+	assert.deepEqual(snapshot.endpoints.map((endpoint) => endpoint.label), ["main"]);
+	assert.equal(store.get("mcp-1"), undefined);
+	assert.equal(store.findAgent("mcp-1"), undefined);
+	assert.equal(events.handlers.get(FABRIC_MONITOR_SNAPSHOT_EVENT)?.size, 1);
+
+	store.disconnect();
+	assert.equal(store.snapshot().fabric, undefined);
+	assert.equal(events.handlers.get(FABRIC_MONITOR_SNAPSHOT_EVENT)?.size, 0);
+});
+
+test("EndpointStore fences Fabric revisions and retired sources", () => {
+	const store = new EndpointStore({ getLegacyAgents: () => [] });
+	assert.equal(store.applyFabricSnapshot(fabricSnapshot({ revision: 2, capturedAt: 100 })), true);
+	assert.equal(store.applyFabricSnapshot(fabricSnapshot({ revision: 2, capturedAt: 101 })), false);
+	assert.equal(store.applyFabricSnapshot(fabricSnapshot({ revision: 1, capturedAt: 102 })), false);
+	assert.equal(store.snapshot().fabric?.revision, 2);
+
+	assert.equal(store.applyFabricSnapshot(fabricSnapshot({
+		sourceId: "fabric-source-b",
+		revision: 1,
+		capturedAt: 100,
+	})), false, "a source switch must have a newer capture time");
+	assert.equal(store.applyFabricSnapshot(fabricSnapshot({
+		sourceId: "fabric-source-b",
+		revision: 1,
+		capturedAt: 101,
+	})), true);
+	assert.equal(store.snapshot().fabric?.sourceId, "fabric-source-b");
+	assert.equal(store.applyFabricSnapshot(fabricSnapshot({
+		sourceId: "fabric-source-a",
+		revision: 3,
+		capturedAt: 102,
+	})), false, "a retired source cannot re-enter even with newer data");
+});
+
+test("EndpointStore rejects oversized, over-limit, and invalid Fabric payloads", () => {
+	const store = new EndpointStore({ getLegacyAgents: () => [] });
+	assert.equal(store.applyFabricSnapshot(fabricSnapshot({
+		connectors: [{ ...fabricSnapshot().connectors[0]!, label: "x".repeat(65 * 1024) }],
+	})), false);
+
+	const endpoint = fabricSnapshot().endpoints[0]!;
+	const tooMany = Array.from({ length: 101 }, (_, index) => ({
+		...endpoint,
+		endpointId: `mcp-${index}`,
+	}));
+	assert.equal(store.applyFabricSnapshot(fabricSnapshot({
+		itemCount: tooMany.length,
+		connectors: [],
+		devices: [],
+		endpoints: tooMany,
+	})), false);
+	assert.equal(store.applyFabricSnapshot({
+		...fabricSnapshot(),
+		sourceId: "unsafe/source",
+	}), false);
+	assert.equal(store.applyFabricSnapshot({
+		...fabricSnapshot(),
+		endpoints: [{ ...endpoint, health: "healthy" }],
+	}), false);
+	assert.equal(store.applyFabricSnapshot({
+		...fabricSnapshot(),
+		cursors: [fabricSnapshot().cursors[0], fabricSnapshot().cursors[0]],
+	}), false);
+	assert.equal(store.applyFabricSnapshot({
+		...fabricSnapshot(),
+		revision: Number.MAX_SAFE_INTEGER + 1,
+	}), false);
+	assert.equal(store.snapshot().fabric, undefined);
+});
+
+test("EndpointStore revokes Fabric state on an undefined event", () => {
+	const events = new Events();
+	const store = new EndpointStore({ getLegacyAgents: () => [] });
+	store.connect({ events });
+	events.emit(FABRIC_MONITOR_SNAPSHOT_EVENT, fabricSnapshot());
+	assert.ok(store.snapshot().fabric);
+	events.emit(FABRIC_MONITOR_SNAPSHOT_EVENT, undefined);
+	assert.equal(store.snapshot().fabric, undefined);
+	assert.equal(store.applyFabricSnapshot(fabricSnapshot({ revision: 1, capturedAt: 11 })), false,
+		"a cleared source cannot replay its prior revision");
+	assert.equal(store.applyFabricSnapshot(fabricSnapshot({ revision: 2, capturedAt: 11 })), true,
+		"the same Gateway runtime may publish a newer snapshot after the overlay reopens");
 });
 
 test("EndpointStore output revision ignores status-only churn and changes with new output", () => {

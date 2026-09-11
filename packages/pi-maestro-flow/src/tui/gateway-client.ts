@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type { CollaborativeSessionStateV1, GatewayTodoTaskV1 } from "../gateway/session-contracts.ts";
+import { parseGatewayFabricMonitorSnapshot, type GatewayFabricMonitorSnapshotV1 } from "../gateway/fabric/monitor-projection.ts";
 import type { GatewayTaskEvent, GatewayTeammateTaskView } from "../gateway/services/teammate-service.ts";
 
 export type GatewayWindowSource = "registered" | "managed";
@@ -73,6 +74,11 @@ export interface GatewayWindowSendResult {
 export interface GatewayMonitor {
   handle: string;
   task: GatewayTeammateTaskView;
+}
+
+export interface GatewayMonitorList {
+  monitors: GatewayMonitor[];
+  fabric?: GatewayFabricMonitorSnapshotV1;
 }
 
 export interface GatewayMonitorObservation {
@@ -361,12 +367,19 @@ export class GatewayStreamableHttpClient {
     return data.todo as unknown as GatewayTodoTaskV1;
   }
 
-  async listGatewayMonitors(sessionId: string, memberId: string): Promise<GatewayMonitor[]> {
+  async readGatewayMonitorList(sessionId: string, memberId: string): Promise<GatewayMonitorList> {
     const data = await this.callTool("monitor", { action: "list", sessionId, memberId });
     if (!Array.isArray(data.monitors)) throw new GatewayClientError("Gateway Monitor response is malformed", "protocol");
-    return data.monitors.flatMap((value) => isRecord(value) && typeof value.handle === "string" && isRecord(value.task)
+    const monitors = data.monitors.flatMap((value) => isRecord(value) && typeof value.handle === "string" && isRecord(value.task)
       ? [{ handle: value.handle, task: value.task as unknown as GatewayTeammateTaskView }]
       : []);
+    const fabric = data.fabric === undefined ? undefined : parseGatewayFabricMonitorSnapshot(data.fabric);
+    if (data.fabric !== undefined && fabric === undefined) throw new GatewayClientError("Gateway Fabric Monitor response is malformed", "protocol");
+    return { monitors, ...(fabric === undefined ? {} : { fabric }) };
+  }
+
+  async listGatewayMonitors(sessionId: string, memberId: string): Promise<GatewayMonitor[]> {
+    return (await this.readGatewayMonitorList(sessionId, memberId)).monitors;
   }
 
   async observeGatewayMonitor(sessionId: string, memberId: string, handle: string, cursor = 0): Promise<GatewayMonitorObservation> {

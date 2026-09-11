@@ -1,9 +1,10 @@
 /** Principal-aware Board service exposed through the shared Gateway catalog. */
 import { randomUUID } from "node:crypto";
+import { assertValidQualifiedTaskReference, type QualifiedTaskReferenceV1 } from "pi-maestro-fabric-core/v1";
 import type { GatewayPrincipal, GatewayResult } from "../contracts.ts";
 import { principalHasScope, principalKey, isAuthenticatedPrincipal } from "../principal.ts";
 import type { GatewayPolicy } from "../policy.ts";
-import type { GatewayHandoffV1 } from "../handoff-contracts.ts";
+import { GATEWAY_HANDOFF_MAX_TASK_REFERENCES, type GatewayHandoffV1 } from "../handoff-contracts.ts";
 import { gatewayHandoffOriginForTransport } from "../handoff-record-contracts.ts";
 import { gatewayError, gatewayOk } from "../result.ts";
 import type { SessionStore } from "../session-store.ts";
@@ -78,6 +79,17 @@ function stringArray(value: unknown, label: string): string[] {
   return value.map((item) => String(item).trim());
 }
 
+function taskReferences(value: unknown): QualifiedTaskReferenceV1[] {
+  if (!Array.isArray(value) || value.length > GATEWAY_HANDOFF_MAX_TASK_REFERENCES) throw new Error("taskReferences must be a bounded array");
+  const references = value.map((item) => {
+    assertValidQualifiedTaskReference(item);
+    return structuredClone(item);
+  });
+  const keys = new Set(references.map((reference) => `${reference.authority}\0${reference.workspaceId}\0${reference.taskId}`));
+  if (keys.size !== references.length) throw new Error("taskReferences must be unique by qualified identity");
+  return references;
+}
+
 function endpointKind(principal: GatewayPrincipal): BoardEndpointBindingV1["kind"] {
   return principal.transport === "stdio" ? "pi" : "web";
 }
@@ -137,6 +149,7 @@ export class BoardService {
             ...(request.priority === undefined ? {} : { priority: request.priority as BoardTaskV1["priority"] }),
             ...(request.labels === undefined ? {} : { labels: stringArray(request.labels, "labels") }),
             ...(request.dependencyIds === undefined ? {} : { dependencyIds: stringArray(request.dependencyIds, "dependencyIds") }),
+            ...(request.taskReferences === undefined ? {} : { taskReferences: taskReferences(request.taskReferences) }),
             ...(request.completionPolicy === undefined ? {} : { completionPolicy: request.completionPolicy as Partial<BoardCompletionPolicyV1> }),
           }, mutation);
           break;
@@ -150,6 +163,7 @@ export class BoardService {
             ...(request.priority === undefined ? {} : { priority: request.priority as BoardTaskV1["priority"] }),
             ...(request.labels === undefined ? {} : { labels: stringArray(request.labels, "labels") }),
             ...(request.dependencyIds === undefined ? {} : { dependencyIds: stringArray(request.dependencyIds, "dependencyIds") }),
+            ...(request.taskReferences === undefined ? {} : { taskReferences: taskReferences(request.taskReferences) }),
             ...(request.completionPolicy === undefined ? {} : { completionPolicy: request.completionPolicy as BoardCompletionPolicyV1 }),
           }, mutation);
           break;

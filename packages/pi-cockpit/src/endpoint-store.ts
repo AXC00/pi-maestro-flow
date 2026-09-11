@@ -10,9 +10,20 @@ import type {
 	WindowThreadEntry,
 } from "pi-maestro-teammate/v1/sessions";
 import { sanitizeExtensionStatusText } from "./extension-status.ts";
-import type { AgentRow } from "./types.ts";
+import type {
+	AgentRow,
+	FabricEndpointStatus,
+	FabricHealth,
+	FabricMonitorConnector,
+	FabricMonitorCursor,
+	FabricMonitorDevice,
+	FabricMonitorEndpoint,
+	FabricMonitorSnapshot,
+	FabricStoreKind,
+} from "./types.ts";
 
 export const SESSION_HOST_REGISTRY_EVENT = "teammate:sessions";
+export const FABRIC_MONITOR_SNAPSHOT_EVENT = "fabric:monitor-snapshot";
 export const SESSION_HOST_REGISTRY_KEY = Symbol.for("pi-maestro-teammate.session-host-registry.v1");
 export const LEGACY_MAIN_ENDPOINT_ID = "cockpit-session/v1/main";
 export const MONITOR_CONTROL_ENDPOINT_PREFIX = "cockpit-session/v1/window-control/";
@@ -70,6 +81,7 @@ export interface EndpointStoreSnapshot {
 	endpoints: readonly CockpitEndpoint[];
 	windows: readonly CockpitEndpoint[];
 	thread: readonly WindowThreadEntry[];
+	fabric?: FabricMonitorSnapshot;
 }
 
 export interface EndpointStoreOptions {
@@ -108,6 +120,169 @@ function endpointLogicalKey(endpoint: Pick<SessionEndpoint, "kind" | "correlatio
 function cleanLabel(value: string | undefined, fallback: string): string {
 	const clean = sanitizeExtensionStatusText(value ?? "").trim();
 	return clean || fallback;
+}
+
+const FABRIC_MONITOR_MAX_ITEMS = 100;
+const FABRIC_MONITOR_MAX_BYTES = 64 * 1024;
+const FABRIC_STORE_KINDS: readonly FabricStoreKind[] = ["registry", "lease", "presence", "invocation", "event"];
+const FABRIC_HEALTH_VALUES: readonly FabricHealth[] = ["online", "degraded", "offline", "disabled", "unknown"];
+const FABRIC_ENDPOINT_STATUS_VALUES: readonly FabricEndpointStatus[] = ["unknown", "online", "offline", "disabled"];
+
+function record(value: unknown): Record<string, unknown> | undefined {
+	return value !== null && typeof value === "object" && !Array.isArray(value)
+		? value as Record<string, unknown>
+		: undefined;
+}
+
+function safeFabricIdentifier(value: unknown): string | undefined {
+	return typeof value === "string" && /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u.test(value)
+		? value
+		: undefined;
+}
+
+function safeFabricInteger(value: unknown, minimum = 0): number | undefined {
+	return Number.isSafeInteger(value) && (value as number) >= minimum ? value as number : undefined;
+}
+
+function fabricJsonByteLength(value: unknown): number | undefined {
+	try {
+		const serialized = JSON.stringify(value);
+		return serialized === undefined ? undefined : new TextEncoder().encode(serialized).byteLength;
+	} catch {
+		return undefined;
+	}
+}
+
+function parseFabricMonitorSnapshot(value: unknown): FabricMonitorSnapshot | undefined {
+	try {
+		const bytes = fabricJsonByteLength(value);
+		if (bytes === undefined || bytes > FABRIC_MONITOR_MAX_BYTES) return undefined;
+		const input = record(value);
+		if (!input || input.version !== 1) return undefined;
+		const sourceId = safeFabricIdentifier(input.sourceId);
+		const revision = safeFabricInteger(input.revision, 1);
+		const capturedAt = safeFabricInteger(input.capturedAt);
+		if (!sourceId || revision === undefined || capturedAt === undefined || typeof input.truncated !== "boolean") return undefined;
+		if (!Array.isArray(input.cursors) || !Array.isArray(input.connectors)
+			|| !Array.isArray(input.devices) || !Array.isArray(input.endpoints)) return undefined;
+		const totalItems = input.connectors.length + input.devices.length + input.endpoints.length;
+		if (totalItems > FABRIC_MONITOR_MAX_ITEMS || input.itemCount !== totalItems) return undefined;
+
+		const cursors: FabricMonitorCursor[] = [];
+		const cursorKinds = new Set<FabricStoreKind>();
+		if (input.cursors.length > FABRIC_STORE_KINDS.length) return undefined;
+		for (const value of input.cursors) {
+			const item = record(value);
+			const storeKind = item?.storeKind;
+			const cursor = safeFabricInteger(item?.cursor);
+			if (!item || !FABRIC_STORE_KINDS.includes(storeKind as FabricStoreKind)
+				|| cursor === undefined || item.handle !== `fabric:${storeKind}`
+				|| cursorKinds.has(storeKind as FabricStoreKind)) return undefined;
+			cursorKinds.add(storeKind as FabricStoreKind);
+			cursors.push(Object.freeze({
+				handle: item.handle as string,
+				storeKind: storeKind as FabricStoreKind,
+				cursor,
+			}));
+		}
+
+		const connectors: FabricMonitorConnector[] = [];
+		for (const value of input.connectors) {
+			const item = record(value);
+			const connectorId = safeFabricIdentifier(item?.connectorId);
+			const health = item?.health;
+			const revision = safeFabricInteger(item?.revision);
+			const connectionId = item?.connectionId === undefined ? undefined : safeFabricIdentifier(item.connectionId);
+			const connectionGeneration = item?.connectionGeneration === undefined
+				? undefined
+				: safeFabricInteger(item.connectionGeneration, 1);
+			if (!item || item.kind !== "connector" || !connectorId
+				|| !FABRIC_HEALTH_VALUES.includes(health as FabricHealth)
+				|| typeof item.label !== "string" || typeof item.transport !== "string"
+				|| typeof item.enabled !== "boolean" || revision === undefined
+				|| (item.connectionId !== undefined && connectionId === undefined)
+				|| (item.connectionGeneration !== undefined && connectionGeneration === undefined)) return undefined;
+			connectors.push(Object.freeze({
+				kind: "connector",
+				connectorId,
+				label: sanitizeExtensionStatusText(item.label),
+				transport: sanitizeExtensionStatusText(item.transport),
+				health: health as FabricHealth,
+				enabled: item.enabled,
+				revision,
+				...(connectionId === undefined ? {} : { connectionId }),
+				...(connectionGeneration === undefined ? {} : { connectionGeneration }),
+			}));
+		}
+
+		const devices: FabricMonitorDevice[] = [];
+		for (const value of input.devices) {
+			const item = record(value);
+			const deviceId = safeFabricIdentifier(item?.deviceId);
+			const connectorId = safeFabricIdentifier(item?.connectorId);
+			const health = item?.health;
+			const revision = safeFabricInteger(item?.revision);
+			if (!item || item.kind !== "device" || !deviceId || !connectorId
+				|| !FABRIC_HEALTH_VALUES.includes(health as FabricHealth)
+				|| typeof item.label !== "string" || typeof item.enabled !== "boolean"
+				|| revision === undefined) return undefined;
+			devices.push(Object.freeze({
+				kind: "device",
+				deviceId,
+				connectorId,
+				label: sanitizeExtensionStatusText(item.label),
+				health: health as FabricHealth,
+				enabled: item.enabled,
+				revision,
+			}));
+		}
+
+		const endpoints: FabricMonitorEndpoint[] = [];
+		for (const value of input.endpoints) {
+			const item = record(value);
+			const endpointId = safeFabricIdentifier(item?.endpointId);
+			const deviceId = safeFabricIdentifier(item?.deviceId);
+			const connectorId = safeFabricIdentifier(item?.connectorId);
+			const health = item?.health;
+			const status = item?.status;
+			const generation = safeFabricInteger(item?.generation, 1);
+			const revision = safeFabricInteger(item?.revision);
+			if (!item || item.kind !== "endpoint" || !endpointId || !deviceId || !connectorId
+				|| (item.endpointKind !== "agent" && item.endpointKind !== "mcp")
+				|| !FABRIC_HEALTH_VALUES.includes(health as FabricHealth)
+				|| !FABRIC_ENDPOINT_STATUS_VALUES.includes(status as FabricEndpointStatus)
+				|| typeof item.label !== "string" || generation === undefined || revision === undefined) return undefined;
+			endpoints.push(Object.freeze({
+				kind: "endpoint",
+				endpointId,
+				deviceId,
+				connectorId,
+				endpointKind: item.endpointKind,
+				label: sanitizeExtensionStatusText(item.label),
+				health: health as FabricHealth,
+				status: status as FabricEndpointStatus,
+				generation,
+				revision,
+			}));
+		}
+
+		const snapshot: FabricMonitorSnapshot = Object.freeze({
+			version: 1,
+			sourceId,
+			revision,
+			capturedAt,
+			truncated: input.truncated,
+			itemCount: totalItems,
+			cursors: Object.freeze(cursors),
+			connectors: Object.freeze(connectors),
+			devices: Object.freeze(devices),
+			endpoints: Object.freeze(endpoints),
+		});
+		const storedBytes = fabricJsonByteLength(snapshot);
+		return storedBytes !== undefined && storedBytes <= FABRIC_MONITOR_MAX_BYTES ? snapshot : undefined;
+	} catch {
+		return undefined;
+	}
 }
 
 /** Stable 32-bit FNV-1a. This is change detection, not a security boundary. */
@@ -251,8 +426,13 @@ export class EndpointStore {
 	#expectedSessionId: string | undefined;
 	#acceptedLocalProjection: LocalSessionProjection | undefined;
 	#registryDisposer: (() => void) | undefined;
-	#eventDisposer: (() => void) | undefined;
+	#eventDisposers: Array<() => void> = [];
 	#externalAgents: readonly ExternalAgentProjectionV1[] = Object.freeze([]);
+	#fabricSnapshot: FabricMonitorSnapshot | undefined;
+	#fabricCapturedAtFence = -1;
+	#lastFabricSourceId: string | undefined;
+	#fabricRevisionFences = new Map<string, number>();
+	#retiredFabricSources = new Set<string>();
 	#mainOutputRevision: string | undefined;
 	#snapshot: EndpointStoreSnapshot = Object.freeze({
 		contentRevision: revisionOf([]),
@@ -290,29 +470,84 @@ export class EndpointStore {
 			}
 		}
 		if (options.events) {
-			this.#eventDisposer = options.events.on(
-				SESSION_HOST_REGISTRY_EVENT,
-				(payload) => this.applyRegistrySnapshot(payload),
-			);
+			try {
+				this.#eventDisposers.push(options.events.on(
+					SESSION_HOST_REGISTRY_EVENT,
+					(payload) => this.applyRegistrySnapshot(payload),
+				));
+			} catch { /* optional peer */ }
+			try {
+				this.#eventDisposers.push(options.events.on(
+					FABRIC_MONITOR_SNAPSHOT_EVENT,
+					(payload) => this.applyFabricSnapshot(payload),
+				));
+			} catch { /* optional peer */ }
 		}
 		this.refreshLegacy();
 	}
 
 	disconnect(): void {
 		try { this.#registryDisposer?.(); } catch { /* best effort */ }
-		try { this.#eventDisposer?.(); } catch { /* best effort */ }
+		for (const dispose of this.#eventDisposers) {
+			try { dispose(); } catch { /* best effort */ }
+		}
 		this.#registryDisposer = undefined;
-		this.#eventDisposer = undefined;
+		this.#eventDisposers = [];
 		this.#registry = undefined;
 		this.#registrySnapshot = undefined;
 		this.#expectedSessionId = undefined;
 		this.#acceptedLocalProjection = undefined;
 		this.#externalAgents = Object.freeze([]);
+		this.#fabricSnapshot = undefined;
+		this.#fabricCapturedAtFence = -1;
+		this.#lastFabricSourceId = undefined;
+		this.#fabricRevisionFences.clear();
+		this.#retiredFabricSources.clear();
 		this.#rebuild();
 	}
 
 	get registry(): SessionHostRegistryLike | undefined {
 		return this.#registry;
+	}
+
+	applyFabricSnapshot(value: unknown): boolean {
+		if (value === undefined) {
+			if (!this.#fabricSnapshot) return false;
+			this.#lastFabricSourceId = this.#fabricSnapshot.sourceId;
+			this.#fabricSnapshot = undefined;
+			return this.#rebuild();
+		}
+
+		const next = parseFabricMonitorSnapshot(value);
+		if (!next || this.#retiredFabricSources.has(next.sourceId)) return false;
+		const revisionFence = this.#fabricRevisionFences.get(next.sourceId) ?? 0;
+		if (next.revision <= revisionFence) return false;
+		const current = this.#fabricSnapshot;
+		if (current?.sourceId !== next.sourceId) {
+			const resumingClearedSource = current === undefined && next.sourceId === this.#lastFabricSourceId;
+			if (resumingClearedSource ? next.capturedAt < this.#fabricCapturedAtFence : next.capturedAt <= this.#fabricCapturedAtFence) return false;
+			if (current) this.#retireFabricSource(current.sourceId);
+		}
+		this.#fabricSnapshot = next;
+		this.#lastFabricSourceId = next.sourceId;
+		this.#recordFabricRevision(next.sourceId, next.revision);
+		this.#fabricCapturedAtFence = Math.max(this.#fabricCapturedAtFence, next.capturedAt);
+		return this.#rebuild();
+	}
+
+	#recordFabricRevision(sourceId: string, revision: number): void {
+		this.#fabricRevisionFences.delete(sourceId);
+		this.#fabricRevisionFences.set(sourceId, revision);
+		while (this.#fabricRevisionFences.size > 17) {
+			this.#fabricRevisionFences.delete(this.#fabricRevisionFences.keys().next().value!);
+		}
+	}
+
+	#retireFabricSource(sourceId: string): void {
+		this.#retiredFabricSources.add(sourceId);
+		while (this.#retiredFabricSources.size > 16) {
+			this.#retiredFabricSources.delete(this.#retiredFabricSources.values().next().value!);
+		}
 	}
 
 	applyRegistrySnapshot(value: unknown): boolean {
@@ -576,6 +811,7 @@ export class EndpointStore {
 				endpoint.outputRevision,
 			]),
 			windows.map((endpoint) => [endpoint.id, endpoint.contentRevision, endpoint.outputRevision]),
+			this.#fabricSnapshot ? [this.#fabricSnapshot.sourceId, this.#fabricSnapshot.revision] : undefined,
 		]);
 		if (contentRevision === this.#snapshot.contentRevision) return false;
 		this.#snapshot = Object.freeze({
@@ -585,6 +821,7 @@ export class EndpointStore {
 			endpoints: Object.freeze(endpoints),
 			windows: Object.freeze(windows),
 			thread: Object.freeze([...thread]),
+			...(this.#fabricSnapshot ? { fabric: this.#fabricSnapshot } : {}),
 		});
 		for (const subscriber of this.#subscribers) subscriber(this.#snapshot);
 		return true;

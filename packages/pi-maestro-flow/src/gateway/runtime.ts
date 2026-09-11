@@ -34,6 +34,7 @@ import { GatewayFabricDeviceService } from "./fabric/device-service.ts";
 import { GatewayFabricWorkspaceService } from "./fabric/workspace-service.ts";
 import { GatewayFabricEndpointService } from "./fabric/endpoint-service.ts";
 import { GatewayFabricRouteService } from "./fabric/route-service.ts";
+import { GatewayFabricMonitorProjection } from "./fabric/monitor-projection.ts";
 import { ExecService } from "./services/exec-service.ts";
 import { FileService } from "./services/file-service.ts";
 import { HostService } from "./services/host-service.ts";
@@ -80,6 +81,7 @@ export interface GatewayRuntimeOptions {
   fabricEndpointDirectory?: FabricEndpointDirectory;
   fabricEndpointRegistrations?: readonly FabricEndpointRegistration[];
   fabricEndpointDispatcher?: FabricEndpointDispatcher;
+  fabricMonitorProjection?: GatewayFabricMonitorProjection;
   /** Explicitly enable auto-wiring of the native-TLS Fabric HTTP data plane. Default: false. */
   fabricHttpChannelEnabled?: boolean;
   fabricHttpChannelServer?: FabricHttpChannelServer;
@@ -133,6 +135,7 @@ export class GatewayRuntime {
   readonly fabricWorkspace: GatewayFabricWorkspaceService;
   readonly fabricEndpoint: GatewayFabricEndpointService;
   readonly fabricRoute: GatewayFabricRouteService;
+  readonly fabricMonitor?: GatewayFabricMonitorProjection;
   readonly fabricEndpointDispatcher?: FabricEndpointDispatcher;
   readonly fabricHttpChannelServer?: FabricHttpChannelServer;
   readonly fabricMcpEndpoint?: McpEndpointBridge;
@@ -292,6 +295,11 @@ export class GatewayRuntime {
     this.fabricEndpoint = new GatewayFabricEndpointService(fabricControl);
     this.fabricRoute = new GatewayFabricRouteService(fabricControl, (routeId, reason) => this.fabricHttpChannelServer?.closeRoute(routeId, reason));
     this.eventStream = new GatewayEventStream(this.teammate.eventJournal, { observer: this.observer });
+    this.fabricMonitor = options.fabricMonitorProjection ?? (this.fabricControlRuntime === undefined ? undefined : new GatewayFabricMonitorProjection({
+      directory: this.fabricControlRuntime.directory,
+      connections: this.fabricControlRuntime.connections,
+      journal: this.eventStream.journal,
+    }));
     this.session = new GatewaySessionService({ store: this.sessionStore, todos: this.todoStore, teammate: this.teammate, receipts: this.operationReceipts, authMode: config.auth.mode, policy: this.policy, stream: this.eventStream });
     this.todo = new GatewayTodoService({ store: this.todoStore, sessions: this.sessionStore, authMode: config.auth.mode });
     this.board = new BoardService({
@@ -351,7 +359,7 @@ export class GatewayRuntime {
         },
       },
     });
-    this.monitor = new GatewayMonitorService({ sessions: this.sessionStore, teammate: this.teammate, receipts: this.operationReceipts, authMode: config.auth.mode, stream: this.eventStream });
+    this.monitor = new GatewayMonitorService({ sessions: this.sessionStore, teammate: this.teammate, receipts: this.operationReceipts, authMode: config.auth.mode, stream: this.eventStream, fabric: this.fabricMonitor });
     this.catalog = new GatewayCatalog({
       workspace: this.workspace,
       board: this.board,

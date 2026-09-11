@@ -7,7 +7,7 @@ import {
   GATEWAY_STATE_VERSION,
   GATEWAY_WORKSPACE_ID_PATTERN,
 } from "./contracts.ts";
-import { GATEWAY_HANDOFF_SCHEMA } from "./handoff-contracts.ts";
+import { GATEWAY_HANDOFF_MAX_TASK_REFERENCES, GATEWAY_HANDOFF_SCHEMA, GATEWAY_QUALIFIED_TASK_REFERENCE_SCHEMA } from "./handoff-contracts.ts";
 import { GATEWAY_HANDOFF_ORIGIN_SCHEMA } from "./handoff-record-contracts.ts";
 
 export const BOARD_TASK_STATUSES = ["open", "active", "blocked", "completed", "cancelled"] as const;
@@ -102,6 +102,7 @@ export const BOARD_TASK_SCHEMA = Type.Object({
   priority: state(BOARD_PRIORITIES),
   labels: Type.Array(Type.String({ minLength: 1, maxLength: 128 }), { maxItems: 32, uniqueItems: true }),
   dependencyIds: Type.Array(id, { maxItems: 256, uniqueItems: true }),
+  taskReferences: Type.Optional(Type.Array(GATEWAY_QUALIFIED_TASK_REFERENCE_SCHEMA, { maxItems: GATEWAY_HANDOFF_MAX_TASK_REFERENCES, uniqueItems: true })),
   createdBy: BOARD_ACTOR_SCHEMA,
   /** Monotonic ownership fence retained even while the task is unclaimed. */
   claimGeneration: Type.Optional(positiveRevision),

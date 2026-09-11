@@ -163,6 +163,7 @@ import {
 } from "../tools/plan-workflow.ts";
 import { SessionOverlay, type SessionOverlayAction } from "../tui/session-overlay.ts";
 import { GatewayOverlay } from "../tui/gateway-overlay.ts";
+import { GATEWAY_FABRIC_MONITOR_EVENT } from "../gateway/fabric/monitor-projection.ts";
 import { startWorkspaceLease, stopWorkspaceLease, registerGatewayWorkspacePermanent, removeGatewayWorkspaceByPath, isGatewayConfigured } from "../gateway/workspace-client.ts";
 import { TodoOverlay } from "../tui/todo-overlay.ts";
 import { GoalOverlay, type GoalOverlayAction } from "../tui/goal-overlay.ts";
@@ -2710,6 +2711,7 @@ When NOT to use:
         requestRender: () => tui.requestRender(),
         getTerminalRows: () => tui.terminal.rows,
         close: () => done(undefined),
+        onFabricProjection: (snapshot) => pi.events.emit(GATEWAY_FABRIC_MONITOR_EVENT, snapshot),
         onRegisterWorkspace: async (path) => registerWindowWithMode(path, false),
         onRegisterWorkspacePermanent: async (path) => registerWindowWithMode(path, true),
         onUnregisterWorkspace: async (path) => {

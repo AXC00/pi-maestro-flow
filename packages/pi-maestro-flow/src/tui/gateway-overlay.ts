@@ -13,6 +13,7 @@ import { Key, type Component, type Focusable, matchesKey, truncateToWidth, visib
 import { locateGateway, readGatewayBearerToken, readTunnelState, readOpenAiTunnelState, restartQuickTunnel, startQuickTunnel, stopQuickTunnel, startOpenAiTunnel, stopOpenAiTunnel, updateGatewayConfigServerURL, restoreGatewayConfig, stopGateway, startGateway, restartGateway, readGatewayControlStatus, listGatewayWorkspaces, startWorkspaceLease, registerGatewayWorkspacePermanent, readGatewayOpsPassword, detectGateway, removeGatewayWorkspaceByPath, readGatewayTasks, readGatewayCollaborativeSessions, readGatewayConfigView, writeGatewayConfigChanges, type TunnelState, type GatewayJournalTask, type GatewayConfigView } from "../gateway/workspace-client.ts";
 import { gatewayConfigPath } from "../gateway/state-paths.ts";
 import type { CollaborativeSessionStateV1, GatewayTodoTaskV1 } from "../gateway/session-contracts.ts";
+import type { GatewayFabricMonitorSnapshotV1 } from "../gateway/fabric/monitor-projection.ts";
 import type { GatewayConfigChanges } from "./gateway-wizard.ts";
 import {
   GatewayClientError,
@@ -101,6 +102,8 @@ export interface GatewaySnapshot {
   collaborationMonitors?: Record<string, GatewayMonitor[]>;
   collaborationMemberIds?: Record<string, string>;
   collaborationError?: string;
+  /** Read-only Fabric health; never participates in Agent/Task routing. */
+  fabric?: GatewayFabricMonitorSnapshotV1;
   /** Compatibility field names for verified built-in Gateway availability. */
   forkInstalled?: boolean;
   forkVersion?: string;
@@ -135,6 +138,8 @@ export interface GatewayOverlayParams {
     session: GatewayConnectionInfo,
     targetMode: "existing" | "new",
   ) => Promise<GatewayWindowComposeResult | undefined>;
+  /** Publishes only refresh-generation-fenced Fabric snapshots to sibling UI consumers. */
+  onFabricProjection?: (snapshot: GatewayFabricMonitorSnapshotV1 | undefined) => void;
   /** Test hook and transport injection point. */
   createClient?: (endpoint: string) => GatewayStreamableHttpClient;
   /** Skip constructor refresh in deterministic overlay tests. */
@@ -830,6 +835,7 @@ export class GatewayOverlay implements Component, Focusable {
       let runtimeWindowFallback: GatewaySnapshot["runtimeWindowFallback"];
       const collaborationMonitors: Record<string, GatewayMonitor[]> = {};
       const collaborationMemberIds: Record<string, string> = {};
+      let fabric: GatewayFabricMonitorSnapshotV1 | undefined;
       if (online) {
         const client = this.clientForEndpoint(endpoint);
         const memberIds = collaborativeSessions.flatMap((state) => state.members.map((member) => member.id));
@@ -853,7 +859,9 @@ export class GatewayOverlay implements Component, Focusable {
             try {
               const state = await client.getGatewaySession(localState.session.id, member.id);
               collaborativeSessions[index] = state;
-              collaborationMonitors[state.session.id] = await client.listGatewayMonitors(state.session.id, member.id);
+              const monitorList = await client.readGatewayMonitorList(state.session.id, member.id);
+              collaborationMonitors[state.session.id] = monitorList.monitors;
+              fabric ??= monitorList.fabric;
               collaborationMemberIds[state.session.id] = member.id;
               break;
             } catch {
@@ -885,6 +893,7 @@ export class GatewayOverlay implements Component, Focusable {
           collaborativeSessions,
           collaborationMonitors,
           collaborationMemberIds,
+          fabric,
           ...(collaborationError === undefined ? {} : { collaborationError }),
           forkInstalled: fork.installed,
           forkVersion: fork.version,
@@ -897,12 +906,14 @@ export class GatewayOverlay implements Component, Focusable {
         this.windowSelected = Math.min(this.windowSelected, Math.max(0, this.windowEntries().length - 1));
         this.collaborationSelected = Math.min(this.collaborationSelected, Math.max(0, collaborativeSessions.length - 1));
         this.collaborationItemSelected = Math.min(this.collaborationItemSelected, Math.max(0, this.collaborationItems().length - 1));
+        this.params.onFabricProjection?.(fabric);
       }
       if (!tunnel.url && !tunnel.alive) tunnel.health = "dead";
       if (!openAiTunnel.opaqueId && !openAiTunnel.alive) openAiTunnel.health = "dead";
     } catch (error) {
       if (generation === this.refreshGeneration && !this.closed) {
-        this.snapshot = { ...this.snapshot, refreshing: false, error: error instanceof Error ? error.message : String(error) };
+        this.snapshot = { ...this.snapshot, refreshing: false, fabric: undefined, error: error instanceof Error ? error.message : String(error) };
+        this.params.onFabricProjection?.(undefined);
       }
     }
     if (this.workspaceToggleQueued && !this.workspaceToggleBusy && generation === this.refreshGeneration && !this.closed) {
@@ -1118,6 +1129,7 @@ export class GatewayOverlay implements Component, Focusable {
   markClosed(): void {
     this.closed = true;
     this.stopWindowObserve();
+    this.params.onFabricProjection?.(undefined);
   }
 
   render(width: number): string[] {
@@ -1801,6 +1813,7 @@ export class GatewayOverlay implements Component, Focusable {
     rows.push(this.renderConnectionRow(inner));
     const brokenMcp = this.snapshot.mcpServers.filter((server) => !server.executable).length;
     rows.push(fitLine(`上游 MCP ${this.snapshot.mcpServers.length} · 客户端 ${this.snapshot.connections?.length ?? "—"} · 工作区 ${this.snapshot.workspaces.length}${brokenMcp ? ` · ${fg("31", `${brokenMcp} 个命令不可用`)}` : ""}`, inner));
+    rows.push(...this.renderFabricRows(inner));
     rows.push(rule(inner));
     rows.push(...this.renderTunnelRows(inner));
     rows.push(...this.renderOpsPasswordRows(inner));
@@ -1825,6 +1838,19 @@ export class GatewayOverlay implements Component, Focusable {
     if (this.snapshot.error) rows.push(fitLine(fg("31", `! ${this.snapshot.error}`), inner));
     rows.push(...fitSegments(inner, ["1 主页", "2/c 配置", "Enter 消息", "G 协作", "V 窗口", "W 工作区", "r 刷新", this.snapshot.endpoint === "online" ? "x 停止" : "s 启动", "R 重启", "T 重建 Cloudflare", "e 注册(租约)", "E 注册(永久)", "P 口令", "Esc 关闭"]));
     return frame(rows, width);
+  }
+
+  private renderFabricRows(width: number): string[] {
+    const fabric = this.snapshot.fabric;
+    if (!fabric) return [fitLine("Fabric · unavailable or disabled", width)];
+    const count = <T extends { health: string }>(items: readonly T[], health: string): number => items.filter((item) => item.health === health).length;
+    const suffix = fabric.truncated ? " · truncated" : "";
+    return [
+      fitLine(`Fabric · revision ${fabric.revision} · ${fabric.itemCount} items${suffix}`, width),
+      fitLine(`  Connectors ${fabric.connectors.length} · online ${count(fabric.connectors, "online")} · degraded ${count(fabric.connectors, "degraded")} · offline ${count(fabric.connectors, "offline")}`, width),
+      fitLine(`  Devices ${fabric.devices.length} · online ${count(fabric.devices, "online")} · disabled ${count(fabric.devices, "disabled")} · offline ${count(fabric.devices, "offline")}`, width),
+      fitLine(`  Endpoints ${fabric.endpoints.length} · agent ${fabric.endpoints.filter((item) => item.endpointKind === "agent").length} · MCP ${fabric.endpoints.filter((item) => item.endpointKind === "mcp").length} · online ${count(fabric.endpoints, "online")}`, width),
+    ];
   }
 
   /** Classify the cwd's registration: present in config.yaml, and if so whether

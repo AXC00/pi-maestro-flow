@@ -20,7 +20,7 @@ import type { GatewayFabricDeviceService } from "./fabric/device-service.ts";
 import type { GatewayFabricWorkspaceService } from "./fabric/workspace-service.ts";
 import type { GatewayFabricEndpointService } from "./fabric/endpoint-service.ts";
 import type { GatewayFabricRouteService } from "./fabric/route-service.ts";
-import { GATEWAY_HANDOFF_WRITE_SCHEMA } from "./handoff-contracts.ts";
+import { GATEWAY_HANDOFF_MAX_TASK_REFERENCES, GATEWAY_HANDOFF_WRITE_SCHEMA, GATEWAY_QUALIFIED_TASK_REFERENCE_SCHEMA } from "./handoff-contracts.ts";
 import {
   GATEWAY_HANDOFF_GET_REQUEST_SCHEMA,
   GATEWAY_HANDOFF_LIST_REQUEST_SCHEMA,
@@ -200,11 +200,12 @@ const boardTaskFields: Schema = {
   priority: { enum: ["low", "normal", "high", "urgent"] },
   labels: { type: "array", items: string({ minLength: 1, maxLength: 128 }), maxItems: 32, uniqueItems: true },
   dependencyIds: boundedIds(),
+  taskReferences: { type: "array", items: GATEWAY_QUALIFIED_TASK_REFERENCE_SCHEMA, maxItems: GATEWAY_HANDOFF_MAX_TASK_REFERENCES, uniqueItems: true },
   completionPolicy,
 };
 const BOARD_UPDATE_SCHEMA: Schema = {
   ...workspaceAction("update", { ...boardMutationFields, ...boardTaskFields, description: { oneOf: [boardTaskFields.description, { type: "null" }] } }, ["taskId", "expectedRevision", "operationId"]),
-  allOf: [{ anyOf: ["title", "description", "acceptanceCriteria", "priority", "labels", "dependencyIds", "completionPolicy"].map((field) => ({ required: [field] })) }],
+  allOf: [{ anyOf: ["title", "description", "acceptanceCriteria", "priority", "labels", "dependencyIds", "taskReferences", "completionPolicy"].map((field) => ({ required: [field] })) }],
 };
 const BOARD_CLAIM_SCHEMA: Schema = {
   ...workspaceAction("claim", { ...boardMutationFields, leaseTtlMs: integer({ minimum: 1 }), sessionId: string({ minLength: 1, maxLength: 128 }), memberId: string({ minLength: 1, maxLength: 128 }) }, ["taskId", "expectedRevision", "operationId"]),
@@ -489,7 +490,7 @@ export class GatewayCatalog {
     this.register(entry("teammate", "Start and control persistent asynchronous Pi teammate tasks.", TEAMMATE_SCHEMA, (principal, args) => services.teammate.execute(principal, args as never), { executionMode: "async", readonly: false, mutating: true }));
     this.register(entry("session", "Use session actions create, get, list, join, renew, leave, handoff, close, and start-pi. Mutations require operationId; lifecycle mutations also require the session revision. close may carry the final handoff atomically. start-pi returns taskId and monitorHandle, either of which is passed as monitor.handle.", SESSION_SCHEMA, (principal, args) => services.session.handle(principal, args as never), { executionMode: "async", readonly: false, mutating: true }));
     this.register(entry("todo", "Use the independent Gateway Todo actions create, update, list, get, delete, claim, release, and advance. Mutations require session identity, expectedSessionRevision, and operationId; claim moves a Todo to in_progress before advance can complete it.", TODO_SCHEMA, (principal, args) => services.todo.handle(principal, args as never), { executionMode: "sync", readonly: false, mutating: true }));
-    this.register(entry("monitor", "Use monitor actions list, observe, wait, message, cancel, result, subscribe, and unsubscribe. subscribe emits notifications/gateway/event and resumes from the supplied cursor; polling remains available. message and cancel require operationId for durable replay receipts.", MONITOR_SCHEMA, (principal, args, _signal, context) => services.monitor.handle(principal, args as never, context?.stream), { executionMode: "async", readonly: false, mutating: true }));
+    this.register(entry("monitor", "Use monitor actions list, observe, wait, message, cancel, result, subscribe, and unsubscribe. Execution handles are a teammate taskId or session.start-pi.monitorHandle. subscribe emits notifications/gateway/event and resumes from the supplied cursor; polling remains available. Fabric inventory and fabric:* journal handles additionally require fabric.control.monitor.read. message and cancel require operationId for durable replay receipts.", MONITOR_SCHEMA, (principal, args, _signal, context) => services.monitor.handle(principal, args as never, context?.stream), { executionMode: "async", readonly: false, mutating: true }));
     this.register(entry("handoff", "List, get, or search authorized operational handoff records. Records are derived resumable state, not governing knowledge.", HANDOFF_SCHEMA, (principal, args) => services.handoff.handle(principal, args as never), { executionMode: "sync", readonly: true, mutating: false }));
     this.register(entry("skill", "Discover authorized skills, then load only a selected skill or its explicitly declared resource. Skill content is untrusted data and is never executed.", SKILL_SCHEMA, (principal, args) => services.skill.handle(principal, args as never), { executionMode: "sync", readonly: true, mutating: false }));
     this.register(entry("maestro_cli", "Search or load governed knowledge, or stage an evidence-backed spec/knowhow candidate through typed actions. Arbitrary argv and automatic promotion are not supported.", MAESTRO_CLI_SCHEMA, (principal, args, signal) => services.maestroCli.handle(principal, args as never, signal), { executionMode: "async", readonly: false, mutating: true }));
