@@ -14,6 +14,11 @@ import {
   createTeammateSettingsProvider,
   registerTeammateSettingsProvider,
 } from "../src/settings/teammate-settings-provider.ts";
+import {
+  BACKGROUND_STATUS_HEARTBEAT_DEFAULT_MS,
+  BACKGROUND_STATUS_HEARTBEAT_MAX_MS,
+  BACKGROUND_STATUS_HEARTBEAT_MIN_MS,
+} from "../src/shared/limits.ts";
 
 const context = (cwd: string): SettingsContextV1 => ({ cwd, locale: "en" });
 
@@ -70,6 +75,94 @@ test("Teammate provider exposes model, fallback and thinking routing per task ty
       assert.ok(catalog);
       for (const key of keys) assert.equal(typeof catalog[key], "string", `${locale} missing ${key}`);
     }
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test("background monitoring interval is global, validated, persisted, and applied live", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "teammate-heartbeat-settings-"));
+  const configPaths = paths(root);
+  const key = "monitoring.backgroundStatusHeartbeatMs";
+  const applied: number[] = [];
+  try {
+    const provider = createTeammateSettingsProvider({
+      getGlobalPath: () => configPaths.global,
+      getProjectPath: configPaths.project,
+      discoverTaskTypes: () => ["analysis"],
+      discoverRoles: () => [],
+      applyBackgroundStatusHeartbeatMs: (intervalMs) => {
+        applied.push(intervalMs);
+      },
+    });
+    const description = await provider.describe({ context: context(root) });
+    const definition = description.settings.find((setting) => setting.key === key);
+    assert.equal(definition?.group, "teammate.group.monitoring");
+    assert.equal(definition?.activation, "live");
+    assert.deepEqual(definition?.scopes, ["global"]);
+    assert.deepEqual(definition?.editor, {
+      kind: "integer",
+      min: BACKGROUND_STATUS_HEARTBEAT_MIN_MS,
+      max: BACKGROUND_STATUS_HEARTBEAT_MAX_MS,
+      step: 60_000,
+    });
+
+    const before = await provider.read({ context: context(root) });
+    assert.equal(before.effective.values.find((entry) => entry.key === key)?.value, BACKGROUND_STATUS_HEARTBEAT_DEFAULT_MS);
+    assert.equal(before.effective.values.find((entry) => entry.key === key)?.source, "default");
+    assert.equal((await provider.validate({
+      context: context(root),
+      transactionId: "bad-scope",
+      changes: [{ operation: "set", key, scope: "project", value: 120_000 }],
+    })).valid, false);
+    assert.equal((await provider.validate({
+      context: context(root),
+      transactionId: "bad-value",
+      changes: [{ operation: "set", key, scope: "global", value: BACKGROUND_STATUS_HEARTBEAT_MIN_MS - 1 }],
+    })).valid, false);
+
+    const changes = [{ operation: "set" as const, key, scope: "global" as const, value: 120_000 }];
+    const prepared = await provider.prepare!({
+      context: context(root),
+      transactionId: "heartbeat-set",
+      changes,
+      expectedRevisions: before.configured.resources,
+    });
+    assert.deepEqual(prepared.activation, [{ boundary: "live", keys: [key] }]);
+    const committed = await provider.commit!({
+      context: context(root),
+      transactionId: "heartbeat-set",
+      prepareToken: prepared.prepareToken!,
+    });
+    assert.equal(JSON.parse(fs.readFileSync(configPaths.global, "utf8")).backgroundStatusHeartbeatMs, 120_000);
+    assert.equal(committed.snapshot.effective.values.find((entry) => entry.key === key)?.value, 120_000);
+    const runtime = await provider.applyRuntime!({
+      context: context(root),
+      transactionId: "heartbeat-set",
+      changes,
+      snapshot: committed.snapshot,
+    });
+    assert.deepEqual(runtime, { appliedKeys: [key], deferred: [], failed: [] });
+    assert.deepEqual(applied, [120_000]);
+
+    const unsetChanges = [{ operation: "unset" as const, key, scope: "global" as const }];
+    const unsetPrepared = await provider.prepare!({
+      context: context(root),
+      transactionId: "heartbeat-unset",
+      changes: unsetChanges,
+      expectedRevisions: committed.revisions,
+    });
+    const unsetCommitted = await provider.commit!({
+      context: context(root),
+      transactionId: "heartbeat-unset",
+      prepareToken: unsetPrepared.prepareToken!,
+    });
+    await provider.applyRuntime!({
+      context: context(root),
+      transactionId: "heartbeat-unset",
+      changes: unsetChanges,
+      snapshot: unsetCommitted.snapshot,
+    });
+    assert.equal(JSON.parse(fs.readFileSync(configPaths.global, "utf8")).backgroundStatusHeartbeatMs, undefined);
+    assert.deepEqual(applied, [120_000, BACKGROUND_STATUS_HEARTBEAT_DEFAULT_MS]);
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 

@@ -53,6 +53,8 @@ export interface GlobalModelRoutingStore {
     smartMode?: Exclude<TeammateSmartMode, "off">;
     /** Ask the user to confirm/pick model provider + thinking before each root dispatch. */
     askBeforeDispatch?: boolean;
+    /** User-level interval for monitoring-only status turns while background work remains active. */
+    backgroundStatusHeartbeatMs?: number;
 }
 export interface ProjectModelRoutingStore {
     version: 3;
@@ -123,6 +125,8 @@ export declare function getGlobalSmartMode(globalFilePath?: string): TeammateSma
 export declare function setGlobalAskBeforeDispatch(enabled: boolean, globalFilePath?: string): boolean;
 /** Effective ask-before-dispatch flag without a cwd (global store only). */
 export declare function getGlobalAskBeforeDispatch(globalFilePath?: string): boolean;
+/** Effective monitoring-only background status heartbeat interval. */
+export declare function getGlobalBackgroundStatusHeartbeatMs(globalFilePath?: string): number;
 export declare function loadModelRoutingState(cwd: string, globalFilePath?: string, sessionId?: string): ModelRoutingState;
 export declare function loadModelRoutingConfig(cwd: string, globalFilePath?: string, sessionId?: string): ModelRoutingConfig;
 export interface ModelRoutingStorePair {

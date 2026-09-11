@@ -13,6 +13,11 @@ import {
   type TeammateTaskType,
 } from "../shared/task-types.ts";
 import { parseTeammateThinkingLevel, type TeammateThinkingLevel } from "../shared/thinking.ts";
+import {
+  BACKGROUND_STATUS_HEARTBEAT_DEFAULT_MS,
+  BACKGROUND_STATUS_HEARTBEAT_MAX_MS,
+  BACKGROUND_STATUS_HEARTBEAT_MIN_MS,
+} from "../shared/limits.ts";
 import type {
   ModelCircuitPolicy,
   ModelCircuitBreaker,
@@ -94,6 +99,8 @@ export interface GlobalModelRoutingStore {
   smartMode?: Exclude<TeammateSmartMode, "off">;
   /** Ask the user to confirm/pick model provider + thinking before each root dispatch. */
   askBeforeDispatch?: boolean;
+  /** User-level interval for monitoring-only status turns while background work remains active. */
+  backgroundStatusHeartbeatMs?: number;
 }
 
 export interface ProjectModelRoutingStore {
@@ -559,7 +566,7 @@ function invalidGlobalStore(): never {
 
 function normalizeGlobalStore(parsed: Record<string, unknown> | undefined): GlobalModelRoutingStore {
   if (parsed?.version === 3) {
-    assertKnownKeys(parsed, ["version", "defaultProfile", "profiles", "retiredProfileIds", "smartMode", "askBeforeDispatch"], "v3 global config");
+    assertKnownKeys(parsed, ["version", "defaultProfile", "profiles", "retiredProfileIds", "smartMode", "askBeforeDispatch", "backgroundStatusHeartbeatMs"], "v3 global config");
     if (!parsed.profiles || typeof parsed.profiles !== "object" || Array.isArray(parsed.profiles)) {
       return invalidGlobalStore();
     }
@@ -606,6 +613,14 @@ function normalizeGlobalStore(parsed: Record<string, unknown> | undefined): Glob
     if (parsed.askBeforeDispatch !== undefined && typeof parsed.askBeforeDispatch !== "boolean") {
       return invalidGlobalStore();
     }
+    const backgroundStatusHeartbeatMs = parsed.backgroundStatusHeartbeatMs;
+    if (backgroundStatusHeartbeatMs !== undefined
+      && (typeof backgroundStatusHeartbeatMs !== "number"
+        || !Number.isSafeInteger(backgroundStatusHeartbeatMs)
+        || backgroundStatusHeartbeatMs < BACKGROUND_STATUS_HEARTBEAT_MIN_MS
+        || backgroundStatusHeartbeatMs > BACKGROUND_STATUS_HEARTBEAT_MAX_MS)) {
+      return invalidGlobalStore();
+    }
     return {
       version: 3,
       defaultProfile: requestedDefault,
@@ -613,6 +628,7 @@ function normalizeGlobalStore(parsed: Record<string, unknown> | undefined): Glob
       ...(retiredProfileIds.length > 0 ? { retiredProfileIds } : {}),
       ...(smartMode === "off" ? {} : { smartMode }),
       ...(parsed.askBeforeDispatch === true ? { askBeforeDispatch: true } : {}),
+      ...(backgroundStatusHeartbeatMs === undefined ? {} : { backgroundStatusHeartbeatMs }),
     };
   }
   if (parsed?.version !== undefined && parsed.version !== 1 && parsed.version !== 2) {
@@ -1281,6 +1297,17 @@ export function getGlobalAskBeforeDispatch(
     return readGlobalStore(globalFilePath).askBeforeDispatch === true;
   } catch {
     return false;
+  }
+}
+
+/** Effective monitoring-only background status heartbeat interval. */
+export function getGlobalBackgroundStatusHeartbeatMs(
+  globalFilePath = getGlobalModelRoutingPath(),
+): number {
+  try {
+    return readGlobalStore(globalFilePath).backgroundStatusHeartbeatMs ?? BACKGROUND_STATUS_HEARTBEAT_DEFAULT_MS;
+  } catch {
+    return BACKGROUND_STATUS_HEARTBEAT_DEFAULT_MS;
   }
 }
 

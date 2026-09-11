@@ -450,6 +450,7 @@ import {
   appendSmartModelSelectionContext,
   appendTaskTypeRoutingContext,
   formatModelRoutingConfig,
+  getGlobalBackgroundStatusHeartbeatMs,
   listModelRoutingProfiles,
   loadModelRoutingState,
   parseTeammateTaskType,
@@ -1842,6 +1843,7 @@ export default function registerTeammateExtension(
   let sessionHostRegistry: SessionHostRegistry | undefined;
 
   const backgroundStatusHeartbeat = createBackgroundStatusHeartbeat({
+    intervalMs: getGlobalBackgroundStatusHeartbeatMs(),
     capture: () => {
       const activeAgents = [...state.activeRuns.values()]
         .filter((agent) => (agent.status === "pending" || agent.status === "running" || agent.status === "retrying")
@@ -10239,6 +10241,9 @@ This Monitor-only lifecycle tool loads configured target ids without exposing SS
   let widgetCtx: ExtensionContext | null = null;
   let agentWidgetInstalled = false;
   const teammateSettingsProvider = createTeammateSettingsProvider({
+    applyBackgroundStatusHeartbeatMs: (intervalMs) => {
+      backgroundStatusHeartbeat.setIntervalMs(intervalMs);
+    },
     openLegacySettings: async () => {
       if (!widgetCtx) return;
       await showTeammateControlCenter(widgetCtx);
@@ -10980,6 +10985,7 @@ This Monitor-only lifecycle tool loads configured target ids without exposing SS
   // =========================================================================
 
   pi.on("session_start", (event, ctx) => {
+    backgroundStatusHeartbeat.setIntervalMs(getGlobalBackgroundStatusHeartbeatMs());
     backgroundStatusHeartbeat.reset();
     registerTeammateSettings();
     state.settlementOwner = undefined;

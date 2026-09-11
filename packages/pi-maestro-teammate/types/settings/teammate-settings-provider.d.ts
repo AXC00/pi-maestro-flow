@@ -18,6 +18,7 @@ export interface TeammateSettingsProviderOptions {
         name: string;
         description: string;
     }[];
+    applyBackgroundStatusHeartbeatMs?: (intervalMs: number) => Promise<void> | void;
     openLegacySettings?: () => Promise<void> | void;
 }
 export declare function createTeammateSettingsProvider(options?: TeammateSettingsProviderOptions): TeammateSettingsProvider;

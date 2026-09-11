@@ -1,4 +1,6 @@
-export const BACKGROUND_STATUS_HEARTBEAT_MS = 4 * 60_000;
+import { BACKGROUND_STATUS_HEARTBEAT_DEFAULT_MS } from "../shared/limits.ts";
+
+export const BACKGROUND_STATUS_HEARTBEAT_MS = BACKGROUND_STATUS_HEARTBEAT_DEFAULT_MS;
 
 export interface BackgroundStatusTeammate {
   id: string;
@@ -47,6 +49,7 @@ export interface BackgroundStatusHeartbeatOptions {
 export interface BackgroundStatusHeartbeatController {
   markSessionActive: () => void;
   markSessionSettled: () => void;
+  setIntervalMs: (intervalMs: number) => void;
   refresh: () => void;
   reset: () => void;
 }
@@ -111,7 +114,7 @@ export function buildBackgroundStatusHeartbeatMessage(
 export function createBackgroundStatusHeartbeat(
   options: BackgroundStatusHeartbeatOptions,
 ): BackgroundStatusHeartbeatController {
-  const intervalMs = options.intervalMs ?? BACKGROUND_STATUS_HEARTBEAT_MS;
+  let intervalMs = options.intervalMs ?? BACKGROUND_STATUS_HEARTBEAT_MS;
   if (!Number.isFinite(intervalMs) || intervalMs <= 0) throw new Error("Background status heartbeat interval must be positive.");
   const now = options.now ?? Date.now;
   const scheduler = options.scheduler ?? {
@@ -156,6 +159,17 @@ export function createBackgroundStatusHeartbeat(
     },
     markSessionSettled(): void {
       settled = true;
+      schedule();
+    },
+    setIntervalMs(nextIntervalMs): void {
+      if (!Number.isFinite(nextIntervalMs) || nextIntervalMs <= 0) {
+        throw new Error("Background status heartbeat interval must be positive.");
+      }
+      if (nextIntervalMs === intervalMs) return;
+      intervalMs = nextIntervalMs;
+      generation += 1;
+      if (!settled) return;
+      cancel();
       schedule();
     },
     refresh(): void {

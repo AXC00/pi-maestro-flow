@@ -127,6 +127,32 @@ test("background state changes arm and cancel the timer only while the session i
   assert.equal(scheduler.callbacks.size, 0);
 });
 
+test("live interval changes re-arm settled monitoring and fence the replaced timer", () => {
+  const scheduler = new FakeScheduler();
+  let deliveries = 0;
+  const controller = createBackgroundStatusHeartbeat({
+    capture: activeSnapshot,
+    deliver: () => {
+      deliveries += 1;
+      return true;
+    },
+    intervalMs: 100,
+    scheduler,
+  });
+
+  controller.markSessionSettled();
+  const stale = [...scheduler.callbacks.values()][0];
+  assert.ok(stale);
+  controller.setIntervalMs(250);
+  assert.deepEqual([...scheduler.delays.values()], [250]);
+
+  stale();
+  assert.equal(deliveries, 0, "a replaced interval cannot deliver through its stale callback");
+  scheduler.fire();
+  assert.equal(deliveries, 1);
+  assert.throws(() => controller.setIntervalMs(0), /must be positive/);
+});
+
 test("reset fences stale timers and failed delivery retries with a fresh interval", () => {
   const scheduler = new FakeScheduler();
   let deliveries = 0;

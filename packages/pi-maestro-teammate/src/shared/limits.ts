@@ -22,3 +22,12 @@ export const TEAMMATE_STALL_TIMEOUT_MS = 30_000;
  * heartbeat and therefore only goes quiet when that heartbeat is actually lost.
  */
 export const TEAMMATE_EXPECTED_SILENCE_TIMEOUT_MS = 5 * 60_000;
+
+/**
+ * Periodic status turns keep an idle root session warm while background work
+ * remains active. Bound the user setting so it cannot become a high-frequency
+ * prompt source or silently stop serving its cache-preservation purpose.
+ */
+export const BACKGROUND_STATUS_HEARTBEAT_DEFAULT_MS = 10 * 60_000;
+export const BACKGROUND_STATUS_HEARTBEAT_MIN_MS = 60_000;
+export const BACKGROUND_STATUS_HEARTBEAT_MAX_MS = 30 * 60_000;

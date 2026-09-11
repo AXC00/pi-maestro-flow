@@ -34,9 +34,15 @@ import {
 } from "../models/model-routing.ts";
 import { parseTeammateTaskType, type TeammateTaskType } from "../shared/task-types.ts";
 import { TEAMMATE_THINKING_LEVELS, parseTeammateThinkingLevel } from "../shared/thinking.ts";
+import {
+  BACKGROUND_STATUS_HEARTBEAT_DEFAULT_MS,
+  BACKGROUND_STATUS_HEARTBEAT_MAX_MS,
+  BACKGROUND_STATUS_HEARTBEAT_MIN_MS,
+} from "../shared/limits.ts";
 
 const PROVIDER_ID = "pi-maestro-teammate";
 const PROVIDER_VERSION = "1.0.0";
+const BACKGROUND_STATUS_HEARTBEAT_SETTING_KEY = "monitoring.backgroundStatusHeartbeatMs";
 
 interface SettingsEventBus {
   on(event: string, handler: (payload: unknown) => void): void | (() => void);
@@ -54,6 +60,7 @@ export interface TeammateSettingsProviderOptions {
   discoverTaskTypes?: (cwd: string) => readonly TeammateTaskType[];
   discoverRoles?: (cwd: string) => readonly string[];
   discoverRoleSummaries?: (cwd: string) => { name: string; description: string }[];
+  applyBackgroundStatusHeartbeatMs?: (intervalMs: number) => Promise<void> | void;
   openLegacySettings?: () => Promise<void> | void;
 }
 
@@ -87,7 +94,11 @@ interface PreparedRoutingChange {
 const BASE_CATALOGS = {
   en: {
     "teammate.provider": "Teammate",
-    "teammate.provider.description": "Agent model, fallback and thinking routing",
+    "teammate.provider.description": "Agent routing and background monitoring",
+    "teammate.group.monitoring": "Background monitoring",
+    "teammate.monitoring.backgroundStatusHeartbeatMs": "Status heartbeat interval (ms)",
+    "teammate.monitoring.backgroundStatusHeartbeatMs.description": "Monitoring-only status turn interval while the root session is idle and teammate or bash_bg work remains active. Range: 1 minute to 30 minutes; default: 10 minutes.",
+    "teammate.monitoring.applyFailed": "The background status heartbeat interval could not be applied to the current session.",
     "teammate.routing.model": "Primary model",
     "teammate.routing.fallbacks": "Fallback models",
     "teammate.routing.thinking": "Thinking level",
@@ -105,7 +116,11 @@ const BASE_CATALOGS = {
   },
   "zh-CN": {
     "teammate.provider": "Teammate",
-    "teammate.provider.description": "Agent Model、Fallback 链与 Thinking 路由",
+    "teammate.provider.description": "Agent 路由与后台监测",
+    "teammate.group.monitoring": "后台监测",
+    "teammate.monitoring.backgroundStatusHeartbeatMs": "状态心跳间隔（毫秒）",
+    "teammate.monitoring.backgroundStatusHeartbeatMs.description": "主 Session 空闲且仍有 teammate 或 bash_bg 在后台运行时，发送仅表示监测状态的心跳轮次。范围 1 分钟到 30 分钟，默认 10 分钟。",
+    "teammate.monitoring.applyFailed": "无法将后台状态心跳间隔应用到当前 Session。",
     "teammate.routing.model": "主 Model",
     "teammate.routing.fallbacks": "Fallbacks",
     "teammate.routing.thinking": "Thinking",
@@ -192,7 +207,7 @@ export function createTeammateSettingsProvider(options: TeammateSettingsProvider
         prepared: true,
         prepareToken: token,
         validation: { valid: true, issues: [] },
-        activation: [{ boundary: "next-invocation", keys: state.changedKeys }],
+        activation: activationForKeys(state.changedKeys),
       };
     },
     commit: async (request) => {
@@ -227,7 +242,7 @@ export function createTeammateSettingsProvider(options: TeammateSettingsProvider
         snapshot: snapshot(resources, instanceId, taskTypes(request.context.cwd), roles(request.context.cwd), roleSummaries(request.context.cwd)),
         revisions: resources.map((entry) => entry.revision),
         changedKeys: state.changedKeys,
-        activation: [{ boundary: "next-invocation", keys: state.changedKeys }],
+        activation: activationForKeys(state.changedKeys),
       };
     },
     abort: async (request) => {
@@ -254,13 +269,39 @@ export function createTeammateSettingsProvider(options: TeammateSettingsProvider
       const restored = readResources(request.context.cwd, getGlobalPath, getProjectPath);
       return { rolledBack: true, snapshot: snapshot(restored, instanceId, taskTypes(request.context.cwd), roles(request.context.cwd), roleSummaries(request.context.cwd)) };
     },
-    applyRuntime: (request) => {
+    applyRuntime: async (request) => {
       const state = [...prepared.values()].find((entry) => entry.transactionId === request.transactionId);
       if (state) prepared.delete(state.token);
+      const liveKeys = request.changes
+        .map((change) => change.key)
+        .filter((key) => key === BACKGROUND_STATUS_HEARTBEAT_SETTING_KEY);
+      const deferredKeys = request.changes
+        .map((change) => change.key)
+        .filter((key) => key !== BACKGROUND_STATUS_HEARTBEAT_SETTING_KEY);
+      const appliedKeys: string[] = [];
+      const failed: Array<{ key: string; messageKey: string }> = [];
+      if (liveKeys.length > 0) {
+        const value = request.snapshot.effective.values.find(
+          (entry) => entry.key === BACKGROUND_STATUS_HEARTBEAT_SETTING_KEY,
+        )?.value;
+        if (typeof value === "number" && options.applyBackgroundStatusHeartbeatMs) {
+          try {
+            await options.applyBackgroundStatusHeartbeatMs(value);
+            appliedKeys.push(BACKGROUND_STATUS_HEARTBEAT_SETTING_KEY);
+          } catch {
+            failed.push({
+              key: BACKGROUND_STATUS_HEARTBEAT_SETTING_KEY,
+              messageKey: "teammate.monitoring.applyFailed",
+            });
+          }
+        } else {
+          deferredKeys.push(BACKGROUND_STATUS_HEARTBEAT_SETTING_KEY);
+        }
+      }
       return {
-        appliedKeys: [],
-        deferred: [{ boundary: "next-invocation", keys: request.changes.map((change) => change.key) }],
-        failed: [],
+        appliedKeys,
+        deferred: deferredKeys.length > 0 ? [{ boundary: "next-invocation", keys: deferredKeys }] : [],
+        failed,
       };
     },
     invokeAction: async () => ({ handled: false }),
@@ -326,6 +367,25 @@ function definitions(taskTypes: readonly TeammateTaskType[], roles: readonly str
       },
     },
   ]);
+  settings.unshift({
+    key: BACKGROUND_STATUS_HEARTBEAT_SETTING_KEY,
+    group: "teammate.group.monitoring",
+    order: 0,
+    labelKey: "teammate.monitoring.backgroundStatusHeartbeatMs",
+    descriptionKey: "teammate.monitoring.backgroundStatusHeartbeatMs.description",
+    defaultValue: BACKGROUND_STATUS_HEARTBEAT_DEFAULT_MS,
+    scopes: ["global"],
+    merge: "override",
+    activation: "live",
+    sensitivity: "public",
+    reversibility: "full",
+    editor: {
+      kind: "integer",
+      min: BACKGROUND_STATUS_HEARTBEAT_MIN_MS,
+      max: BACKGROUND_STATUS_HEARTBEAT_MAX_MS,
+      step: 60_000,
+    },
+  });
   settings.push(...roles.flatMap((role, index): SettingDefinition[] => [
     {
       key: roleSettingKey(role, "model"),
@@ -416,6 +476,21 @@ function snapshot(
   const profile = stores.global.profiles[profileId];
   const globalResource = resources.find((entry) => entry.scope === "global")!;
   const projectResource = resources.find((entry) => entry.scope === "project")!;
+  const configuredHeartbeatMs = stores.global.backgroundStatusHeartbeatMs;
+  configured.push({
+    key: BACKGROUND_STATUS_HEARTBEAT_SETTING_KEY,
+    scope: "global",
+    state: globalResource.document.error ? "invalid" : configuredHeartbeatMs === undefined ? "absent" : "set",
+    ...(configuredHeartbeatMs === undefined ? {} : { value: configuredHeartbeatMs }),
+    resource: globalResource.revision.resource,
+    ...(globalResource.document.error ? { messageKey: globalResource.document.error } : {}),
+  });
+  effective.push({
+    key: BACKGROUND_STATUS_HEARTBEAT_SETTING_KEY,
+    value: configuredHeartbeatMs ?? BACKGROUND_STATUS_HEARTBEAT_DEFAULT_MS,
+    source: configuredHeartbeatMs === undefined ? "default" : "configured",
+    ...(configuredHeartbeatMs === undefined ? {} : { scope: "global", resource: globalResource.revision.resource }),
+  });
   for (const taskType of taskTypes) {
     for (const field of ["model", "fallbacks", "thinking"] as const) {
       const key = settingKey(taskType, field);
@@ -591,11 +666,12 @@ function validateRequest(
       issues.push(issue(change, "teammate.settings.unknownKey"));
       continue;
     }
-    if (change.scope !== "global" && change.scope !== "project") {
+    if ((parsed.kind === "runtime" && change.scope !== "global")
+      || (parsed.kind !== "runtime" && change.scope !== "global" && change.scope !== "project")) {
       issues.push(issue(change, "teammate.settings.invalidScope"));
       continue;
     }
-    if (change.operation === "set" && !validValue(parsed.field, change.value)) {
+    if (change.operation === "set" && !validValue(parsed, change.value)) {
       issues.push(issue(change, "teammate.settings.invalidValue"));
     }
   }
@@ -611,6 +687,11 @@ function applyChanges(before: ModelRoutingStorePair, changes: readonly SettingsC
   for (const change of changes) {
     const parsed = parseSettingKey(change.key);
     if (!parsed) continue;
+    if (parsed.kind === "runtime") {
+      if (change.operation === "unset") delete next.global.backgroundStatusHeartbeatMs;
+      else next.global.backgroundStatusHeartbeatMs = change.value as number;
+      continue;
+    }
     const rules = change.scope === "global"
       ? next.global.profiles[profileId]
       : next.project.overrides;
@@ -695,24 +776,30 @@ function settingKey(taskType: TeammateTaskType, field: "model" | "fallbacks" | "
   return `routing.${taskType}.${field}`;
 }
 
+type RoutingField = "model" | "fallbacks" | "thinking";
+
 type ParsedSetting =
-  | { kind: "task"; taskType: TeammateTaskType; field: "model" | "fallbacks" | "thinking" }
-  | { kind: "role"; role: string; field: "model" | "fallbacks" | "thinking" };
+  | { kind: "runtime"; field: "backgroundStatusHeartbeatMs" }
+  | { kind: "task"; taskType: TeammateTaskType; field: RoutingField }
+  | { kind: "role"; role: string; field: RoutingField };
 
 function roleSettingKey(role: string, field: "model" | "fallbacks" | "thinking"): string {
   return `role.${role}.${field}`;
 }
 
 function parseSettingKey(key: string): ParsedSetting | undefined {
+  if (key === BACKGROUND_STATUS_HEARTBEAT_SETTING_KEY) {
+    return { kind: "runtime", field: "backgroundStatusHeartbeatMs" };
+  }
   const taskMatch = /^routing\.([a-z][a-z0-9._-]*)\.(model|fallbacks|thinking)$/.exec(key);
   if (taskMatch) {
     const taskType = parseTeammateTaskType(taskMatch[1]);
     if (!taskType) return undefined;
-    return { kind: "task", taskType, field: taskMatch[2] as ParsedSetting["field"] };
+    return { kind: "task", taskType, field: taskMatch[2] as RoutingField };
   }
   const roleMatch = /^role\.([a-z][a-z0-9._-]*)\.(model|fallbacks|thinking)$/.exec(key);
   if (!roleMatch) return undefined;
-  return { kind: "role", role: roleMatch[1], field: roleMatch[2] as ParsedSetting["field"] };
+  return { kind: "role", role: roleMatch[1], field: roleMatch[2] as RoutingField };
 }
 
 function sectionFor(field: "model" | "fallbacks" | "thinking"): "mappings" | "fallbackMappings" | "thinkingLevels" {
@@ -721,10 +808,25 @@ function sectionFor(field: "model" | "fallbacks" | "thinking"): "mappings" | "fa
   return "thinkingLevels";
 }
 
-function validValue(field: "model" | "fallbacks" | "thinking", value: JsonValue): boolean {
-  if (field === "model") return value === null || (typeof value === "string" && value.trim().length > 0);
-  if (field === "fallbacks") return value === null || (Array.isArray(value) && value.every((entry) => typeof entry === "string" && entry.trim().length > 0));
+function validValue(setting: ParsedSetting, value: JsonValue): boolean {
+  if (setting.kind === "runtime") {
+    return typeof value === "number"
+      && Number.isSafeInteger(value)
+      && value >= BACKGROUND_STATUS_HEARTBEAT_MIN_MS
+      && value <= BACKGROUND_STATUS_HEARTBEAT_MAX_MS;
+  }
+  if (setting.field === "model") return value === null || (typeof value === "string" && value.trim().length > 0);
+  if (setting.field === "fallbacks") return value === null || (Array.isArray(value) && value.every((entry) => typeof entry === "string" && entry.trim().length > 0));
   return value === null || parseTeammateThinkingLevel(value) !== undefined;
+}
+
+function activationForKeys(keys: readonly string[]): SettingsActivationPlan[] {
+  const live = keys.filter((key) => key === BACKGROUND_STATUS_HEARTBEAT_SETTING_KEY);
+  const deferred = keys.filter((key) => key !== BACKGROUND_STATUS_HEARTBEAT_SETTING_KEY);
+  return [
+    ...(live.length > 0 ? [{ boundary: "live" as const, keys: live }] : []),
+    ...(deferred.length > 0 ? [{ boundary: "next-invocation" as const, keys: deferred }] : []),
+  ];
 }
 
 function storePair(resources: readonly RoutingResourceState[]): ModelRoutingStorePair {

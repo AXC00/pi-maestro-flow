@@ -72,7 +72,9 @@ test("root Monitor command entry points exclude the legacy evaluator runtime", a
   assert.equal(source.match(/pi\.registerCommand\("teammate-send"/g)?.length, 1);
   assert.match(source, /kind: "workspace",[\s\S]*?capabilities: \{ inspect: true, wait: true, cancel: false, message: true, supervise: true \}/);
   assert.match(source, /pi\.events\.on\("bash-bg:update", applyBashBgSnapshot\)/);
-  assert.match(source, /createBackgroundStatusHeartbeat\(\{[\s\S]*?customType: "background-status-heartbeat"[\s\S]*?triggerTurn: true/);
+  assert.match(source, /createBackgroundStatusHeartbeat\(\{[\s\S]*?intervalMs: getGlobalBackgroundStatusHeartbeatMs\(\)[\s\S]*?customType: "background-status-heartbeat"[\s\S]*?triggerTurn: true/);
+  assert.match(source, /createTeammateSettingsProvider\(\{[\s\S]*?applyBackgroundStatusHeartbeatMs:[\s\S]*?backgroundStatusHeartbeat\.setIntervalMs\(intervalMs\)/);
+  assert.match(source, /pi\.on\("session_start"[\s\S]*?backgroundStatusHeartbeat\.setIntervalMs\(getGlobalBackgroundStatusHeartbeatMs\(\)\)/);
   assert.match(source, /pi\.on\("agent_start"[\s\S]*?backgroundStatusHeartbeat\.markSessionActive\(\)/);
   assert.match(source, /pi\.on\("agent_settled"[\s\S]*?backgroundStatusHeartbeat\.markSessionSettled\(\)/);
   assert.match(source, /pi\.on\("session_shutdown"[\s\S]*?backgroundStatusHeartbeat\.reset\(\)/);
