@@ -17,6 +17,9 @@
     "./transport-registry": "./src/transport-registry.ts",
     "./connection-manager": "./src/connection-manager.ts",
     "./admission-manager": "./src/admission-manager.ts",
+    "./store-coordinator": "./src/store-coordinator.ts",
+    "./presence-manager": "./src/presence-manager.ts",
+    "./invocation-manager": "./src/invocation-manager.ts",
     "./fixed-ssh-channel": "./src/fixed-ssh-channel.ts"
   },
   "files": [

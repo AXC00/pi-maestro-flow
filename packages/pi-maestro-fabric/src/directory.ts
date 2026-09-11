@@ -46,6 +46,28 @@ export interface FabricAdvertisementSnapshot {
   capabilities: readonly CapabilityBinding[];
 }
 
+export interface FabricAdvertisementDeltaRecords {
+  workspaces?: readonly WorkspaceRecord[];
+  endpoints?: readonly EndpointRecord[];
+  capabilities?: readonly CapabilityBinding[];
+}
+
+export interface FabricAdvertisementDeltaRemovals {
+  workspaceIds?: readonly string[];
+  endpointIds?: readonly string[];
+  capabilityIds?: readonly string[];
+}
+
+export interface FabricAdvertisementDelta {
+  connectionId: string;
+  connectionGeneration: number;
+  capabilityDigest: string;
+  baseRevision: number;
+  advertisementRevision: number;
+  upserts?: FabricAdvertisementDeltaRecords;
+  removals?: FabricAdvertisementDeltaRemovals;
+}
+
 export interface AcceptedAdvertisementMetadata {
   connectionId: string;
   connectionGeneration: number;
@@ -62,6 +84,13 @@ export interface FabricDirectorySnapshot {
   capabilities: readonly CapabilityBinding[];
 }
 
+export interface FabricAcceptedExecutionView extends AcceptedAdvertisementMetadata {
+  devices: readonly DeviceRecord[];
+  workspaces: readonly PublicWorkspaceRecord[];
+  endpoints: readonly EndpointRecord[];
+  capabilities: readonly CapabilityBinding[];
+}
+
 export interface CapabilityQuery {
   capabilityId?: string;
   kind?: FabricCapabilityKind;
@@ -70,6 +99,7 @@ export interface CapabilityQuery {
 }
 
 interface OwnedSnapshot extends AcceptedAdvertisementMetadata {
+  devices: readonly DeviceRecord[];
   workspaces: readonly WorkspaceRecord[];
   endpoints: readonly EndpointRecord[];
   capabilities: readonly CapabilityBinding[];
@@ -138,6 +168,7 @@ function cloneOwnedSnapshot(
     connectorId,
     capabilityDigest: snapshot.capabilityDigest,
     advertisementRevision: snapshot.advertisementRevision,
+    devices: snapshot.devices.map(projectDevice),
     workspaces: snapshot.workspaces.map((workspace) => ({ ...workspace, endpointIds: [...workspace.endpointIds] })),
     endpoints: snapshot.endpoints.map(projectEndpoint),
     capabilities: snapshot.capabilities.map(projectCapability),
@@ -146,6 +177,28 @@ function cloneOwnedSnapshot(
 
 function compareText(left: string, right: string): number {
   return left < right ? -1 : left > right ? 1 : 0;
+}
+
+function applyDeltaRecords<T>(
+  current: readonly T[],
+  upserts: readonly T[],
+  removals: readonly string[],
+  identity: (record: T) => string,
+  path: string,
+): readonly T[] {
+  const next = new Map(current.map((record) => [identity(record), record]));
+  const upserted = uniqueBy(upserts, identity, `${path}.upserts`);
+  const removed = new Set<string>();
+  for (const [index, id] of removals.entries()) {
+    assertFabricIdentifier(id, `${path}.removals[${index}]`);
+    if (removed.has(id)) conflict(`Duplicate ${path} removal '${id}'`, `${path}.removals[${index}]`);
+    if (upserted.has(id)) conflict(`${path} cannot upsert and remove '${id}'`, path);
+    if (!next.has(id)) conflict(`${path} cannot remove unknown identity '${id}'`, `${path}.removals[${index}]`);
+    removed.add(id);
+    next.delete(id);
+  }
+  for (const [id, record] of upserted) next.set(id, record);
+  return [...next.values()];
 }
 
 /** Host-owned durable authority plus connection-scoped advertisement projections. */
@@ -206,6 +259,53 @@ export class FabricDirectory {
 
   /** Internal package seam: only FabricConnectionManager supplies this symbol-keyed authority context. */
   [FABRIC_DIRECTORY_ADVERTISEMENT_AUTHORITY](
+    context: DirectoryAdvertisementAuthorityContext,
+    snapshot: FabricAdvertisementSnapshot,
+  ): AcceptedAdvertisementMetadata;
+  /** Applies a monotonic delta only to the exact accepted connection snapshot. */
+  [FABRIC_DIRECTORY_ADVERTISEMENT_AUTHORITY](
+    context: DirectoryAdvertisementAuthorityContext,
+    delta: FabricAdvertisementDelta,
+  ): AcceptedAdvertisementMetadata;
+  [FABRIC_DIRECTORY_ADVERTISEMENT_AUTHORITY](
+    context: DirectoryAdvertisementAuthorityContext,
+    input: FabricAdvertisementSnapshot | FabricAdvertisementDelta,
+  ): AcceptedAdvertisementMetadata {
+    if (!("baseRevision" in input)) return this.#acceptSnapshot(context, input);
+    const delta = input;
+    assertFabricIdentifier(delta.connectionId, "connectionId");
+    assertGeneration(delta.connectionGeneration, "connectionGeneration");
+    assertBoundedString(delta.capabilityDigest, "capabilityDigest", 256);
+    assertRevision(delta.baseRevision, "baseRevision");
+    assertRevision(delta.advertisementRevision, "advertisementRevision");
+    const previous = this.#advertisements.get(context.connectorId);
+    if (
+      previous === undefined || previous.connectionId !== context.connectionId ||
+      previous.connectionGeneration !== context.connectionGeneration ||
+      previous.capabilityDigest !== context.capabilityDigest ||
+      delta.connectionId !== context.connectionId || delta.connectionGeneration !== context.connectionGeneration ||
+      delta.capabilityDigest !== context.capabilityDigest
+    ) {
+      throw new FabricContractError("stale_generation", "Advertisement delta does not match the accepted connection", "connectionId");
+    }
+    if (delta.baseRevision !== previous.advertisementRevision || delta.advertisementRevision !== delta.baseRevision + 1) {
+      throw new FabricContractError("stale_generation", "Advertisement delta must advance the current revision by one", "baseRevision");
+    }
+    const upserts = delta.upserts ?? {};
+    const removals = delta.removals ?? {};
+    return this.#acceptSnapshot(context, {
+      connectionId: delta.connectionId,
+      connectionGeneration: delta.connectionGeneration,
+      capabilityDigest: delta.capabilityDigest,
+      advertisementRevision: delta.advertisementRevision,
+      devices: previous.devices,
+      workspaces: applyDeltaRecords(previous.workspaces, upserts.workspaces ?? [], removals.workspaceIds ?? [], (record) => record.workspaceId, "workspaces"),
+      endpoints: applyDeltaRecords(previous.endpoints, upserts.endpoints ?? [], removals.endpointIds ?? [], (record) => record.endpointId, "endpoints"),
+      capabilities: applyDeltaRecords(previous.capabilities, upserts.capabilities ?? [], removals.capabilityIds ?? [], (record) => record.capabilityId, "capabilities"),
+    });
+  }
+
+  #acceptSnapshot(
     context: DirectoryAdvertisementAuthorityContext,
     snapshot: FabricAdvertisementSnapshot,
   ): AcceptedAdvertisementMetadata {
@@ -414,6 +514,37 @@ export class FabricDirectory {
     if (entry === undefined) return undefined;
     const { connectionId, connectionGeneration, capabilityDigest, advertisementRevision } = entry;
     return { connectorId, connectionId, connectionGeneration, capabilityDigest, advertisementRevision };
+  }
+
+  getAcceptedExecutionView(connectorId: string, deviceId?: string): FabricAcceptedExecutionView | undefined {
+    const entry = this.#advertisements.get(connectorId);
+    if (entry === undefined) return undefined;
+    const devices = entry.devices.filter((device) => deviceId === undefined || device.deviceId === deviceId);
+    if (deviceId !== undefined && devices.length === 0) return undefined;
+    const deviceIds = new Set(devices.map((device) => device.deviceId));
+    const workspaces = entry.workspaces.filter((workspace) => deviceIds.has(workspace.deviceId));
+    const workspaceIds = new Set(workspaces.map((workspace) => workspace.workspaceId));
+    const endpoints = entry.endpoints.filter((endpoint) => deviceIds.has(endpoint.deviceId) && (endpoint.scope.kind !== "workspace" || workspaceIds.has(endpoint.scope.workspaceId)));
+    const endpointIds = new Set(endpoints.map((endpoint) => endpoint.endpointId));
+    return {
+      connectorId,
+      connectionId: entry.connectionId,
+      connectionGeneration: entry.connectionGeneration,
+      capabilityDigest: entry.capabilityDigest,
+      advertisementRevision: entry.advertisementRevision,
+      devices: devices.map(projectDevice).sort((a, b) => compareText(a.deviceId, b.deviceId)),
+      workspaces: workspaces.map(projectWorkspace).sort((a, b) => compareText(a.workspaceId, b.workspaceId)),
+      endpoints: endpoints.map(projectEndpoint).sort((a, b) => compareText(a.endpointId, b.endpointId)),
+      capabilities: entry.capabilities.filter((capability) => endpointIds.has(capability.endpointId)).map(projectCapability)
+        .sort((a, b) => compareText(a.capabilityId, b.capabilityId)),
+    };
+  }
+
+  listAcceptedExecutionViews(): readonly FabricAcceptedExecutionView[] {
+    return [...this.#advertisements.keys()].sort(compareText).flatMap((connectorId) => {
+      const view = this.getAcceptedExecutionView(connectorId);
+      return view === undefined ? [] : [view];
+    });
   }
 
   getConnector(connectorId: string): PublicConnectorRecord | undefined {

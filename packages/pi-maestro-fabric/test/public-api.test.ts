@@ -12,6 +12,9 @@ const publicFiles = [
   "transport-registry.ts",
   "connection-manager.ts",
   "admission-manager.ts",
+  "store-coordinator.ts",
+  "presence-manager.ts",
+  "invocation-manager.ts",
   "fixed-ssh-channel.ts",
 ];
 const runtimeFiles = [...publicFiles, "directory-authority.ts"];
