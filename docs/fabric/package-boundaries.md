@@ -1,6 +1,6 @@
 # Multi-Device Fabric Package Boundaries
 
-> Status: Phase 1 started. `pi-maestro-fabric-core` now contains the v1 pure contract baseline; runtime extraction and integration remain future work.
+> Status: Phase 2 connection kernel implemented. `pi-maestro-fabric-core` contains the v1 pure contract baseline and `pi-maestro-fabric` now provides the host-independent in-memory connection kernel; Flow integration and Phase 3+ work remain future work.
 
 ## 1. Why isolate the feature
 
@@ -228,19 +228,19 @@ No package may write another package's private state files directly.
 - define workspace ID mapping, three task authorities, and per-entry compatibility mappings;
 - resolve open decisions before creating runtime code.
 
-### Phase 1 — `pi-maestro-fabric-core` (started)
+### Phase 1 — `pi-maestro-fabric-core` (implemented baseline)
 
-- pure v1 records, protocol enums, validation, connection-first transitions, and redacted projections are implemented;
+- pure v1 records, protocol enums, bounded plain-JSON validation, explicit connected-to-ready transitions, and redacted allowlist projections are implemented;
 - focused tests cover identifier/UTF-8 bounds, route generations, workspace binding, replay proof, state transitions, public exports, and dependency isolation;
 - no transport, persistence, Gateway, teammate, or MCP runtime changes.
 
 ### Phase 2 — `pi-maestro-fabric` connection kernel
 
-- transport registry;
-- explicit connect/disconnect;
-- connection generation and shutdown drain;
-- device/workspace/endpoint read models;
-- separate adapters for current Gateway-control and teammate-runtime fixed SSH channels;
+- explicit transport registry and host-authority seeding separated from connection-scoped advertisements;
+- explicit connect, accepted-advertisement readiness, retryable disconnect, and one-current-generation-per-Connector fencing;
+- deadline-scheduled shutdown drain plus bounded terminal metadata retention/compaction;
+- revision-fenced Device/Connector authority and generation-high-water Workspace/Endpoint read models;
+- separate generic adapters that preserve the actual host-owned Gateway-control and teammate-runtime fixed SSH handles;
 - do not claim a generic remote MCP data path until its framing, identity, and route fencing are verified;
 - freeze only Device/Connection/Workspace/Endpoint/Route MVP contracts; Artifact and Edge contracts remain provisional;
 - no WSS and no Edge yet.

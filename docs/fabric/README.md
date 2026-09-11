@@ -105,6 +105,6 @@ pi-maestro-flow          Gateway/CLI/TUI/MCP/Board integration
 
 `pi-maestro-teammate` may depend only on versioned Fabric contracts or receive a runtime-registered placement provider. Fabric must not statically import Flow or teammate internals.
 
-Phase 1 has started in `packages/pi-maestro-fabric-core`: v1 pure contracts, validators, connection-first transitions, and public projections are implemented without network, storage, process, UI, teammate, or MCP runtime dependencies.
+Phase 2 now includes `packages/pi-maestro-fabric`: the host-independent in-memory directory, connection/admission kernel, explicit transport registry, and two fixed SSH channel seams are implemented on top of `pi-maestro-fabric-core`; Flow integration and Phase 3+ remain deferred.
 
 See [Package boundaries](./package-boundaries.md) for the incremental migration.

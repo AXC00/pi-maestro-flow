@@ -1,0 +1,35 @@
+{
+  "name": "pi-maestro-fabric",
+  "version": "0.1.0",
+  "description": "Host-independent connection kernel for the Pi Maestro multi-device Fabric.",
+  "type": "module",
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "scripts": {
+    "test": "node --experimental-transform-types --test \"test/*.test.ts\"",
+    "typecheck": "tsc --noEmit -p tsconfig.json"
+  },
+  "main": "./src/index.ts",
+  "exports": {
+    ".": "./src/index.ts",
+    "./directory": "./src/directory.ts",
+    "./transport-registry": "./src/transport-registry.ts",
+    "./connection-manager": "./src/connection-manager.ts",
+    "./admission-manager": "./src/admission-manager.ts",
+    "./fixed-ssh-channel": "./src/fixed-ssh-channel.ts"
+  },
+  "files": [
+    "src/**/*.ts"
+  ],
+  "keywords": [
+    "pi",
+    "maestro",
+    "fabric",
+    "multi-device"
+  ],
+  "license": "ISC",
+  "dependencies": {
+    "pi-maestro-fabric-core": "0.1.0"
+  }
+}
