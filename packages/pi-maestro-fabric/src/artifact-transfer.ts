@@ -9,8 +9,14 @@ import {
   type JsonValue,
 } from "pi-maestro-fabric-core/v1";
 
-/** 48 KiB keeps a chunk comfortably inside the protocol frame bound. */
-export const FABRIC_ARTIFACT_CHUNK_BYTES = 48 * 1024;
+/**
+ * 24 KiB: the encoded chunk has to fit inside one protocol frame.
+ *
+ * 48 KiB base64-encodes to exactly 65,536 bytes — the entire JSON payload
+ * budget — and the chunk's own fields then push the frame over it, so a larger
+ * chunk could never travel the stream seam at all.
+ */
+export const FABRIC_ARTIFACT_CHUNK_BYTES = 24 * 1024;
 export const FABRIC_ARTIFACT_TRANSFER_STATES = ["available", "transferring", "partial", "complete", "cancelled"] as const;
 export type FabricArtifactTransferState = (typeof FABRIC_ARTIFACT_TRANSFER_STATES)[number];
 

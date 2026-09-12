@@ -160,7 +160,7 @@ test("out-of-order, overrunning, and short non-final chunks are refused", () => 
   assert.throws(() => receiver.accept(chunkOf(content, FABRIC_ARTIFACT_CHUNK_BYTES, FABRIC_ARTIFACT_CHUNK_BYTES), "route-1"), /does not continue at 0/);
   // A replay of an already-accepted offset.
   receiver.accept(chunkOf(content, 0, FABRIC_ARTIFACT_CHUNK_BYTES), "route-1");
-  assert.throws(() => receiver.accept(chunkOf(content, 0, FABRIC_ARTIFACT_CHUNK_BYTES), "route-1"), /does not continue at 49152/);
+  assert.throws(() => receiver.accept(chunkOf(content, 0, FABRIC_ARTIFACT_CHUNK_BYTES), "route-1"), new RegExp(`does not continue at ${FABRIC_ARTIFACT_CHUNK_BYTES}`));
   // A chunk that would overrun the artifact.
   const overrun = { ...chunkOf(content, FABRIC_ARTIFACT_CHUNK_BYTES, FABRIC_ARTIFACT_CHUNK_BYTES), byteLength: FABRIC_ARTIFACT_CHUNK_BYTES + 1 };
   assert.throws(() => receiver.accept(overrun, "route-1"), FabricContractError);

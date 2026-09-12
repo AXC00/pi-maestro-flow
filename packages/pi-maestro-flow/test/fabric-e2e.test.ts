@@ -1743,13 +1743,14 @@ test("chain 4 shows the Edge/WSS path refusing a full-size chunk, and the real s
   assert.equal(receiver.receivedBytes, 0);
   assert.equal(receiver.finish(), "partial", "an artifact the Endpoint never received cannot report complete");
 
-  // The converse bound: the Endpoint refuses anything smaller than a full chunk,
-  // so no chunk size is both admissible on the wire and admissible here.
+  // The receiver's own bound is independent of the wire: a non-final chunk that
+  // is not a full chunk is refused, so the two sides cannot agree on a smaller
+  // chunk size to work around the path's refusal.
   assert.throws(
     () => receiver.accept({
-      version: FABRIC_ARTIFACT_VERSION, artifactId: manifest.artifactId, offset: 0, byteLength: 32 * 1024,
-      digest: nodeDigest.of(content.subarray(0, 32 * 1024)),
-      encodedData: Buffer.from(content.subarray(0, 32 * 1024)).toString("base64"), final: false,
+      version: FABRIC_ARTIFACT_VERSION, artifactId: manifest.artifactId, offset: 0, byteLength: 1_024,
+      digest: nodeDigest.of(content.subarray(0, 1_024)),
+      encodedData: Buffer.from(content.subarray(0, 1_024)).toString("base64"), final: false,
     }, route.routeId),
     /must be a full chunk/,
   );
