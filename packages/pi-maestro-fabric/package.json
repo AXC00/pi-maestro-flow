@@ -25,7 +25,8 @@
     "./channel-router": "./src/channel-router.ts",
     "./mcp-mount-provider": "./src/mcp-mount-provider.ts",
     "./outbound-wss-transport": "./src/outbound-wss-transport.ts",
-    "./edge-relay-transport": "./src/edge-relay-transport.ts"
+    "./edge-relay-transport": "./src/edge-relay-transport.ts",
+    "./artifact-transfer": "./src/artifact-transfer.ts"
   },
   "files": [
     "src/**/*.ts"

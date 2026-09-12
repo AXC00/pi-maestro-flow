@@ -21,6 +21,7 @@ const publicFiles = [
   "mcp-mount-provider.ts",
   "outbound-wss-transport.ts",
   "edge-relay-transport.ts",
+  "artifact-transfer.ts",
 ];
 const runtimeFiles = [...publicFiles, "directory-authority.ts"];
 
