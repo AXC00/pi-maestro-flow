@@ -1,13 +1,15 @@
 /** Lifecycle owner for the one packaged Gateway daemon. */
 import { dirname, join } from "node:path";
 import type { GatewayConfig } from "./config.ts";
-import { gatewayTunnelProfileInput, loadGatewayConfig } from "./config.ts";
+import { gatewayTunnelProfileInput, FABRIC_DEFAULT_AUDIENCE, loadGatewayConfig } from "./config.ts";
 import { GATEWAY_PROTOCOL_VERSION, type GatewayOwnerRecord } from "./contracts.ts";
 import type { GatewayHttpServerHandle } from "./http-server.ts";
 import { isLoopbackHost } from "./auth.ts";
 import { gatewayIpcAddress, startGatewayIpcServer, type GatewayIpcServerHandle } from "./ipc.ts";
 import { GatewayOwnerStore } from "./owner-store.ts";
 import { GatewayRuntime, type GatewayRuntimeOptions } from "./runtime.ts";
+import { FabricConnectorSecurity } from "./fabric/security.ts";
+import { FabricWssServer } from "./fabric/wss-server.ts";
 import { GatewayControlDispatcher, type GatewayControlHandler, type GatewayTunnelControlAction } from "./control-dispatcher.ts";
 import type { GatewayTunnelProvider } from "./tunnel/contracts.ts";
 import { GatewayTunnelManager } from "./tunnel/provider.ts";
@@ -41,6 +43,8 @@ export class GatewayDaemon {
   http?: GatewayHttpServerHandle;
   controlDispatcher?: GatewayControlDispatcher;
   tunnelManager?: GatewayTunnelManager;
+  fabricSecurity?: FabricConnectorSecurity;
+  fabricWss?: FabricWssServer;
   private ownerStore?: GatewayOwnerStore;
   private stopping?: Promise<void>;
   private stopped: Promise<void> = Promise.resolve();
@@ -196,6 +200,23 @@ export class GatewayDaemon {
           path: this.options.httpPath,
         });
       }
+      if (config.fabric.enabled) {
+        // Fabric rides the Gateway's own TLS listener: a Connector channel on a
+        // plaintext socket would authenticate a key over a link anyone can
+        // rewrite, and the pairing rules already refuse that for HTTP.
+        if (this.http === undefined || !this.http.secure) {
+          throw new Error(
+            "Fabric requires the Gateway HTTPS listener; enable transport.http.tls or disable fabric",
+          );
+        }
+        this.fabricSecurity = new FabricConnectorSecurity({ audience: config.fabric.audience ?? FABRIC_DEFAULT_AUDIENCE });
+        this.fabricWss = new FabricWssServer({
+          security: this.fabricSecurity,
+          server: this.http.server,
+          limits: config.fabric.limits,
+        });
+        this.fabricWss.start();
+      }
       // Recovery is fail-soft: an external ingress failure never takes down the
       // local HTTPS/stdio Gateway.
       if (tunnelManager) void tunnelManager.recoverAll().catch(() => undefined);
@@ -212,6 +233,11 @@ export class GatewayDaemon {
       const ownerToken = this.owner?.ownerToken;
       const deadlineAt = Date.now() + (this.options.shutdownTimeoutMs ?? 5_000);
       this.http?.setReady(false);
+      // Drain Connector channels before the listener goes away, so a peer sees a
+      // deliberate close rather than a dropped socket.
+      await this.fabricWss?.close("the Gateway is shutting down").catch(() => undefined);
+      this.fabricWss = undefined;
+      this.fabricSecurity = undefined;
       await Promise.allSettled([
         this.runtime?.beginQuiesce(deadlineAt),
         this.tunnelManager?.closeAll(deadlineAt),

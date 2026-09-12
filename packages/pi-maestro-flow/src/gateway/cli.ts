@@ -177,6 +177,20 @@ export async function main(argv = process.argv.slice(2), io: GatewayCliIo = {}):
       await relayGatewayStdio();
       return 0;
     }
+    if (command === "connector") {
+      const action = args[0];
+      if (action !== "start" && action !== "stop" && action !== "status") {
+        throw new Error("Usage: pi-maestro-gateway connector start|stop|status [--json]");
+      }
+      const flags = args.slice(1);
+      const unknown = flags.filter((arg) => arg !== "--json");
+      if (unknown.length > 0) throw new Error(`connector ${action} does not accept ${unknown[0]}`);
+      const { fabricConnectorStart, fabricConnectorStatus, fabricConnectorStop } = await import("./fabric/connector-cli.ts");
+      const io = { stdout: (text: string) => write(stdout, text.trimEnd()), stderr: (text: string) => write(stderr, text.trimEnd()), root: process.cwd(), json: flags.includes("--json") };
+      if (action === "status") return await fabricConnectorStatus(io);
+      if (action === "start") return await fabricConnectorStart(io);
+      return await fabricConnectorStop(io);
+    }
     if (command === "config") {
       const { runGatewayConfigCommand } = await import("./config-tui.ts");
       await runGatewayConfigCommand(args, { input: stdin, output: stdout });
@@ -420,6 +434,7 @@ export async function main(argv = process.argv.slice(2), io: GatewayCliIo = {}):
         "  connect --stdio",
         "  config [--config PATH]  # standalone terminal UI; no Pi host required",
         "  config-sync apply",
+        "  connector start|stop|status [--json]  # Fabric Connector for this workspace",
         "  migrate-legacy --dry-run|--apply [--json]",
         "  service install|ensure|start|stop|restart|status|uninstall [--config PATH] [--json]",
         "    install|ensure [--windows-startup | --detached-fallback]",

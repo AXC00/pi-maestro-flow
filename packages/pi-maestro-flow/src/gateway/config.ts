@@ -278,8 +278,7 @@ export function gatewayTunnelProfileInput(
 }
 
 export interface GatewayConfig {
-  version: typeof GATEWAY_CONFIG_VERSION;
-  server: GatewayServerConfig;
+  version: typeof GATEWAY_CONFIG_VERSION;  server: GatewayServerConfig;
   auth: GatewayAuthConfig;
   security: GatewaySecurityConfig;
   workspaces: GatewayWorkspaceConfig[];
@@ -289,6 +288,26 @@ export interface GatewayConfig {
   state: GatewayStateConfig;
   retention: GatewayRetentionConfig;
   tunnels: GatewayTunnelsConfig;
+  fabric: GatewayFabricConfig;
+}
+
+export interface GatewayFabricConfig {
+  enabled: boolean;
+  /**
+   * Audience every Fabric Connector pairing and proof must carry.
+   *
+   * Optional so that a document which does not mention Fabric stays exactly as
+   * it was: a default written back into the canonical form would read as an
+   * operator setting on the next load.
+   */
+  audience?: string;
+  /** Absolute path of the Connector enrollment document, when one is persisted. */
+  enrollmentPath?: string;
+  limits?: {
+    maxFrameBytes: number;
+    heartbeatIntervalMs: number;
+    heartbeatTimeoutMs: number;
+  };
 }
 
 export type GatewayConfigPatchValue<T> =
@@ -318,7 +337,7 @@ export class GatewayConfigValidationError extends Error {
   }
 }
 
-const KNOWN_SECTIONS = new Set(["version", "server", "auth", "security", "workspaces", "transport", "limits", "logging", "state", "retention", "tunnels"]);
+const KNOWN_SECTIONS = new Set(["version", "server", "auth", "security", "workspaces", "transport", "limits", "logging", "state", "retention", "tunnels", "fabric"]);
 const MAX_CONFIG_BYTES = 4 * 1024 * 1024;
 
 const DEFAULT_SERVER: GatewayServerConfig = {
@@ -352,6 +371,12 @@ const DEFAULT_TUNNELS: GatewayTunnelsConfig = {
   },
   profiles: [],
 };
+const DEFAULT_FABRIC: GatewayFabricConfig = {
+  enabled: false,
+};
+/** Audience used when the document does not name one. */
+export const FABRIC_DEFAULT_AUDIENCE = "fabric";
+const DEFAULT_FABRIC_LIMITS = { maxFrameBytes: 256 * 1024, heartbeatIntervalMs: 10_000, heartbeatTimeoutMs: 30_000 } as const;
 const DEFAULT_RETENTION: GatewayRetentionConfig = {
   jobsMs: 7 * 24 * 60 * 60 * 1000,
   tasksMs: 30 * 24 * 60 * 60 * 1000,
@@ -421,6 +446,7 @@ export function defaultGatewayConfig(): GatewayConfig {
     state: {},
     retention: DEFAULT_RETENTION,
     tunnels: DEFAULT_TUNNELS,
+    fabric: DEFAULT_FABRIC,
   });
 }
 
@@ -693,6 +719,40 @@ export function normalizeGatewayConfig(value: unknown): GatewayConfig {
 
   const tunnelsRaw = optionalObject(root.tunnels, "tunnels");
   knownKeys(tunnelsRaw, ["openai", "profiles"], "tunnels");
+  const fabricRaw = optionalObject(root.fabric, "fabric");
+  knownKeys(fabricRaw, ["enabled", "audience", "limits", "enrollmentPath", "enrollment_path"], "fabric");
+  const fabricEnabled = bool(fabricRaw.enabled, "fabric.enabled", DEFAULT_FABRIC.enabled);
+  const fabricLimitsRaw = optionalObject(fabricRaw.limits, "fabric.limits");
+  knownKeys(fabricLimitsRaw, ["maxFrameBytes", "max_frame_bytes", "heartbeatIntervalMs", "heartbeat_interval_ms", "heartbeatTimeoutMs", "heartbeat_timeout_ms"], "fabric.limits");
+  const fabricLimits = {
+    maxFrameBytes: integer(fabricLimitsRaw.maxFrameBytes ?? fabricLimitsRaw.max_frame_bytes, "fabric.limits.maxFrameBytes", 1_024, 16 * 1024 * 1024, DEFAULT_FABRIC_LIMITS.maxFrameBytes),
+    heartbeatIntervalMs: integer(fabricLimitsRaw.heartbeatIntervalMs ?? fabricLimitsRaw.heartbeat_interval_ms, "fabric.limits.heartbeatIntervalMs", 100, 600_000, DEFAULT_FABRIC_LIMITS.heartbeatIntervalMs),
+    heartbeatTimeoutMs: integer(fabricLimitsRaw.heartbeatTimeoutMs ?? fabricLimitsRaw.heartbeat_timeout_ms, "fabric.limits.heartbeatTimeoutMs", 200, 3_600_000, DEFAULT_FABRIC_LIMITS.heartbeatTimeoutMs),
+  };
+  if (fabricLimits.heartbeatTimeoutMs <= fabricLimits.heartbeatIntervalMs) {
+    throw new GatewayConfigValidationError("fabric.limits.heartbeatTimeoutMs must exceed heartbeatIntervalMs");
+  }
+  const fabricAudience = optionalString(fabricRaw.audience, "fabric.audience", 256);
+  const fabricEnrollmentPath = optionalString(fabricRaw.enrollmentPath ?? fabricRaw.enrollment_path, "fabric.enrollmentPath", 4_096);
+  const fabricLimitsConfigured = Object.keys(fabricLimitsRaw).length > 0;
+  const fabric: GatewayFabricConfig = {
+    enabled: fabricEnabled,
+    ...(fabricAudience === undefined ? {} : { audience: fabricAudience }),
+    ...(fabricLimitsConfigured ? { limits: fabricLimits } : {}),
+    ...(fabricEnrollmentPath === undefined ? {} : { enrollmentPath: fabricEnrollmentPath }),
+  };
+  // Fabric is recognized whether or not it is enabled: a document that names
+  // Fabric settings while the section is off is a configuration the operator
+  // meant to take effect, and silently ignoring it would leave the Gateway
+  // running without the multi-device plane it was configured for.
+  if (!fabricEnabled) {
+    const configured = Object.keys(fabricRaw).filter((key) => key !== "enabled");
+    if (configured.length > 0) {
+      throw new GatewayConfigValidationError(
+        `fabric.${configured[0]} is set while fabric.enabled is false; enable Fabric or remove the setting rather than leaving it ignored`,
+      );
+    }
+  }
   const openaiRaw = optionalObject(tunnelsRaw.openai, "tunnels.openai");
   knownKeys(openaiRaw, ["enabled", "binaryPath", "binary_path", "tunnelIdEnv", "tunnel_id_env", "runtimeKeyEnv", "runtime_key_env", "minimumVersion", "minimum_version", "credentialTtlMs", "credential_ttl_ms"], "tunnels.openai");
   const environmentName = (value: unknown, path: string, fallback: string): string => {
@@ -865,6 +925,7 @@ export function normalizeGatewayConfig(value: unknown): GatewayConfig {
     state,
     retention,
     tunnels,
+    fabric,
   };
 }
 

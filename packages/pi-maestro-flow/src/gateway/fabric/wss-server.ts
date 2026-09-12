@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import type { IncomingMessage } from "node:http";
+import type { IncomingMessage, Server as HttpServer } from "node:http";
 import type { Server as HttpsServer } from "node:https";
 import { WebSocketServer, type RawData, type WebSocket } from "ws";
 import {
@@ -65,7 +65,12 @@ export interface FabricConnectorSession {
 
 export interface FabricWssServerOptions {
   readonly security: FabricConnectorSecurity;
-  readonly server: HttpsServer;
+  /**
+   * The host's own listener. TLS is the host's decision: the daemon refuses to
+   * mount this without its HTTPS listener, and attaching here does not itself
+   * make the socket secure.
+   */
+  readonly server: HttpServer | HttpsServer;
   readonly path?: string;
   readonly limits?: Partial<FabricProtocolLimits>;
   readonly now?: () => number;
