@@ -140,6 +140,12 @@ export class FabricArtifactSender {
           throw new FabricContractError("invalid_argument", `the source returned more bytes than requested`);
         }
         running.update(bytes);
+        if (bytes.byteLength !== byteLength) {
+          // A short non-final read would produce a chunk the receiver must
+          // refuse, so the sender refuses it first rather than publishing a
+          // stream the peer can never accept.
+          throw new FabricContractError("invalid_state", "the source returned a short chunk");
+        }
         const chunk: FabricArtifactChunkV1 = {
           version: FABRIC_ARTIFACT_VERSION,
           artifactId: manifest.artifactId,
@@ -177,6 +183,11 @@ export class FabricArtifactSender {
         // The bytes read are not the artifact the manifest describes.
         throw new FabricContractError("invalid_state", "the source content changed during transfer");
       }
+      if (this.#cancelled) {
+        // Cancellation during an in-flight read or send is final: a transfer a
+        // caller cancelled must never later report complete.
+        throw new FabricContractError("cancelled", "artifact transfer was cancelled");
+      }
       this.#state = "complete";
     } catch (error) {
       // A transport failure after the receiver may already hold bytes is not a
@@ -201,8 +212,11 @@ export class FabricArtifactSender {
       }
       if (frame.kind === "ack") {
         const offset = frame.payload.offset;
-        if (typeof offset !== "number") {
-          throw new FabricContractError("invalid_argument", "artifact acknowledgement is missing its offset");
+        // An acknowledgement may only confirm bytes that were actually sent. A
+        // future, negative, or non-integer offset would otherwise let the drain
+        // loop exit early and report a transfer the receiver never confirmed.
+        if (typeof offset !== "number" || !Number.isSafeInteger(offset) || offset < 0 || offset > this.#sentBytes) {
+          throw new FabricContractError("invalid_argument", "artifact acknowledgement offset is outside the bytes sent");
         }
         this.#acknowledgedBytes = Math.max(this.#acknowledgedBytes, offset);
         continue;
@@ -277,6 +291,12 @@ export class FabricArtifactReceiver {
     if (value.artifactId !== this.#manifest.artifactId) {
       throw new FabricContractError("invalid_argument", "artifact chunk names a different artifact");
     }
+    if (this.#routeId !== undefined && routeId !== this.#routeId) {
+      // Bytes may only be joined on the route they were already travelling: a
+      // change of route is a resume, and a resume must be explicitly admitted
+      // against an authorized route rather than arriving with a bare chunk.
+      throw new FabricContractError("invalid_argument", "artifact chunk arrived on a route this transfer is not using; resume first");
+    }
     if (value.offset !== this.#receivedBytes) {
       // A gap or an overlap would make the reassembled body depend on arrival
       // order, so the transfer refuses rather than guessing.
@@ -306,7 +326,9 @@ export class FabricArtifactReceiver {
     this.#running.update(bytes);
     this.#receivedBytes += value.byteLength;
     this.#lastChunkDigest = value.digest;
-    this.#routeId = routeId;
+    // The first chunk establishes the route; later chunks were already checked
+    // against it above.
+    this.#routeId ??= routeId;
     this.#state = "transferring";
     return this.#receivedBytes;
   }

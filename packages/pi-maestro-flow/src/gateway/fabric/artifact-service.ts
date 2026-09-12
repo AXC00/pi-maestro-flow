@@ -1,6 +1,6 @@
-import { createHash } from "node:crypto";
-import { mkdir, rename, rm, writeFile } from "node:fs/promises";
-import { dirname, isAbsolute, join } from "node:path";
+import { createHash, randomBytes } from "node:crypto";
+import { mkdir, open, rename, rm } from "node:fs/promises";
+import { basename, dirname, isAbsolute, join } from "node:path";
 import { FabricContractError, type FabricArtifactState } from "pi-maestro-fabric-core/v1";
 import { FABRIC_ARTIFACT_CHUNK_BYTES, type FabricArtifactManifestV1 } from "pi-maestro-fabric";
 import type { FabricArtifactSourceEntry } from "./artifact-source.ts";
@@ -88,19 +88,30 @@ export class FabricArtifactService {
     const manifest = await this.manifest(artifactId);
     const directory = dirname(destination);
     await mkdir(directory, { recursive: true });
-    const temporary = join(directory, `.${artifactId}.fabric-partial`);
+    // A staging name unique to this operation, created exclusively: a
+    // predictable name could be pre-created as a symlink and redirect the write
+    // outside the destination the caller named.
+    const temporary = join(directory, `.${basename(destination)}.fabric-partial-${randomBytes(8).toString("hex")}`);
     const hasher = createHash("sha256");
+    let handle: Awaited<ReturnType<typeof open>> | undefined;
     try {
+      handle = await open(temporary, "wx", 0o600);
       let offset = 0;
-      const parts: Buffer[] = [];
       while (offset < manifest.byteLength) {
         const byteLength = Math.min(FABRIC_ARTIFACT_CHUNK_BYTES, manifest.byteLength - offset);
         const bytes = await this.#source.read(this.#require(artifactId), offset, byteLength);
         if (bytes.byteLength === 0) {
           throw new FabricContractError("invalid_state", `artifact ${artifactId} ended before its manifest byteLength was reached`);
         }
+        if (bytes.byteLength > byteLength) {
+          // A reader that returns more than it was asked for would make the
+          // published file disagree with the manifest it was verified against.
+          throw new FabricContractError("invalid_argument", `artifact ${artifactId} returned more bytes than requested`);
+        }
         hasher.update(bytes);
-        parts.push(Buffer.from(bytes));
+        // Written per bounded chunk while hashing, so peak memory stays
+        // proportional to the chunk rather than to the artifact.
+        await handle.write(bytes);
         offset += bytes.byteLength;
       }
       const digest = hasher.digest("hex");
@@ -109,10 +120,12 @@ export class FabricArtifactService {
         // a mixture as the artifact the caller asked for.
         throw new FabricContractError("invalid_state", `artifact ${artifactId} changed while it was being read`);
       }
-      await writeFile(temporary, Buffer.concat(parts));
+      await handle.close();
+      handle = undefined;
       await rename(temporary, destination);
       return { byteLength: offset, digest };
     } catch (error) {
+      await handle?.close().catch(() => undefined);
       await rm(temporary, { force: true }).catch(() => undefined);
       throw error;
     }

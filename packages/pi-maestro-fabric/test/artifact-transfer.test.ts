@@ -187,14 +187,19 @@ test("a wrong final digest leaves an explicit partial state, never complete", ()
   const content = randomBytes(FABRIC_ARTIFACT_CHUNK_BYTES + 10);
   const receiver = new FabricArtifactReceiver(manifestOf(content), nodeDigest);
   receiver.accept(chunkOf(content, 0, FABRIC_ARTIFACT_CHUNK_BYTES), "route-1");
-  receiver.accept(chunkOf(content, FABRIC_ARTIFACT_CHUNK_BYTES, 10), "route-2");
-  // The manifest promised different content than the chunks carried.
+  // Same route: this test is about the digest verdict, not route continuity.
+  receiver.accept(chunkOf(content, FABRIC_ARTIFACT_CHUNK_BYTES, 10), "route-1");
+  // The manifest promised different content than the chunks carried, so the
+  // receiver must report partial even though every chunk checked out.
   const wrongManifest = new FabricArtifactReceiver({ ...manifestOf(content), digest: sha256(randomBytes(4)) }, nodeDigest);
+  wrongManifest.accept(chunkOf(content, 0, FABRIC_ARTIFACT_CHUNK_BYTES), "route-1");
+  wrongManifest.accept(chunkOf(content, FABRIC_ARTIFACT_CHUNK_BYTES, 10), "route-1");
+  assert.equal(wrongManifest.finish(), "partial");
+  assert.equal(wrongManifest.state, "partial");
   const partial = new FabricArtifactReceiver(manifestOf(randomBytes(8)), nodeDigest);
   assert.equal(partial.finish(), "partial");
   assert.equal(partial.state, "partial");
   assert.equal(receiver.finish(), "complete");
-  void wrongManifest;
 });
 
 test("a source whose content changed mid-transfer fails instead of publishing a stitched body", async () => {
