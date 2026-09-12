@@ -9,6 +9,7 @@
 
 export {
   PI_SUBPROCESS,
+  FABRIC_BACKEND,
   backendRegistryConfigSync,
   dispatchRegistryForProjectionSync,
   dispatchRegistrySync,

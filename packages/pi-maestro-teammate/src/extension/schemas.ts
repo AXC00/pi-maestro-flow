@@ -12,6 +12,7 @@
  */
 
 import { Type, type Static } from "typebox";
+import type { TeammatePlacementV1 } from "pi-maestro-fabric-core/v1/placement";
 import { TEAMMATE_THINKING_INPUTS } from "../shared/thinking.ts";
 import {
   MONITOR_QUERY_DEFAULT_TIMEOUT_MS,
@@ -104,6 +105,13 @@ export const TaskSpec = Type.Object({
   thinking: Type.Optional(ThinkingLevel),
   cwd: Type.Optional(
     Type.String({ description: "Working directory for this task" }),
+  ),
+  placement: Type.Optional(
+    Type.Unsafe<TeammatePlacementV1>({
+      type: "object",
+      description:
+        "Fabric route placement for a remote Agent Endpoint. Omit for local execution. A placement binds the admitted route, its Endpoint, and the connection/workspace/Endpoint generations plus a deadline; the origin host stays the dispatch, recovery, reclamation, and completion authority, and a selected route never falls back to another Endpoint.",
+    }),
   ),
   outputSchema: Type.Optional(
     structuredOutputSchema(
@@ -277,6 +285,13 @@ export const TeammateParams = Type.Object({
     Type.String({
       description:
         "Default working directory. Per-task cwd takes precedence.",
+    }),
+  ),
+  placement: Type.Optional(
+    Type.Unsafe<TeammatePlacementV1>({
+      type: "object",
+      description:
+        "Default Fabric route placement for tasks that name none. Omit for local execution.",
     }),
   ),
 

@@ -8,6 +8,7 @@
 import type { BackendRegistryConfig } from "pi-maestro-backend-core/v1/registry";
 import type { TeammateRunSpec } from "pi-maestro-backend-core/v1/spec";
 import { TeammateBackendRegistry } from "pi-maestro-backends";
+import { type FabricBackendRouteResolver } from "pi-maestro-backends/fabric";
 import type { RemoteWorkerManagerLike as RemoteManagerPort } from "pi-maestro-backends/remote";
 import { type CliToolsConfig } from "../cli-tools/cli-tools-config.ts";
 import type { AvailableModelEntry } from "../models/model-catalog.ts";
@@ -27,6 +28,15 @@ export declare const PI_SUBPROCESS = "pi-subprocess";
  * resolving to this one module: the target is a config field, not a module.
  */
 export declare const REMOTE_WORKERS = "remote-workers";
+/**
+ * Module name a Fabric placement resolves to.
+ *
+ * The route resolver is host wiring, not a module: a deployment that ships the
+ * Fabric adapter registers this module name and supplies the resolver at
+ * dispatch. A dispatch without the wiring refuses the registration by name
+ * rather than running the placed task on this machine.
+ */
+export declare const FABRIC_BACKEND = "fabric";
 export interface ModelRegistryProjectionInputs {
     /** Authenticated models currently visible to the host Pi registry. */
     hostModels?: readonly AvailableModelEntry[];
@@ -70,7 +80,7 @@ export declare function publishedModelRegistryPairSync(workspaceRoot: string): C
  * Callers use this for the whole dispatch so a registry edit cannot split a
  * candidate sweep across two model/deployment projections.
  */
-export declare function dispatchRegistryForProjectionSync(projection: CompiledModelRegistryPair["dispatch"], extrasOf: (spec: TeammateRunSpec, options: BackendRunOptions) => PiSubprocessRunExtras, remoteManagerOf?: () => RemoteManagerPort): TeammateBackendRegistry;
+export declare function dispatchRegistryForProjectionSync(projection: CompiledModelRegistryPair["dispatch"], extrasOf: (spec: TeammateRunSpec, options: BackendRunOptions) => PiSubprocessRunExtras, remoteManagerOf?: () => RemoteManagerPort, fabricRouteResolverOf?: () => FabricBackendRouteResolver): TeammateBackendRegistry;
 /**
  * Resolve the registry a dispatch should use, without an awaited read.
  *
@@ -79,9 +89,12 @@ export declare function dispatchRegistryForProjectionSync(projection: CompiledMo
  * @param remoteManagerOf - the host's remote Monitor wiring; omitted by a
  * dispatch that has none, which makes a remote registration unloadable rather
  * than silently local.
+ * @param fabricRouteResolverOf - the host's Fabric route resolver; omitted by a
+ * dispatch that has none, which makes a Fabric registration unloadable rather
+ * than silently local.
  * @returns the registry, or undefined when the document keeps the legacy path.
  */
-export declare function dispatchRegistrySync(workspaceRoot: string, extrasOf: (spec: TeammateRunSpec, options: BackendRunOptions) => PiSubprocessRunExtras, remoteManagerOf?: () => RemoteManagerPort, globalFilePath?: string): TeammateBackendRegistry | undefined;
+export declare function dispatchRegistrySync(workspaceRoot: string, extrasOf: (spec: TeammateRunSpec, options: BackendRunOptions) => PiSubprocessRunExtras, remoteManagerOf?: () => RemoteManagerPort, globalFilePath?: string, fabricRouteResolverOf?: () => FabricBackendRouteResolver): TeammateBackendRegistry | undefined;
 /**
  * Forget cached documents and published pairs so an operator edit takes effect.
  *

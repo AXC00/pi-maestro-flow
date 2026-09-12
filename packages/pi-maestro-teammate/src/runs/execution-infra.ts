@@ -40,6 +40,8 @@ import {
 } from "../models/model-routing.ts";
 import type { DispatchAuthorityProjection } from "../models/model-registry.ts";
 import type { ModelHealthCoordinator } from "../models/model-circuit-breaker.ts";
+import type { TeammatePlacementV1 } from "pi-maestro-fabric-core/v1/placement";
+import { assertValidTeammatePlacement } from "pi-maestro-fabric-core/v1/validation";
 import type {
   BackendRegistry,
   ResolvedBackend,
@@ -115,6 +117,8 @@ export interface TeammateTaskSpec {
    * to load each one; see runs/briefing.ts.
    */
   briefing?: string[];
+  /** Admitted Fabric route constraining this task to one Agent Endpoint. */
+  placement?: TeammatePlacementV1;
 }
 
 export type TeammateMode = "default" | "expert";
@@ -137,6 +141,8 @@ export interface RunTeammateParams {
   fallbackModels?: string[];
   thinking?: TeammateThinkingInput;
   cwd?: string;
+  /** Default Fabric route placement for tasks that name none. */
+  placement?: TeammatePlacementV1;
   timeoutMs?: number;
   outputSchema?: Record<string, unknown>;
   concurrency?: number;
@@ -184,6 +190,8 @@ export interface RunSingleTeammateParams {
   todos?: string[];
   /** Lazy background references appended to the task prompt (see runs/briefing.ts). */
   briefing?: string[];
+  /** Admitted Fabric route constraining this task to one Agent Endpoint. */
+  placement?: TeammatePlacementV1;
 }
 
 export interface ModelRegistryDispatchContext {
@@ -246,6 +254,14 @@ export interface RunTeammateOptions {
    * than run it on this machine.
    */
   remoteManagerOf?: () => import("pi-maestro-backends/remote").RemoteWorkerManagerLike;
+  /**
+   * The host's Fabric route resolver.
+   *
+   * Omitted by a dispatch that owns no Fabric wiring, which makes the Fabric
+   * backend fail to load and the dispatch refuse a placed task by name rather
+   * than run it on this machine.
+   */
+  fabricRouteResolverOf?: () => import("pi-maestro-backends/fabric").FabricBackendRouteResolver;
   modelCapabilities?: readonly TeammateModelCapability[];
   modelCircuitBreaker?: ModelCircuitBreaker;
   /**
@@ -425,6 +441,14 @@ export interface NormalizedTask {
   todos?: string[];
   /** Lazy background references (see TeammateTaskSpec.briefing). */
   briefing?: string[];
+  /**
+   * Admitted Fabric route constraining this task to one Agent Endpoint.
+   *
+   * Present only for a placed dispatch: the origin host still owns model
+   * fallback, recovery, reclamation, and completion publication, and the route
+   * may never fall back to another Endpoint.
+   */
+  placement?: TeammatePlacementV1;
 }
 
 /**
@@ -473,6 +497,7 @@ export function singleRunParamsOf(
     // same ids, and a run must not be able to reorder what the roster shows.
     ...(source.todos === undefined ? {} : { todos: [...source.todos] }),
     ...(source.briefing === undefined ? {} : { briefing: [...source.briefing] }),
+    ...(source.placement === undefined ? {} : { placement: structuredClone(source.placement) }),
     ...(overrides.timeoutMs === undefined ? {} : { timeoutMs: overrides.timeoutMs }),
   };
 }
@@ -1397,6 +1422,30 @@ export function normalizeTeammateParams(
           + `(got ${task.maxNestingDepth}); 0 forbids nested teammate calls.`,
       };
     }
+    const placement = task.placement ?? params.placement;
+    if (placement !== undefined) {
+      const label = `tasks[${index}]${task.name ? ` "${task.name}"` : ""}`;
+      try {
+        // Checked at validation so an expired or malformed placement fails here
+        // rather than after a route has already been prepared.
+        assertValidTeammatePlacement(placement, Date.now());
+      } catch (error) {
+        return {
+          tasks: [],
+          isMultiTask: false,
+          warnings,
+          error: `${label} has an invalid Fabric placement: ${error instanceof Error ? error.message : String(error)}`,
+        };
+      }
+      if ((normalizeTodoBindings(task.todo) ?? []).length > 0) {
+        return {
+          tasks: [],
+          isMultiTask: false,
+          warnings,
+          error: `${label} binds Todo ids together with a Fabric placement. A placed Agent Endpoint runs in its own workspace and cannot serve this host's Todo queue, so the bound items would stall at in_progress; drop "todo" and dispatch without it.`,
+        };
+      }
+    }
   }
 
   const normalized: NormalizedTask[] = params.tasks.map((task) => ({
@@ -1417,6 +1466,7 @@ export function normalizeTeammateParams(
     maxNestingDepth: task.maxNestingDepth ?? params.maxNestingDepth,
     todos: normalizeTodoBindings(task.todo),
     briefing: normalizeBriefingEntries(task.briefing),
+    placement: task.placement ?? params.placement,
   }));
   const isMultiTask = normalized.length > 1;
 

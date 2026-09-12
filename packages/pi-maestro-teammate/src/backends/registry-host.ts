@@ -16,6 +16,7 @@ import type {
 
 import type { TeammateRunSpec } from "pi-maestro-backend-core/v1/spec";
 import { TeammateBackendRegistry } from "pi-maestro-backends";
+import { createFabricBackend, type FabricBackendRouteResolver } from "pi-maestro-backends/fabric";
 import { createRemoteBackend } from "pi-maestro-backends/remote";
 import type { RemoteWorkerManagerLike as RemoteManagerPort } from "pi-maestro-backends/remote";
 import { loadCliToolsConfigProjection, type CliToolsConfig } from "../cli-tools/cli-tools-config.ts";
@@ -53,6 +54,16 @@ export const PI_SUBPROCESS = "pi-subprocess";
  * resolving to this one module: the target is a config field, not a module.
  */
 export const REMOTE_WORKERS = "remote-workers";
+
+/**
+ * Module name a Fabric placement resolves to.
+ *
+ * The route resolver is host wiring, not a module: a deployment that ships the
+ * Fabric adapter registers this module name and supplies the resolver at
+ * dispatch. A dispatch without the wiring refuses the registration by name
+ * rather than running the placed task on this machine.
+ */
+export const FABRIC_BACKEND = "fabric";
 
 /**
  * The registration used when the project ships no document.
@@ -352,6 +363,7 @@ export function dispatchRegistryForProjectionSync(
   projection: CompiledModelRegistryPair["dispatch"],
   extrasOf: (spec: TeammateRunSpec, options: BackendRunOptions) => PiSubprocessRunExtras,
   remoteManagerOf?: () => RemoteManagerPort,
+  fabricRouteResolverOf?: () => FabricBackendRouteResolver,
 ): TeammateBackendRegistry {
   const backends = Object.create(null) as BackendRegistryConfig["backends"];
   for (const [deploymentId, deployment] of projection.deploymentsById) {
@@ -361,7 +373,7 @@ export function dispatchRegistryForProjectionSync(
     mode: "model-registry",
     default: projection.defaultDeployment,
     backends,
-  }, backendLoader(extrasOf, remoteManagerOf));
+  }, backendLoader(extrasOf, remoteManagerOf, fabricRouteResolverOf));
 }
 
 /**
@@ -372,6 +384,9 @@ export function dispatchRegistryForProjectionSync(
  * @param remoteManagerOf - the host's remote Monitor wiring; omitted by a
  * dispatch that has none, which makes a remote registration unloadable rather
  * than silently local.
+ * @param fabricRouteResolverOf - the host's Fabric route resolver; omitted by a
+ * dispatch that has none, which makes a Fabric registration unloadable rather
+ * than silently local.
  * @returns the registry, or undefined when the document keeps the legacy path.
  */
 export function dispatchRegistrySync(
@@ -379,6 +394,7 @@ export function dispatchRegistrySync(
   extrasOf: (spec: TeammateRunSpec, options: BackendRunOptions) => PiSubprocessRunExtras,
   remoteManagerOf?: () => RemoteManagerPort,
   globalFilePath: string = getGlobalBackendRegistryPath(),
+  fabricRouteResolverOf?: () => FabricBackendRouteResolver,
 ): TeammateBackendRegistry | undefined {
   let config = backendRegistryConfigSync(workspaceRoot, globalFilePath);
   if (config.mode === "model-registry") {
@@ -387,11 +403,11 @@ export function dispatchRegistrySync(
       // The revision-aware read may have observed a rollback to a 2.0 mode.
       config = backendRegistryConfigSync(workspaceRoot, globalFilePath);
     } else {
-      return dispatchRegistryForProjectionSync(pair.dispatch, extrasOf, remoteManagerOf);
+      return dispatchRegistryForProjectionSync(pair.dispatch, extrasOf, remoteManagerOf, fabricRouteResolverOf);
     }
   }
   if ((config.mode ?? "legacy") === "legacy") return undefined;
-  return new TeammateBackendRegistry(config, backendLoader(extrasOf, remoteManagerOf));
+  return new TeammateBackendRegistry(config, backendLoader(extrasOf, remoteManagerOf, fabricRouteResolverOf));
 }
 
 /**
@@ -404,11 +420,13 @@ export function dispatchRegistrySync(
  *
  * @param extrasOf - per-run host wiring handed to the Pi backend.
  * @param remoteManagerOf - the host's remote Monitor wiring, when it has any.
+ * @param fabricRouteResolverOf - the host's Fabric route resolver, when it has any.
  * @returns the loader.
  */
 function backendLoader(
   extrasOf: (spec: TeammateRunSpec, options: BackendRunOptions) => PiSubprocessRunExtras,
   remoteManagerOf?: () => RemoteManagerPort,
+  fabricRouteResolverOf?: () => FabricBackendRouteResolver,
 ): (module: string) => Promise<unknown> {
   // Pi is in this process already; importing it by specifier would load a
   // second copy with its own module state.
@@ -429,6 +447,20 @@ function backendLoader(
         );
       }
       return createRemoteBackend(remoteManagerOf);
+    }
+    if (module === FABRIC_BACKEND) {
+      // Same reason as remote, one step stronger: the resolver owns the route
+      // admission and the paired transport for this host, so a second instance
+      // would address a Fabric Endpoint the host's own surfaces cannot see. A
+      // dispatch without the wiring is refused by name rather than served by a
+      // stand-in, because the alternative is running a placed task locally.
+      if (fabricRouteResolverOf === undefined) {
+        throw new Error(
+          `teammate backend module "${FABRIC_BACKEND}" needs the host's Fabric route resolver, `
+          + "but this dispatch supplied no Fabric wiring; a placed task cannot run on this machine",
+        );
+      }
+      return createFabricBackend(fabricRouteResolverOf());
     }
     return await import(module);
   };

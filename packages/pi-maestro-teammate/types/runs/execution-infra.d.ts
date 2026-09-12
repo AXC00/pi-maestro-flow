@@ -16,6 +16,7 @@ import { type LeaseToken } from "./session-handoff.ts";
 import { type ResolvedModelRegistrationRouting, type TeammateTaskType } from "../models/model-routing.ts";
 import type { DispatchAuthorityProjection } from "../models/model-registry.ts";
 import type { ModelHealthCoordinator } from "../models/model-circuit-breaker.ts";
+import type { TeammatePlacementV1 } from "pi-maestro-fabric-core/v1/placement";
 import type { BackendRegistry, ResolvedBackend } from "pi-maestro-backend-core/v1/registry";
 import type { TeammateModelCapability } from "../models/model-catalog.ts";
 import { type ModelCircuitBreaker } from "../models/model-circuit-breaker.ts";
@@ -72,6 +73,8 @@ export interface TeammateTaskSpec {
      * to load each one; see runs/briefing.ts.
      */
     briefing?: string[];
+    /** Admitted Fabric route constraining this task to one Agent Endpoint. */
+    placement?: TeammatePlacementV1;
 }
 export type TeammateMode = "default" | "expert";
 export interface RunTeammateParams {
@@ -92,6 +95,8 @@ export interface RunTeammateParams {
     fallbackModels?: string[];
     thinking?: TeammateThinkingInput;
     cwd?: string;
+    /** Default Fabric route placement for tasks that name none. */
+    placement?: TeammatePlacementV1;
     timeoutMs?: number;
     outputSchema?: Record<string, unknown>;
     concurrency?: number;
@@ -138,6 +143,8 @@ export interface RunSingleTeammateParams {
     todos?: string[];
     /** Lazy background references appended to the task prompt (see runs/briefing.ts). */
     briefing?: string[];
+    /** Admitted Fabric route constraining this task to one Agent Endpoint. */
+    placement?: TeammatePlacementV1;
 }
 export interface ModelRegistryDispatchContext {
     readonly authority: DispatchAuthorityProjection;
@@ -191,6 +198,14 @@ export interface RunTeammateOptions {
      * than run it on this machine.
      */
     remoteManagerOf?: () => import("pi-maestro-backends/remote").RemoteWorkerManagerLike;
+    /**
+     * The host's Fabric route resolver.
+     *
+     * Omitted by a dispatch that owns no Fabric wiring, which makes the Fabric
+     * backend fail to load and the dispatch refuse a placed task by name rather
+     * than run it on this machine.
+     */
+    fabricRouteResolverOf?: () => import("pi-maestro-backends/fabric").FabricBackendRouteResolver;
     modelCapabilities?: readonly TeammateModelCapability[];
     modelCircuitBreaker?: ModelCircuitBreaker;
     /**
@@ -351,6 +366,14 @@ export interface NormalizedTask {
     todos?: string[];
     /** Lazy background references (see TeammateTaskSpec.briefing). */
     briefing?: string[];
+    /**
+     * Admitted Fabric route constraining this task to one Agent Endpoint.
+     *
+     * Present only for a placed dispatch: the origin host still owns model
+     * fallback, recovery, reclamation, and completion publication, and the route
+     * may never fall back to another Endpoint.
+     */
+    placement?: TeammatePlacementV1;
 }
 /**
  * Project one normalized task into the params `runSingleTeammate` takes.

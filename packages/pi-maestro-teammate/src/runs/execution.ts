@@ -177,6 +177,7 @@ import {
   backendRegistryConfigSync,
   dispatchRegistryForProjectionSync,
   dispatchRegistrySync,
+  FABRIC_BACKEND,
   modelRegistryPairSync,
   PI_SUBPROCESS,
 } from "../backends/registry-host.ts";
@@ -264,6 +265,7 @@ function createModelRegistryDispatchContext(
       return binding;
     },
     options.remoteManagerOf,
+    options.fabricRouteResolverOf,
   );
   const context: MutableModelRegistryDispatchContext = {
     authority,
@@ -326,6 +328,16 @@ function modelRegistrationBackendSpecOf(
   candidate: ResolvedModelRegistrationCandidate,
 ): TeammateRunSpec {
   const selector = candidate.route.selector;
+  // A placed task is served by the Fabric adapter and by nothing else. A
+  // candidate pointing at another deployment would run on this machine a task
+  // that was placed on another Endpoint, so it is refused before any start.
+  if (params.placement !== undefined && candidate.deployment.registration.module !== FABRIC_BACKEND) {
+    throw new Error(
+      `Teammate task carries a Fabric placement, but the resolved model registration routes to deployment `
+      + `${JSON.stringify(candidate.route.deploymentId)}, which is not the ${JSON.stringify(FABRIC_BACKEND)} `
+      + "deployment; a placed task runs only on the selected Fabric Endpoint",
+    );
+  }
   return {
     agent: params.agent,
     task: params.task ?? "",
@@ -340,6 +352,7 @@ function modelRegistrationBackendSpecOf(
     ...(params.thinking === undefined ? {} : { thinking: params.thinking as TeammateRunSpec["thinking"] }),
     ...(params.outputSchema === undefined ? {} : { outputSchema: params.outputSchema }),
     ...(params.todos === undefined ? {} : { todos: params.todos }),
+    ...(params.placement === undefined ? {} : { placement: params.placement }),
     ...(isRemoteModelRegistration(candidate) ? {} : { cwd }),
   };
 }
@@ -479,6 +492,10 @@ function backendNameOf(
   remote?: RemoteLocationRouting,
 ): string | undefined {
   if (remote !== undefined) return remote.backend;
+  // A placed task is served by the Fabric adapter, never by the default
+  // backend: falling through would run on this machine a task that was placed
+  // on another Endpoint, which is the one outcome a placement must not have.
+  if (params.placement !== undefined) return FABRIC_BACKEND;
   if (params.backend !== undefined) return params.backend;
   // A `cli/<tool>` model names its own registration: the tool is the registered
   // backend, so a deployment adds a CLI by registering one and changes no host
@@ -518,6 +535,7 @@ function backendSpecOf(
     ...(params.thinking === undefined ? {} : { thinking: params.thinking as TeammateRunSpec["thinking"] }),
     ...(params.outputSchema === undefined ? {} : { outputSchema: params.outputSchema }),
     ...(params.todos === undefined ? {} : { todos: params.todos }),
+    ...(params.placement === undefined ? {} : { placement: params.placement }),
     // A remote location is a target, not a directory: the working directory a
     // remote run uses comes from that target's own configuration, and passing
     // the literal `remote:beta` down as a path is what made the old bypass
@@ -868,6 +886,51 @@ async function runSingleTeammateV1(
         `Teammate task requests remote location "${params.cwd}", but .pi/teammate-backends.json is in `
         + `legacy execution mode; set mode "backend-registry" and register "${remoteRouting.backend}" — `
         + "refusing to run a remote task on this machine",
+      );
+    }
+  }
+
+  if (params.placement !== undefined) {
+    // A route is a target, not a directory: a task that names an absolute cwd
+    // alongside a placement is confusing a Device with a path, and honouring
+    // either one silently would run the task somewhere the caller did not
+    // select.
+    if (params.cwd !== undefined && path.isAbsolute(params.cwd)) {
+      return rejectAndPublish(
+        `Teammate task carries a Fabric placement and an absolute "cwd" (${params.cwd}); a placed `
+        + "Agent Endpoint runs in its own workspace directory, so an origin path here selects nothing. "
+        + 'Drop "cwd" and dispatch the placed task without it.',
+      );
+    }
+    if (remoteRouting !== undefined) {
+      return rejectAndPublish(
+        `Teammate task carries both a Fabric placement and remote location "${params.cwd}"; `
+        + "a placement already selects its Agent Endpoint, so these two cannot both be set",
+      );
+    }
+    if (params.backend !== undefined && params.backend !== FABRIC_BACKEND) {
+      return rejectAndPublish(
+        `Teammate task carries a Fabric placement and names backend "${params.backend}"; a placed task is `
+        + `served by "${FABRIC_BACKEND}" because the selected route is the target. Remove the backend selector `
+        + "or drop the placement.",
+      );
+    }
+    if (params.todos !== undefined && params.todos.length > 0) {
+      return rejectAndPublish(
+        "Teammate task carries a Fabric placement and binds Todo ids; a placed Agent Endpoint runs in its own "
+        + "workspace and cannot serve this host's Todo queue. Drop the todo binding and dispatch without it.",
+      );
+    }
+    // A placement is a routing decision like a named backend, and legacy mode
+    // can serve neither. Falling through would run the placed task on this
+    // machine under the default backend, so it is refused by name instead.
+    if (modelRegistryContext === undefined
+      && options.backendRegistry === undefined
+      && (backendRegistryConfigSync(options.baseCwd).mode ?? "legacy") === "legacy") {
+      return rejectAndPublish(
+        `Teammate task carries a Fabric placement, but .pi/teammate-backends.json is in legacy execution `
+        + `mode; set mode "backend-registry" and register "${FABRIC_BACKEND}" — refusing to run a placed `
+        + "task on this machine",
       );
     }
   }
@@ -1529,6 +1592,8 @@ async function runSingleTeammateV1(
             options.baseCwd,
             () => ({ hostOptions: attemptOptions, cwd, replyTo }),
             options.remoteManagerOf,
+            undefined,
+            options.fabricRouteResolverOf,
           );
         if (registry === undefined) {
           // A `cli/<tool>` model is served by a registered backend and by
@@ -2233,6 +2298,8 @@ export async function runGraph(
             throw new Error("capability adjudication never starts a run");
           },
           options.remoteManagerOf,
+          undefined,
+          options.fabricRouteResolverOf,
         )
       : undefined;
   } catch (cause) {

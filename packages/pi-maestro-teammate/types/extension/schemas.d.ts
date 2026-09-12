@@ -11,6 +11,7 @@
  *   - reply_to: result routing (caller | main)
  */
 import { Type, type Static } from "typebox";
+import type { TeammatePlacementV1 } from "pi-maestro-fabric-core/v1/placement";
 export declare const TaskSpec: Type.TObject<{
     prompt: Type.TString;
     description: Type.TOptional<Type.TString>;
@@ -23,6 +24,7 @@ export declare const TaskSpec: Type.TObject<{
     fallbackModels: Type.TOptional<Type.TArray<Type.TString>>;
     thinking: Type.TOptional<Type.TUnsafe<"off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max">>;
     cwd: Type.TOptional<Type.TString>;
+    placement: Type.TOptional<Type.TUnsafe<TeammatePlacementV1>>;
     outputSchema: Type.TOptional<Type.TUnsafe<Record<string, unknown>>>;
     timeoutMs: Type.TOptional<Type.TInteger>;
     background: Type.TOptional<Type.TBoolean>;
@@ -47,6 +49,7 @@ export declare const TeammateParams: Type.TObject<{
         fallbackModels: Type.TOptional<Type.TArray<Type.TString>>;
         thinking: Type.TOptional<Type.TUnsafe<"off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max">>;
         cwd: Type.TOptional<Type.TString>;
+        placement: Type.TOptional<Type.TUnsafe<TeammatePlacementV1>>;
         outputSchema: Type.TOptional<Type.TUnsafe<Record<string, unknown>>>;
         timeoutMs: Type.TOptional<Type.TInteger>;
         background: Type.TOptional<Type.TBoolean>;
@@ -66,6 +69,7 @@ export declare const TeammateParams: Type.TObject<{
     fallbackModels: Type.TOptional<Type.TArray<Type.TString>>;
     thinking: Type.TOptional<Type.TUnsafe<"off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max">>;
     cwd: Type.TOptional<Type.TString>;
+    placement: Type.TOptional<Type.TUnsafe<TeammatePlacementV1>>;
     timeoutMs: Type.TOptional<Type.TInteger>;
 }>;
 export declare const LocalTeammateListParams: Type.TObject<{
