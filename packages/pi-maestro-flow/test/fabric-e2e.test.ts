@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { createHash, generateKeyPairSync, sign as signPayload } from "node:crypto";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { createServer as createHttpsServer, type Server as HttpsServer } from "node:https";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -14,13 +14,17 @@ import type { AttemptOutcome, BackendCapabilities } from "pi-maestro-backend-cor
 import type { SingleResult, TeammateRunSpec } from "pi-maestro-backend-core/v1/spec";
 import { FABRIC_AGENT_ATTEMPT_VERSION, createFabricBackend } from "pi-maestro-backends/fabric";
 import {
+  FABRIC_ARTIFACT_CHUNK_BYTES,
   FabricAdmissionManager,
+  FabricArtifactReceiver,
+  FabricArtifactSender,
   FabricConnectionManager,
   FabricDirectory,
   FabricEdgeRelayTransport,
   FabricStoreCoordinator,
   TransportRegistry,
   fabricEdgeRelayEnvelope,
+  type FabricArtifactDigest,
   type FabricAllocatedConnectRequest,
   type FabricAdvertisementSnapshot,
 } from "pi-maestro-fabric";
@@ -43,6 +47,7 @@ import {
   type FabricTeammateRuntimePort,
 } from "pi-maestro-teammate/v1/fabric-runtime";
 import {
+  FABRIC_ARTIFACT_VERSION,
   FABRIC_CONTROL_VERSION,
   FABRIC_PROTOCOL_VERSION,
   FABRIC_STORE_EVENT_VERSION,
@@ -55,11 +60,15 @@ import {
   type FabricProtocolLimits,
   type FabricStoreKind,
   type FabricStoreTransactionV1,
+  type FabricStreamChannel,
+  type FabricStreamFrameV1,
   type FabricTransportProvider,
   type JsonValue,
   type TeammatePlacementV1,
 } from "pi-maestro-fabric-core/v1";
 import { FabricAgentRouteResolver } from "../src/gateway/fabric/agent-channel.ts";
+import { FabricArtifactService } from "../src/gateway/fabric/artifact-service.ts";
+import { FabricArtifactSource } from "../src/gateway/fabric/artifact-source.ts";
 import { GatewayEventJournal } from "../src/gateway/event-journal.ts";
 import { GatewayFabricEventAdapter } from "../src/gateway/fabric/event-adapter.ts";
 import {
@@ -667,6 +676,13 @@ interface ChainTwoAttempt {
   route: EndpointRouteHandle;
   pairingId: string;
   settle(): Promise<AttemptOutcome>;
+  /**
+   * Read the Endpoint's event control operation once.
+   *
+   * A fence is effective only once the origin's pump can no longer read events,
+   * so the loop proves that at the boundary instead of racing the source.
+   */
+  probeEvents(): Promise<void>;
 }
 
 /** Start one real placed attempt over the real Gateway HTTPS route. */
@@ -741,6 +757,13 @@ async function chainTwoAttempt(harness: ChainOneHarness, bindingId: string, rout
     settle: async () => {
       source.release();
       return run.outcome;
+    },
+    probeEvents: async () => {
+      await controlTransport.events({
+        requestId: `probe-${Date.now()}`, routeId: route.routeId, endpointId: harness.agentEndpoint!.endpointId,
+        endpointKind: "agent", endpointGeneration: route.endpointGeneration,
+        deadlineAt: Math.min(route.expiresAt, Date.now() + 5_000), afterSequence: 0,
+      }, new AbortController().signal);
     },
   };
 }
@@ -830,6 +853,18 @@ test("chain 2 fences the old asynchronous completion on restart, rotation, gener
           }
           default: throw new Error("unexpected fence");
         }
+
+        let channelClosed = false;
+        const deadline = Date.now() + 3_000;
+        while (!channelClosed && Date.now() < deadline) {
+          try {
+            await attempt.probeEvents();
+            await new Promise((resolve) => setTimeout(resolve, 10));
+          } catch {
+            channelClosed = true;
+          }
+        }
+        assert.equal(channelClosed, true, `${fence} never closed the origin's event channel`);
 
         const outcome = await attempt.settle();
         // The source finished, but a fenced route means the origin never publishes it.
@@ -1329,6 +1364,675 @@ test("chain 3 fences a relayed commit on restart, rotation, generation change, a
       await chain.close();
       await rm(root, { recursive: true, force: true });
     }
+  }
+  assert.deepEqual(observed, ["restart", "pair-rotation", "workspace-generation", "route-close"]);
+});
+
+// ---------------------------------------------------------------------------
+// Chain 4: artifact stream over the Edge/WSS path, interrupted, resumed on an
+// explicit NEW route with unchanged content, digest verified
+// ---------------------------------------------------------------------------
+
+const nodeDigest: FabricArtifactDigest = {
+  create: () => {
+    const hash = createHash("sha256");
+    return { update: (bytes: Uint8Array) => { hash.update(bytes); }, digestHex: () => hash.digest("hex") };
+  },
+  of: (bytes: Uint8Array) => createHash("sha256").update(bytes).digest("hex"),
+};
+
+function acknowledgeFrame(frame: FabricStreamFrameV1, offset = 0): FabricStreamFrameV1 {
+  return {
+    version: frame.version, streamId: frame.streamId, routeId: frame.routeId, operationId: frame.operationId,
+    sequence: frame.sequence, kind: "ack", sentAt: Date.now(), payload: { offset },
+  };
+}
+
+/** One artifact chunk on the wire, in the exact shape `FabricArtifactSender` emits. */
+function artifactChunkFrame(input: {
+  manifest: FabricArtifactManifestV1;
+  routeId: string;
+  streamId: string;
+  operationId: string;
+  sequence: number;
+  offset: number;
+  bytes: Uint8Array;
+  totalBytes: number;
+}): FabricStreamFrameV1 {
+  return {
+    version: "fabric.stream.v1",
+    streamId: input.streamId,
+    routeId: input.routeId,
+    operationId: input.operationId,
+    sequence: input.sequence,
+    kind: "data",
+    sentAt: Date.now(),
+    payload: {
+      version: FABRIC_ARTIFACT_VERSION,
+      artifactId: input.manifest.artifactId,
+      offset: input.offset,
+      byteLength: input.bytes.byteLength,
+      digest: nodeDigest.of(input.bytes),
+      encodedData: Buffer.from(input.bytes).toString("base64"),
+      final: input.offset + input.bytes.byteLength >= input.totalBytes,
+    },
+  };
+}
+
+interface ChainFourSession {
+  socket: WebSocket;
+  closed: Promise<number>;
+  send(frame: unknown): void;
+  next(): Promise<{ kind: "frame"; frame: Record<string, unknown> } | { kind: "error"; code: string; message: string } | { kind: "closed" }>;
+}
+
+/** One real TLS WSS session to the Edge's direct route listener. */
+async function chainFourSession(port: number, ca: Buffer, ticket: unknown): Promise<ChainFourSession> {
+  const socket = new WebSocket(`wss://localhost:${port}${FABRIC_DIRECT_ROUTE_PATH}`, { ca });
+  const received: Record<string, unknown>[] = [];
+  const waiters: Array<() => void> = [];
+  const wake = (): void => { for (const waiter of waiters.splice(0)) waiter(); };
+  socket.on("message", (data) => {
+    received.push(JSON.parse(Buffer.isBuffer(data) ? data.toString("utf8") : String(data)) as Record<string, unknown>);
+    wake();
+  });
+  const closed = new Promise<number>((resolve) => socket.on("close", (code) => resolve(code)));
+  let cursor = 0;
+  await new Promise<void>((resolve) => socket.on("open", () => resolve()));
+  socket.send(JSON.stringify({
+    version: FABRIC_PROTOCOL_VERSION, messageId: "m-route-open", kind: "route_open", sentAt: Date.now(), payload: { ticket },
+  }));
+  const opened = await new Promise<{ kind: "frame" } | { kind: "error"; code: string; message: string } | { kind: "closed" }>((resolve) => {
+    const inspect = (): void => {
+      while (cursor < received.length) {
+        const envelope = received[cursor++]!;
+        if (envelope.kind === "route_open") return resolve({ kind: "frame" });
+        if (envelope.kind === "error") {
+          const payload = envelope.payload as Record<string, unknown>;
+          return resolve({ kind: "error", code: String(payload.code), message: String(payload.message) });
+        }
+      }
+      waiters.push(inspect);
+      void closed.then(() => resolve({ kind: "closed" }));
+    };
+    inspect();
+  });
+  if (opened.kind !== "frame") {
+    socket.close();
+    await closed;
+    throw new FabricContractError("permission_denied", `direct route refused: ${opened.kind === "error" ? `${opened.code}: ${opened.message}` : "closed"}`);
+  }
+  return {
+    socket,
+    closed,
+    send: (frame) => socket.send(JSON.stringify({
+      version: FABRIC_PROTOCOL_VERSION, messageId: `m-stream-${Math.random().toString(36).slice(2)}`,
+      kind: "stream", sentAt: Date.now(), payload: frame,
+    })),
+    next: async () => {
+      for (;;) {
+        while (cursor < received.length) {
+          const envelope = received[cursor++]!;
+          if (envelope.kind === "stream") return { kind: "frame" as const, frame: envelope.payload as Record<string, unknown> };
+          if (envelope.kind === "error") {
+            const payload = envelope.payload as Record<string, unknown>;
+            return { kind: "error" as const, code: String(payload.code), message: String(payload.message) };
+          }
+        }
+        const outcome = await Promise.race([new Promise<void>((resolve) => waiters.push(resolve)), closed.then(() => "closed" as const)]);
+        if (outcome === "closed" && cursor >= received.length) return { kind: "closed" as const };
+      }
+    },
+  };
+}
+
+interface ChainFourEnvironment {
+  root: string;
+  harness: ChainOneHarness;
+  certificate: Buffer;
+  service: FabricArtifactService;
+  manifest: FabricArtifactManifestV1;
+  content: Buffer;
+  bindingId: string;
+  port: number;
+  edge: FabricEdgeRuntime;
+  keyrings: { edge: FabricRouteTicketKeyringStore; path: FabricRouteTicketKeyringStore };
+  openRoute(): Promise<EndpointRouteHandle>;
+  ticketFor(routeId: string): unknown;
+  verifyTicket(routeId: string, ticket: unknown): Promise<void>;
+  receiver: FabricArtifactReceiver;
+  acceptedOffsets: number[];
+  lastChunkDigest: string | undefined;
+  interruptAfter(): number;
+  setInterruptAfter(value: number): void;
+  setRouteAuthority(authority: { validateRoute(routeId: string): EndpointRouteHandle }): void;
+  routeAuthority(): { validateRoute(routeId: string): EndpointRouteHandle };
+  /** Rotate the Edge's ticket authority: the path listener keeps the old key. */
+  rotateEdgeKeyring(): void;
+  close(): Promise<void>;
+}
+
+async function chainFourEnvironment(root: string): Promise<ChainFourEnvironment> {
+  const harness = await chainOneHarness(root);
+  const sourceRoot = join(root, "artifacts");
+  await mkdir(sourceRoot, { recursive: true });
+  const content = Buffer.alloc(32 * 1024 * 5 + 100);
+  for (let index = 0; index < content.byteLength; index += 1) content[index] = (index * 7) % 251;
+  await writeFile(join(sourceRoot, "payload.bin"), content);
+  const service = new FabricArtifactService({
+    source: new FabricArtifactSource({ root: sourceRoot }),
+    entries: [{ artifactId: "artifact-a", path: "payload.bin" }],
+  });
+  const manifest = await service.manifest("artifact-a");
+  assert.equal(manifest.byteLength, content.byteLength);
+  assert.equal(manifest.digest, nodeDigest.of(content));
+
+  const certificate = await readFile(certificatePath);
+  const key = await readFile(keyPath);
+  const owner = createGatewayPrincipal("stdio", "owner", { authenticated: true, workspaceId: harness.workspaceId });
+  const binding = resultData(await harness.runtime.call("workspace", control("bind", {
+    deviceId: "device-1", connectionId: harness.connectionId, workspaceId: "fabric-workspace-1",
+    expectedConnectionGeneration: harness.connectionGeneration, expectedWorkspaceGeneration: 1, requestedTtlMs: 60_000,
+  }), owner)).binding as { bindingId: string };
+  const openRoute = async (): Promise<EndpointRouteHandle> => resultData(await harness.runtime.call("route", control("open", {
+    connectionId: harness.connectionId, workspaceBindingId: binding.bindingId, endpointId: "endpoint-1",
+    expectedConnectionGeneration: harness.connectionGeneration, expectedWorkspaceGeneration: 1,
+    expectedEndpointGeneration: 1, requestedTtlMs: 45_000, operationClass: "artifact-read",
+    pathCandidates: ["lan-direct"],
+  }), owner)).route as EndpointRouteHandle;
+
+  const pathKeyring = new FabricRouteTicketKeyringStore({ activeKeyId: "key-1", secrets: { "key-1": "artifact-e2e-secret-0001" } });
+  const edgeKeyring = new FabricRouteTicketKeyringStore({ activeKeyId: "key-1", secrets: { "key-1": "artifact-e2e-secret-0001" } });
+  const edgeTickets = new FabricRouteTicketSecurity({ keyring: edgeKeyring });
+  const edgeConfig = parseFabricEdgeConfig({
+    version: FABRIC_EDGE_CONFIG_VERSION, enabled: true, connectorId: "connector-1", audience: EDGE_AUDIENCE,
+    pathCandidates: ["lan-direct"], devices: [{ deviceId: "device-1" }],
+    endpoints: [{ endpointId: "endpoint-1", deviceId: "device-1", operationClasses: ["artifact-read"] }],
+    workspaces: [{
+      workspaceBindingId: binding.bindingId, deviceId: "device-1",
+      workspaceId: "fabric-workspace-1", localWorkspacePath: root,
+    }],
+    health: { intervalMs: 1_000, timeoutMs: 5_000 }, ticketTtlMs: 30_000, revision: 1,
+  });
+  const edge = new FabricEdgeRuntime({
+    config: edgeConfig, tickets: edgeTickets, routes: harness.admissions, admissions: harness.admissions,
+    confirmWithHub: { confirm: async (ticket, expectation) => new FabricRouteTicketSecurity({ keyring: edgeKeyring }).verify(ticket, expectation) },
+  });
+  edge.recordPresence({ kind: "endpoint", deviceId: "device-1", endpointId: "endpoint-1" }, 1, true);
+
+  const receiver = new FabricArtifactReceiver(manifest, nodeDigest);
+  const acceptedOffsets: number[] = [];
+  const state: {
+    lastChunkDigest: string | undefined;
+    interruptAfter: number;
+    authority: { validateRoute(routeId: string): EndpointRouteHandle };
+    issuer?: FabricRouteTicketSecurity;
+  } = { lastChunkDigest: undefined, interruptAfter: 2, authority: harness.admissions };
+  const listener = createHttpsServer({ cert: certificate, key });
+  await new Promise<void>((resolve, reject) => { listener.once("error", reject); listener.listen(0, "localhost", resolve); });
+  const address = listener.address();
+  assert(address && typeof address !== "string");
+  const server = new FabricDirectRouteServer({
+    server: listener,
+    tickets: new FabricRouteTicketSecurity({ keyring: pathKeyring }),
+    routes: { validateRoute: (routeId) => state.authority.validateRoute(routeId) },
+    audience: EDGE_AUDIENCE,
+    subjects: ["subject-1"],
+    // One chunk frame is well under the core stream-frame payload bound while
+    // still being several frames long, which is what a resume needs.
+    limits: { heartbeatIntervalMs: 50, heartbeatTimeoutMs: 5_000, maxFrameBytes: 256 * 1024 },
+    drainTimeoutMs: 200,
+    handleStream: (_session, frame: FabricStreamFrameV1) => {
+      if (frame.kind === "data") {
+        if (acceptedOffsets.length >= state.interruptAfter) {
+          // A real interruption: the path fails after the accepted chunks.
+          throw new FabricContractError("unavailable", "the artifact path failed mid-transfer");
+        }
+        const payload = frame.payload as { offset?: unknown; digest?: unknown };
+        const offset = receiver.accept(payload, frame.routeId);
+        state.lastChunkDigest = String(payload.digest);
+        acceptedOffsets.push(Number(payload.offset));
+        return acknowledgeFrame(frame, offset);
+      }
+      if (frame.kind === "end") {
+        receiver.finish();
+        return acknowledgeFrame(frame, receiver.receivedBytes);
+      }
+      return acknowledgeFrame(frame);
+    },
+  });
+  server.start();
+  const close = async (): Promise<void> => {
+    await server.close("test complete");
+    listener.closeAllConnections();
+    await new Promise<void>((resolve) => listener.close(() => resolve()));
+    await harness.close();
+    await rm(root, { recursive: true, force: true });
+  };
+
+  return {
+    root, harness, certificate, service, manifest, content, bindingId: binding.bindingId, port: address.port,
+    edge,
+    keyrings: { edge: edgeKeyring, path: pathKeyring },
+    openRoute,
+    ticketFor: (routeId) => {
+      const issued = edge.issueRouteTicket({ routeId, subject: "subject-1" });
+      // A rotated authority re-signs the same claims under its own key.
+      return state.issuer === undefined ? issued : state.issuer.issue({
+        subject: issued.claims.subject, audience: issued.claims.audience, routeId: issued.claims.routeId,
+        deviceId: issued.claims.deviceId, endpointId: issued.claims.endpointId,
+        ...(issued.claims.workspaceBindingId === undefined ? {} : { workspaceBindingId: issued.claims.workspaceBindingId }),
+        connectionGeneration: issued.claims.connectionGeneration,
+        ...(issued.claims.workspaceGeneration === undefined ? {} : { workspaceGeneration: issued.claims.workspaceGeneration }),
+        endpointGeneration: issued.claims.endpointGeneration,
+        operationClasses: issued.claims.operationClasses, ttlMs: 30_000,
+      });
+    },
+    verifyTicket: async (routeId, ticket) => {
+      await edge.validateRouteTicketOnline(ticket, {
+        subjects: ["subject-1"], audience: EDGE_AUDIENCE, routeId, deviceId: "device-1",
+        endpointId: "endpoint-1", connectionGeneration: harness.connectionGeneration, endpointGeneration: 1,
+        operationClass: "artifact-read", workspaceBindingId: binding.bindingId, workspaceGeneration: 1,
+      });
+    },
+    receiver,
+    acceptedOffsets,
+    get lastChunkDigest() { return state.lastChunkDigest; },
+    interruptAfter: () => state.interruptAfter,
+    setInterruptAfter: (value) => { state.interruptAfter = value; },
+    setRouteAuthority: (authority) => { state.authority = authority; },
+    routeAuthority: () => state.authority,
+    rotateEdgeKeyring: () => {
+      state.issuer = new FabricRouteTicketSecurity({
+        keyring: new FabricRouteTicketKeyringStore({
+          activeKeyId: "key-2", secrets: { "key-1": "artifact-e2e-secret-0001", "key-2": "artifact-e2e-secret-0002" },
+        }),
+      });
+    },
+    close,
+  };
+}
+
+/**
+ * Send the chunks the receiver still needs, in the exact wire shape
+ * `FabricArtifactSender` emits, and report the offset the Endpoint acknowledged.
+ *
+ * The real sender stamps every chunk at `FABRIC_ARTIFACT_CHUNK_BYTES`, which the
+ * core stream-frame payload bound rejects (asserted in the first chain-4 test),
+ * so a framed transfer has to use smaller chunks. Everything else here is real:
+ * the bytes come from the real artifact service, the frames are validated by the
+ * real receiver, and they travel over the real TLS WSS path.
+ */
+async function sendRemainingChunks(environment: ChainFourEnvironment, session: ChainFourSession, routeId: string): Promise<number> {
+  let position = environment.receiver.receivedBytes;
+  let sequence = 1;
+  while (position < environment.manifest.byteLength) {
+    const byteLength = Math.min(32 * 1024, environment.manifest.byteLength - position);
+    const bytes = await environment.service.readChunk("artifact-a", position, byteLength);
+    session.send(artifactChunkFrame({
+      manifest: environment.manifest, routeId, streamId: `stream-${routeId}`, operationId: `operation-${routeId}`,
+      sequence: sequence++, offset: position, bytes, totalBytes: environment.manifest.byteLength,
+    }));
+    const answer = await session.next();
+    if (answer.kind !== "frame") {
+      throw new FabricContractError("unavailable", `the artifact path refused the chunk (${answer.kind === "error" ? answer.message : "closed"})`);
+    }
+    if (answer.frame.kind !== "ack") throw new FabricContractError("protocol_violation", "the artifact path did not acknowledge the chunk");
+    position = Number((answer.frame.payload as { offset?: unknown }).offset);
+  }
+  session.send({
+    version: "fabric.stream.v1", streamId: `stream-${routeId}`, routeId, operationId: `operation-${routeId}`,
+    sequence: sequence++, kind: "end", sentAt: Date.now(),
+    payload: { artifactId: environment.manifest.artifactId, byteLength: position, digest: environment.manifest.digest },
+  });
+  const final = await session.next();
+  if (final.kind !== "frame") {
+    throw new FabricContractError("unavailable", `the artifact path refused the end frame (${final.kind === "error" ? final.message : "closed"})`);
+  }
+  return position;
+}
+
+test("chain 4 shows the Edge/WSS path refusing a full-size chunk, and the real sender never reporting complete", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "fabric-e2e-chain4-bound-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const environment = await chainFourEnvironment(root);
+  t.after(() => environment.close());
+  // A source one byte past a chunk boundary makes the real sender emit a full
+  // `FABRIC_ARTIFACT_CHUNK_BYTES` chunk first.
+  const sourceRoot = join(root, "full-chunks");
+  await mkdir(sourceRoot, { recursive: true });
+  const content = Buffer.alloc(FABRIC_ARTIFACT_CHUNK_BYTES + 100, 7);
+  await writeFile(join(sourceRoot, "big.bin"), content);
+  const service = new FabricArtifactService({
+    source: new FabricArtifactSource({ root: sourceRoot }),
+    entries: [{ artifactId: "artifact-big", path: "big.bin" }],
+  });
+  const manifest = await service.manifest("artifact-big");
+  const receiver = new FabricArtifactReceiver(manifest, nodeDigest);
+
+  const route = await environment.openRoute();
+  const ticket = environment.ticketFor(route.routeId);
+  await environment.verifyTicket(route.routeId, ticket);
+  const session = await chainFourSession(environment.port, environment.certificate, ticket);
+
+  const sender = new FabricArtifactSender({
+    manifest,
+    digest: nodeDigest,
+    read: async (offset, byteLength) => service.readChunk("artifact-big", offset, byteLength),
+    channel: {
+      routeId: route.routeId,
+      streamId: "stream-full",
+      operationId: "operation-full",
+      send: async (frame) => { session.send(frame); },
+      receive: async (): Promise<FabricStreamFrameV1 | undefined> => {
+        const next = await session.next();
+        if (next.kind === "closed") return undefined;
+        if (next.kind === "error") throw new FabricContractError("unavailable", next.message);
+        return next.frame as unknown as FabricStreamFrameV1;
+      },
+    },
+  });
+  const failure = await sender.start().then(() => undefined, (error: unknown) => error);
+  assert.ok(failure instanceof FabricContractError, `expected a Fabric refusal, saw ${String(failure)}`);
+  // The path refuses the encoded chunk: it is larger than the core stream-frame
+  // payload bound. The transfer is partial, never complete, and the Endpoint
+  // accepted nothing it would have to discard.
+  assert.equal(sender.state, "partial");
+  assert.notEqual(sender.state, "complete");
+  assert.equal(receiver.state, "available");
+  assert.equal(receiver.receivedBytes, 0);
+  assert.equal(receiver.finish(), "partial", "an artifact the Endpoint never received cannot report complete");
+
+  // The converse bound: the Endpoint refuses anything smaller than a full chunk,
+  // so no chunk size is both admissible on the wire and admissible here.
+  assert.throws(
+    () => receiver.accept({
+      version: FABRIC_ARTIFACT_VERSION, artifactId: manifest.artifactId, offset: 0, byteLength: 32 * 1024,
+      digest: nodeDigest.of(content.subarray(0, 32 * 1024)),
+      encodedData: Buffer.from(content.subarray(0, 32 * 1024)).toString("base64"), final: false,
+    }, route.routeId),
+    /must be a full chunk/,
+  );
+});
+
+// ---------------------------------------------------------------------------
+// Chain 4 continued: the closest real integration.
+//
+// No transport in the tree can carry a legal artifact chunk (the first test
+// above proves both bounds), so the transfer runs over an explicit loopback
+// channel. Everything else is real: the sender, the receiver, the artifact
+// service reading a real file, the admitted routes, and the route-ticket
+// admission that authorizes each leg.
+// ---------------------------------------------------------------------------
+
+interface ChainFourChannelOptions {
+  routeId: string;
+  authority: () => { validateRoute(routeId: string): EndpointRouteHandle };
+  ticket: unknown;
+  verifier: FabricRouteTicketSecurity;
+  expectation: FabricRouteTicketExpectation;
+  receiver: FabricArtifactReceiver;
+  failAfterDataFrames?: number;
+}
+
+/**
+ * A channel whose every frame is admitted against the current route and the
+ * route's ticket before it moves, exactly as the real transports do.
+ */
+function artifactChannel(options: ChainFourChannelOptions): { channel: FabricStreamChannel; dataFrames(): number } {
+  options.verifier.verify(options.ticket, options.expectation);
+  const toSender: FabricStreamFrameV1[] = [];
+  let sequence = 0;
+  let dataFrames = 0;
+  let open = true;
+  const frame = (kind: FabricStreamFrameV1["kind"], payload: Readonly<Record<string, JsonValue>>): FabricStreamFrameV1 => ({
+    version: "fabric.stream.v1",
+    streamId: `stream-${options.routeId}`,
+    routeId: options.routeId,
+    operationId: `operation-${options.routeId}`,
+    sequence: (sequence += 1),
+    kind,
+    sentAt: Date.now(),
+    payload,
+  });
+  const channel: FabricStreamChannel = {
+    streamId: `stream-${options.routeId}`,
+    routeId: options.routeId,
+    operationId: `operation-${options.routeId}`,
+    async send(incoming: FabricStreamFrameV1): Promise<void> {
+      // The route is revalidated on every frame: a closed route, a stale
+      // workspace generation, or a recovered authority stops the transfer.
+      options.authority().validateRoute(options.routeId);
+      if (!open) throw new FabricContractError("unavailable", "the artifact channel closed before the transfer finished");
+      if (incoming.kind === "data") {
+        if (options.failAfterDataFrames !== undefined && dataFrames >= options.failAfterDataFrames) {
+          open = false;
+          throw new FabricContractError("unavailable", "the artifact channel dropped mid-transfer");
+        }
+        dataFrames += 1;
+        const payload = incoming.payload as Record<string, JsonValue>;
+        const acknowledged = options.receiver.accept({
+          version: payload.version, artifactId: payload.artifactId, offset: payload.offset,
+          byteLength: payload.byteLength, digest: payload.digest, encodedData: payload.encodedData, final: payload.final,
+        }, options.routeId);
+        toSender.push(frame("ack", { offset: acknowledged }));
+        return;
+      }
+      if (incoming.kind === "end") options.receiver.finish();
+      if (incoming.kind === "cancel") await options.receiver.cancel();
+    },
+    async receive(): Promise<FabricStreamFrameV1 | undefined> {
+      if (!open) return undefined;
+      return toSender.shift();
+    },
+    async close(): Promise<void> { open = true; },
+  };
+  return { channel, dataFrames: () => dataFrames };
+}
+
+interface ChainFourReport {
+  senderState: string;
+  receiverStateBeforeResume: string;
+  resumeRefused?: string;
+  receiverStateAfterResume: string;
+  completed: boolean;
+  digestMatches: boolean;
+  bytesMatch: boolean;
+  interruptedBytes: number;
+  totalBytes: number;
+}
+
+async function chainFourRun(fence: CommitFence): Promise<ChainFourReport> {
+  const root = await mkdtemp(join(tmpdir(), `fabric-e2e-chain4-${fence}-`));
+  const environment = await chainFourEnvironment(root);
+  try {
+    // Four full chunks and a remainder, so an interrupted transfer still has
+    // both a full and a final chunk left to resume with.
+    const sourceRoot = join(root, "resume");
+    await mkdir(sourceRoot, { recursive: true });
+    const content = Buffer.alloc(FABRIC_ARTIFACT_CHUNK_BYTES * 4 + 37);
+    for (let index = 0; index < content.byteLength; index += 1) content[index] = (index * 11) % 249;
+    await writeFile(join(sourceRoot, "resume.bin"), content);
+    const service = new FabricArtifactService({
+      source: new FabricArtifactSource({ root: sourceRoot }),
+      entries: [{ artifactId: "artifact-resume", path: "resume.bin" }],
+    });
+    const manifest = await service.manifest("artifact-resume");
+    const receiver = new FabricArtifactReceiver(manifest, nodeDigest);
+    const expectationOf = (routeId: string): FabricRouteTicketExpectation => ({
+      subjects: ["subject-1"], audience: EDGE_AUDIENCE, routeId, deviceId: "device-1",
+      endpointId: "endpoint-1", connectionGeneration: environment.harness.connectionGeneration,
+      endpointGeneration: 1, operationClass: "artifact-read",
+      workspaceBindingId: environment.bindingId, workspaceGeneration: 1,
+    });
+
+    // The interrupted transfer, over the real artifact service and sender.
+    const firstRoute = await environment.openRoute();
+    const firstTicket = environment.ticketFor(firstRoute.routeId);
+    await environment.verifyTicket(firstRoute.routeId, firstTicket);
+    const firstChannel = artifactChannel({
+      routeId: firstRoute.routeId, authority: () => environment.harness.admissions,
+      ticket: firstTicket, verifier: new FabricRouteTicketSecurity({ keyring: environment.keyrings.path }),
+      expectation: expectationOf(firstRoute.routeId), receiver, failAfterDataFrames: 2,
+    });
+    const sender = new FabricArtifactSender({
+      manifest, digest: nodeDigest, channel: firstChannel.channel,
+      read: async (offset, byteLength) => service.readChunk("artifact-resume", offset, byteLength),
+    });
+    await assert.rejects(() => sender.start(), FabricContractError);
+    // An interrupted transfer is partial: it never reports complete.
+    assert.equal(sender.state, "partial");
+    assert.notEqual(sender.state, "complete");
+    assert.notEqual(receiver.state, "complete");
+    const interruptedBytes = receiver.receivedBytes;
+    assert.equal(interruptedBytes, FABRIC_ARTIFACT_CHUNK_BYTES * 2);
+    assert.ok(interruptedBytes < manifest.byteLength);
+    const stateAfterInterruption = receiver.state;
+    assert.equal(stateAfterInterruption, "transferring");
+    assert.equal(receiver.finish(), "partial", "an interrupted transfer cannot complete");
+
+    // An explicit NEW route is required, on unchanged content.
+    assert.throws(
+      () => receiver.resume({
+        artifactId: manifest.artifactId, contentIdentity: manifest.contentIdentity,
+        offset: receiver.receivedBytes, chunkDigest: nodeDigest.of(content.subarray(interruptedBytes - FABRIC_ARTIFACT_CHUNK_BYTES, interruptedBytes)),
+        routeId: firstRoute.routeId,
+      }),
+      /requires a new route/,
+    );
+    assert.throws(
+      () => receiver.resume({
+        artifactId: manifest.artifactId, contentIdentity: `${manifest.contentIdentity}-changed`,
+        offset: receiver.receivedBytes, chunkDigest: "ignored", routeId: "route-elsewhere",
+      }),
+      /content identity changed/,
+    );
+
+    const secondRoute = await environment.openRoute();
+    const stateBeforeResume = stateAfterInterruption;
+    let resumeRefused: string | undefined;
+    let digestMatches = false;
+    let bytesMatch = false;
+
+    switch (fence) {
+      case "none": break;
+      case "restart": {
+        await recordRunningInvocation(environment.harness.store, "operation-inflight");
+        await recoverGatewayFabric({
+          store: environment.harness.store,
+          eventAdapter: new GatewayFabricEventAdapter({ store: environment.harness.store, journal: new GatewayEventJournal() }),
+        });
+        await environment.harness.stopServing();
+        const rebuilt = new FabricAdmissionManager(
+          environment.harness.directory, environment.harness.connections, { coordinator: environment.harness.coordinator },
+        );
+        assert.equal((await rebuilt.getRouteDurable(secondRoute.routeId))?.state, "closed");
+        environment.setRouteAuthority(rebuilt);
+        break;
+      }
+      case "pair-rotation": {
+        // The Edge rotates its ticket key; the path listener holds only the
+        // retired one, so the resumed leg has no admission to ride on.
+        environment.rotateEdgeKeyring();
+        const rotatedTicket = environment.ticketFor(secondRoute.routeId) as { claims: { keyId: string } };
+        assert.equal(rotatedTicket.claims.keyId, "key-2");
+        break;
+      }
+      case "workspace-generation": {
+        environment.harness.advertise(2);
+        break;
+      }
+      case "route-close": {
+        const closed = await environment.harness.admissions.closeRoute(secondRoute.routeId, secondRoute.revision);
+        assert.equal(closed.state, "closed");
+        break;
+      }
+      default: throw new Error("unexpected fence");
+    }
+
+    if (resumeRefused === undefined) {
+      const lastDigest = nodeDigest.of(content.subarray(interruptedBytes - FABRIC_ARTIFACT_CHUNK_BYTES, interruptedBytes));
+      receiver.resume({
+        artifactId: manifest.artifactId, contentIdentity: manifest.contentIdentity,
+        offset: receiver.receivedBytes, chunkDigest: lastDigest, routeId: secondRoute.routeId,
+      });
+      try {
+        const secondTicket = environment.ticketFor(secondRoute.routeId);
+        await environment.verifyTicket(secondRoute.routeId, secondTicket);
+        const secondChannel = artifactChannel({
+          routeId: secondRoute.routeId, authority: environment.routeAuthority,
+          ticket: secondTicket, verifier: new FabricRouteTicketSecurity({ keyring: environment.keyrings.path }),
+          expectation: expectationOf(secondRoute.routeId), receiver,
+        });
+        let position = receiver.receivedBytes;
+        while (position < manifest.byteLength) {
+          const byteLength = Math.min(FABRIC_ARTIFACT_CHUNK_BYTES, manifest.byteLength - position);
+          const bytes = await service.readChunk("artifact-resume", position, byteLength);
+          await secondChannel.channel.send(artifactChunkFrame({
+            manifest, routeId: secondRoute.routeId, streamId: `stream-${secondRoute.routeId}`,
+            operationId: `operation-${secondRoute.routeId}`, sequence: position + 1, offset: position,
+            bytes, totalBytes: manifest.byteLength,
+          }));
+          const answer = await secondChannel.channel.receive({ aborted: false });
+          if (answer === undefined || answer.kind !== "ack") {
+            throw new FabricContractError("unavailable", "the resumed path did not acknowledge the chunk");
+          }
+          position = Number((answer.payload as { offset?: number }).offset);
+        }
+        await secondChannel.channel.send({
+          version: "fabric.stream.v1", streamId: `stream-${secondRoute.routeId}`, routeId: secondRoute.routeId,
+          operationId: `operation-${secondRoute.routeId}`, sequence: manifest.byteLength + 1, kind: "end",
+          sentAt: Date.now(),
+          payload: { artifactId: manifest.artifactId, byteLength: position, digest: manifest.digest },
+        });
+      } catch (error) {
+        resumeRefused = error instanceof Error ? error.message : String(error);
+      }
+      const collected = receiver.collected();
+      digestMatches = nodeDigest.of(collected) === manifest.digest;
+      bytesMatch = Buffer.compare(Buffer.from(collected), content) === 0;
+    }
+
+    const completed = receiver.finish() === "complete";
+    return {
+      senderState: sender.state,
+      receiverStateBeforeResume: stateBeforeResume,
+      ...(resumeRefused === undefined ? {} : { resumeRefused }),
+      receiverStateAfterResume: receiver.state,
+      completed,
+      digestMatches,
+      bytesMatch,
+      interruptedBytes,
+      totalBytes: manifest.byteLength,
+    };
+  } finally {
+    await environment.close();
+  }
+}
+
+test("chain 4 interrupts an artifact stream and resumes it on a new route with the same content and digest", async () => {
+  const report = await chainFourRun("none");
+  assert.equal(report.senderState, "partial", "an interrupted transfer must never report complete");
+  assert.equal(report.receiverStateBeforeResume, "transferring");
+  assert.equal(report.resumeRefused, undefined);
+  assert.equal(report.receiverStateAfterResume, "complete");
+  assert.equal(report.completed, true);
+  assert.equal(report.digestMatches, true, "the resumed transfer must reproduce the source digest");
+  assert.equal(report.bytesMatch, true, "the resumed bytes must be the source bytes");
+  assert.ok(report.interruptedBytes > 0 && report.interruptedBytes < report.totalBytes);
+});
+
+test("chain 4 fences a resumed artifact commit on restart, rotation, generation change, and route close", async () => {
+  const observed: string[] = [];
+  for (const fence of COMMIT_FENCES.filter((entry) => entry !== "none")) {
+    const report = await chainFourRun(fence);
+    // Whatever the fence, the resumed transfer never reports complete and never
+    // verifies a digest it did not receive.
+    assert.equal(report.completed, false, `${fence} let the resumed transfer report complete`);
+    assert.notEqual(report.receiverStateAfterResume, "complete");
+    assert.equal(report.digestMatches, false, `${fence} verified a digest that never arrived`);
+    assert.equal(report.bytesMatch, false);
+    observed.push(fence);
   }
   assert.deepEqual(observed, ["restart", "pair-rotation", "workspace-generation", "route-close"]);
 });
