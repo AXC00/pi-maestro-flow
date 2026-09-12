@@ -29,6 +29,7 @@ import { toolCallLine, toolResultLine, resultSummary } from "../quiet-render.ts"
 import { checkGhAvailable, showGhHint } from "./web-access/github-api.ts";
 import { getAgentOutputPath, formatAgentMatchListing, resolveAgentOutput } from "../teammate/agent-output-store.ts";
 import { createSessionHistoryInventoryProvider } from "./session-history.ts";
+import type { FabricArtifactService } from "../gateway/fabric/artifact-service.ts";
 import {
   SessionHistoryService,
   parseSessionHistoryUri,
@@ -45,6 +46,8 @@ export const ResourceParams = Type.Object({
 export interface ResourceResolveOptions {
   /** Fresh host-authorized session inventory used by session:// reads. */
   sessionHistory?: SessionHistoryInventorySource | SessionHistoryService;
+  /** Fabric artifact source for artifact:// reads, when the host serves one. */
+  fabricArtifacts?: FabricArtifactService;
 }
 
 export interface ResourceToolOptions {
@@ -52,6 +55,8 @@ export interface ResourceToolOptions {
   sessionHistory?: SessionHistoryInventorySource | SessionHistoryService;
   /** Optional host-context inventory factory. */
   sessionHistoryFactory?: (ctx: ExtensionContext) => SessionHistoryInventorySource;
+  /** Optional Fabric artifact source; absent hosts simply do not serve artifact://. */
+  fabricArtifacts?: FabricArtifactService;
 }
 
 export interface ResourceDetails {
@@ -394,7 +399,7 @@ export async function resolveResource(
   const parsed = parseResourceUri(uri);
   if (!parsed) {
     throw new Error(
-      `Unsupported URI format: "${uri}". Supported schemes: pr://, issue://, skill://, rule://, agent://, session://. ` +
+      `Unsupported URI format: "${uri}". Supported schemes: pr://, issue://, skill://, rule://, agent://, session://, artifact://. ` +
       "For local files use the read tool.",
     );
   }
@@ -502,13 +507,21 @@ export async function resolveResource(
         cached: false,
       };
     }
+    case "artifact": {
+      const service = options.fabricArtifacts;
+      if (service === undefined) {
+        throw new Error("artifact:// requires a Fabric artifact source; none is connected for this host.");
+      }
+      const { resolveFabricArtifactResource } = await import("./artifact-resource.ts");
+      return await resolveFabricArtifactResource(uri, segments, { service });
+    }
     case "memory":
       throw new Error(
         "The memory:// scheme is reserved for future persistent memory access. " +
         "Use the knowledge system (maestro knowledge) for memory today.",
       );
     default:
-      throw new Error(`Unsupported scheme "${scheme}://" in "${uri}". Supported: pr://, issue://, skill://, rule://, agent://, session://.`);
+      throw new Error(`Unsupported scheme "${scheme}://" in "${uri}". Supported: pr://, issue://, skill://, rule://, agent://, session://, artifact://.`);
   }
 }
 
@@ -526,6 +539,7 @@ export function createResourceTool(
 - \`rule://name\` — project rule files (agents → AGENTS.md, rules → RULES.md, cursor → .cursorrules, cline → .clinerules, plus .pi/rules/ and docs/).
 - \`agent://<id>[/key[/index[/field]]]\` — published teammate output. Exact correlation and publication IDs resolve globally across workspace buckets; task-name discovery remains scoped to the caller's workspace/subtree and may return a disambiguation list. A correlation ID follows that task's latest publication, while a publication ID pins one immutable result; use task names only to discover candidates, then retain an exact ID. Bare \`agent://<id>\` returns the whole output; optional path segments load one nested field, e.g. \`agent://catalog-audit-correlation/findings/0/path\`. Do NOT append \`/json\`. Agent resources are not cached: reuse content already present in the current context instead of loading the same immutable URI again.
 - \`session://<sessionId>/entry/<entryId>\` — one visible active-chain entry from host-authorized session history. Obtain exact URIs from \`session_history\`; arbitrary transcript paths, unauthorized sessions, hidden rows, thinking blocks, abandoned branches, and tool-call arguments are rejected or omitted. Session reads are never cached.
+- \`artifact://<artifactId>\` — a Fabric artifact's identity and state (metadata only; fetching bytes is an explicit-destination download).
 
 pr:// and issue:// require the gh CLI (https://cli.github.com). Results are cached in memory for 5 minutes — re-reads within the window return the cached copy, so refetch after state changes only when the window has expired.
 Read local files with the built-in read tool — resource is for protocol resources only.`,
@@ -548,6 +562,7 @@ Read local files with the built-in read tool — resource is for protocol resour
         ?? createSessionHistoryInventoryProvider(ctx, "all", requestedSessionId);
       const { content, title, cached } = await resolveResource(uri, cwd, signal, {
         sessionHistory,
+        ...(options.fabricArtifacts === undefined ? {} : { fabricArtifacts: options.fabricArtifacts }),
       });
       if (signal?.aborted) throw new Error("Tool execution aborted.");
       return {
