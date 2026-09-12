@@ -9,3 +9,4 @@ export * from "./fixed-ssh-channel.ts";
 export * from "./stream-channel.ts";
 export * from "./channel-router.ts";
 export * from "./mcp-mount-provider.ts";
+export * from "./outbound-wss-transport.ts";
