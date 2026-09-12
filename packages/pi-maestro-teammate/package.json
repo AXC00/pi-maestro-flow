@@ -77,6 +77,10 @@
       "types": "./types/public/v1/foreground-detach.d.ts",
       "default": "./src/public/v1/foreground-detach.ts"
     },
+    "./v1/fabric-runtime": {
+      "types": "./types/public/v1/fabric-runtime.d.ts",
+      "default": "./src/public/v1/fabric-runtime.ts"
+    },
     "./v1/model-routing": {
       "types": "./types/public/v1/model-routing.d.ts",
       "default": "./src/public/v1/model-routing.ts"
@@ -205,6 +209,7 @@
     "pi-maestro-settings-core": "0.2.1",
     "pi-maestro-backend-core": "0.1.3",
     "pi-maestro-backends": "0.1.3",
+    "pi-maestro-fabric-core": "0.1.0",
     "proper-lockfile": "4.1.2",
     "ssh2": "1.17.0",
     "zod": "4.4.3"

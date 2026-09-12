@@ -6,6 +6,8 @@
  * contract that any package may import without pulling in an implementation.
  */
 
+import type { TeammatePlacementV1 } from "pi-maestro-fabric-core/v1/placement";
+
 /** Token and cost accounting for one settled run. */
 export interface Usage {
   inputTokens: number;
@@ -61,6 +63,14 @@ export interface TeammateRunSpec {
   outputSchema?: Record<string, unknown>;
   /** Todo task ids bound to this agent; injected into the child's prompt. */
   todos?: string[];
+  /**
+   * A previously admitted Fabric route constraining this attempt.
+   *
+   * The placement is additive: absence preserves local execution. The backend
+   * selected by `backend` adapts the route; the host still owns model fallback,
+   * recovery, reclamation, and completion publication.
+   */
+  placement?: TeammatePlacementV1;
 }
 
 /**

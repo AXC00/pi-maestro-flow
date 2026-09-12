@@ -28,6 +28,7 @@ import {
   type FabricRouteAuthority,
 } from "./fabric/endpoint-dispatcher.ts";
 import { FabricHttpChannelServer } from "./fabric/http-channel-server.ts";
+import { FabricAgentEndpointBridge } from "./fabric/agent-endpoint.ts";
 import { McpEndpointBridge, type FabricMcpSourceRegistration } from "./fabric/mcp-endpoint.ts";
 import { GatewayFabricControlSupport, type GatewayFabricControlRuntime } from "./fabric/control-support.ts";
 import { GatewayFabricDeviceService } from "./fabric/device-service.ts";
@@ -85,6 +86,9 @@ export interface GatewayRuntimeOptions {
   /** Explicitly enable auto-wiring of the native-TLS Fabric HTTP data plane. Default: false. */
   fabricHttpChannelEnabled?: boolean;
   fabricHttpChannelServer?: FabricHttpChannelServer;
+  fabricAgentEndpoint?: FabricAgentEndpointBridge;
+  /** Agent Endpoint ids served by the source-side teammate runtime port. */
+  fabricAgentEndpointIds?: readonly string[];
   fabricMcpEndpoint?: McpEndpointBridge;
   fabricMcpSources?: readonly FabricMcpSourceRegistration[];
   warningSink?: (message: string) => void;
@@ -138,6 +142,7 @@ export class GatewayRuntime {
   readonly fabricMonitor?: GatewayFabricMonitorProjection;
   readonly fabricEndpointDispatcher?: FabricEndpointDispatcher;
   readonly fabricHttpChannelServer?: FabricHttpChannelServer;
+  readonly fabricAgentEndpoint?: FabricAgentEndpointBridge;
   readonly fabricMcpEndpoint?: McpEndpointBridge;
   readonly session: GatewaySessionService;
   readonly todo: GatewayTodoService;
@@ -246,6 +251,16 @@ export class GatewayRuntime {
       throw new Error("Gateway Fabric event adapter must use the runtime Fabric store and event journal");
     }
     this.fabricControlRuntime = options.fabricControlRuntime;
+    const fabricControl = new GatewayFabricControlSupport(this.fabricControlRuntime, this.policy, this.registry);
+    this.fabricAgentEndpoint = options.fabricAgentEndpoint ?? (options.fabricAgentEndpointIds === undefined ? undefined : new FabricAgentEndpointBridge({
+      support: fabricControl,
+      limits: {
+        maxAttempts: config.limits.maxTasks,
+        maxEventsPerAttempt: 512,
+        maxEventRead: 128,
+        maxMessageBytes: config.limits.maxRequestBytes,
+      },
+    }));
     this.fabricMcpEndpoint = options.fabricMcpEndpoint ?? (options.fabricMcpSources === undefined ? undefined : new McpEndpointBridge({
       registry: this.registry,
       policy: this.policy,
@@ -254,6 +269,11 @@ export class GatewayRuntime {
     }));
     const endpointRegistrations = [
       ...(options.fabricEndpointRegistrations ?? []),
+      ...(this.fabricAgentEndpoint === undefined ? [] : (options.fabricAgentEndpointIds ?? []).map((endpointId): FabricEndpointRegistration => ({
+        endpointId,
+        kind: "agent",
+        handler: this.fabricAgentEndpoint!,
+      }))),
       ...(this.fabricMcpEndpoint === undefined ? [] : (options.fabricMcpSources ?? []).map((source): FabricEndpointRegistration => ({
         endpointId: source.endpointId,
         kind: "mcp",
@@ -289,11 +309,13 @@ export class GatewayRuntime {
         maxPendingRequests: config.limits.maxConcurrentRequests,
       },
     }));
-    const fabricControl = new GatewayFabricControlSupport(this.fabricControlRuntime, this.policy, this.registry);
     this.fabricDevice = new GatewayFabricDeviceService(fabricControl);
     this.fabricWorkspace = new GatewayFabricWorkspaceService(fabricControl);
     this.fabricEndpoint = new GatewayFabricEndpointService(fabricControl);
-    this.fabricRoute = new GatewayFabricRouteService(fabricControl, (routeId, reason) => this.fabricHttpChannelServer?.closeRoute(routeId, reason));
+    this.fabricRoute = new GatewayFabricRouteService(fabricControl, async (routeId, reason) => {
+      this.fabricAgentEndpoint?.closeRoute(routeId);
+      await this.fabricHttpChannelServer?.closeRoute(routeId, reason);
+    });
     this.eventStream = new GatewayEventStream(this.teammate.eventJournal, { observer: this.observer });
     this.fabricMonitor = options.fabricMonitorProjection ?? (this.fabricControlRuntime === undefined ? undefined : new GatewayFabricMonitorProjection({
       directory: this.fabricControlRuntime.directory,
@@ -559,7 +581,13 @@ export class GatewayRuntime {
     this.phase = "closed";
     for (const resolve of this.drainWaiters) resolve();
     this.drainWaiters.clear();
-    await Promise.allSettled([this.job.shutdown(), this.teammate.shutdown(), this.browser.shutdown(), this.fabricMcpEndpoint?.close()]);
+    await Promise.allSettled([
+      this.job.shutdown(),
+      this.teammate.shutdown(),
+      this.browser.shutdown(),
+      this.fabricAgentEndpoint?.close(),
+      this.fabricMcpEndpoint?.close(),
+    ]);
   }
 }
 

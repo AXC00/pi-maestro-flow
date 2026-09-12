@@ -27,5 +27,8 @@
     "teammate",
     "backend"
   ],
-  "license": "ISC"
+  "license": "ISC",
+  "dependencies": {
+    "pi-maestro-fabric-core": "0.1.0"
+  }
 }

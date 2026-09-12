@@ -14,5 +14,7 @@ export {
   type AdjudicatedTask,
 } from "./capabilities.ts";
 export { TeammateBackendRegistry, type BackendLoader } from "./registry.ts";
+export { createFabricBackend, type FabricBackendOptions } from "./fabric/backend.ts";
+export type { FabricBackendRouteResolver, PreparedFabricBackendChannel } from "./fabric/channel.ts";
 export { createRemoteBackend, type RemoteManagerFactory } from "./remote/backend.ts";
 export type { RemoteWorkerManagerLike } from "./remote/types.ts";

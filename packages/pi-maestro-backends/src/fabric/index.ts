@@ -1,0 +1,28 @@
+export { createFabricBackend, type FabricBackendOptions } from "./backend.ts";
+export {
+  FABRIC_AGENT_ATTEMPT_VERSION,
+  FABRIC_AGENT_OPERATIONS,
+  assertFabricAgentControlReceipt,
+  assertFabricAgentEvent,
+  assertFabricAgentRecoveryReceipt,
+  assertFabricAgentReclamationReceipt,
+  assertFabricAgentStartAck,
+  assertFabricAgentStartRequest,
+  assertPreparedFabricChannel,
+  fabricPlacementEvent,
+  fabricStartRequest,
+  type FabricAgentControlReceiptV1,
+  type FabricAgentEventPageV1,
+  type FabricAgentOperation,
+  type FabricAgentRecoveryReceiptV1,
+  type FabricAgentReclamationReceiptV1,
+  type FabricAgentRunSpecV1,
+  type FabricAgentSendRequestV1,
+  type FabricAgentStartAckV1,
+  type FabricAgentStartRequestV1,
+  type FabricBackendChannelWaitResult,
+  type FabricBackendPrepareRequest,
+  type FabricBackendRouteResolver,
+  type PreparedFabricBackendChannel,
+} from "./channel.ts";
+export { fabricTurnResult, foldFabricOutcome, type FabricOutcomeInput } from "./outcome.ts";

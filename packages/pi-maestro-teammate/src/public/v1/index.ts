@@ -18,6 +18,7 @@ export * from "./external-agent-projections.ts";
 export * from "./execution.ts";
 export * from "./extension.ts";
 export * from "./foreground-detach.ts";
+export * from "./fabric-runtime.ts";
 export * from "./mailbox.ts";
 export * from "./model-routing.ts";
 export * from "./monitor-window-state.ts";
