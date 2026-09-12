@@ -8,6 +8,7 @@
 import type { AttemptOutcome, BackendCapabilities, BackendRun } from "pi-maestro-backend-core/v1/backend";
 import type { AgentTerminalStatus, SingleResult, TeammateRunSpec } from "pi-maestro-backend-core/v1/spec";
 import type { TeammatePlacementV1 } from "pi-maestro-fabric-core/v1/placement";
+import type { FabricBackendRouteResolver } from "pi-maestro-backends/fabric";
 /** One already-authorized, device-local attempt. */
 export interface FabricTeammateAttemptRequest {
     readonly placement: TeammatePlacementV1;
@@ -48,3 +49,17 @@ export interface FabricTeammateRuntimeRegistration {
 export declare function registerFabricTeammateRuntimePort(port: FabricTeammateRuntimePort): FabricTeammateRuntimeRegistration;
 /** Return the currently registered source runtime, if this host installed one. */
 export declare function getFabricTeammateRuntimePort(): FabricTeammateRuntimePort | undefined;
+/**
+ * Supplies the origin host's Fabric route resolver to a dispatch that loads the
+ * Fabric backend.
+ *
+ * The resolver is transport wiring: it owns the paired connection to the
+ * Gateway that admitted the route. It is consulted lazily, so a purely local
+ * dispatch never pays for it and a dispatch with no provider refuses a placed
+ * task by name instead of running it on this machine.
+ */
+export type FabricRouteResolverProvider = () => FabricBackendRouteResolver | undefined;
+/** Install the origin host's route resolver provider; the disposer is idempotent. */
+export declare function registerFabricRouteResolverProvider(provider: FabricRouteResolverProvider): () => void;
+/** Return the installed route resolver provider, when this host has one. */
+export declare function getFabricRouteResolverProvider(): FabricRouteResolverProvider | undefined;

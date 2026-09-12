@@ -17,6 +17,7 @@ import type {
   TeammateRunSpec,
 } from "pi-maestro-backend-core/v1/spec";
 import type { TeammatePlacementV1 } from "pi-maestro-fabric-core/v1/placement";
+import type { FabricBackendRouteResolver } from "pi-maestro-backends/fabric";
 
 /** One already-authorized, device-local attempt. */
 export interface FabricTeammateAttemptRequest {
@@ -86,4 +87,36 @@ export function getFabricTeammateRuntimePort(): FabricTeammateRuntimePort | unde
   return candidate && typeof candidate.startAttempt === "function"
     ? candidate as FabricTeammateRuntimePort
     : undefined;
+}
+
+/**
+ * Supplies the origin host's Fabric route resolver to a dispatch that loads the
+ * Fabric backend.
+ *
+ * The resolver is transport wiring: it owns the paired connection to the
+ * Gateway that admitted the route. It is consulted lazily, so a purely local
+ * dispatch never pays for it and a dispatch with no provider refuses a placed
+ * task by name instead of running it on this machine.
+ */
+export type FabricRouteResolverProvider = () => FabricBackendRouteResolver | undefined;
+
+const RESOLVER_KEY = Symbol.for("pi-maestro.fabric-route-resolver-provider.v1");
+
+/** Install the origin host's route resolver provider; the disposer is idempotent. */
+export function registerFabricRouteResolverProvider(
+  provider: FabricRouteResolverProvider,
+): () => void {
+  if (typeof provider !== "function") {
+    throw new TypeError("Fabric route resolver provider must be a function");
+  }
+  globals[RESOLVER_KEY] = provider;
+  return () => {
+    if (globals[RESOLVER_KEY] === provider) delete globals[RESOLVER_KEY];
+  };
+}
+
+/** Return the installed route resolver provider, when this host has one. */
+export function getFabricRouteResolverProvider(): FabricRouteResolverProvider | undefined {
+  const candidate = globals[RESOLVER_KEY];
+  return typeof candidate === "function" ? candidate as FabricRouteResolverProvider : undefined;
 }

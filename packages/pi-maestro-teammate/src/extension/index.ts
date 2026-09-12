@@ -199,6 +199,9 @@ import {
   registerWorkspaceProjectionDirtyListener,
 } from "../public/v1/workspace-projections.ts";
 import {
+  getFabricRouteResolverProvider,
+} from "../public/v1/fabric-runtime.ts";
+import {
   workspaceSessionObservationSnapshot,
   workspaceTodosObservationSnapshot,
 } from "./workspace-session-observation.ts";
@@ -5076,6 +5079,20 @@ export default function registerTeammateExtension(
           // purely local dispatch must not pay for that. Only loading a remote
           // registration reaches this.
           remoteManagerOf: () => ensureRemoteMonitorBinding().port.port,
+          // Lazy for the same reason: only loading a Fabric registration reaches
+          // this, and a dispatch with no Fabric wiring must refuse a placed task
+          // by name rather than run it here.
+          ...(getFabricRouteResolverProvider() === undefined
+            ? {}
+            : {
+              fabricRouteResolverOf: () => {
+                const resolver = getFabricRouteResolverProvider()?.();
+                if (resolver === undefined) {
+                  throw new Error("Fabric route resolver provider returned no resolver for this dispatch");
+                }
+                return resolver;
+              },
+            }),
           modelCapabilities: dispatchModelCatalog.models,
           ...(dispatchModelRegistryAuthority === undefined
             ? {}
