@@ -10,3 +10,4 @@ export * from "./stream-channel.ts";
 export * from "./channel-router.ts";
 export * from "./mcp-mount-provider.ts";
 export * from "./outbound-wss-transport.ts";
+export * from "./edge-relay-transport.ts";
