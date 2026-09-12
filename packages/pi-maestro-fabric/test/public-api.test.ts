@@ -19,6 +19,8 @@ const publicFiles = [
   "stream-channel.ts",
   "channel-router.ts",
   "mcp-mount-provider.ts",
+  "outbound-wss-transport.ts",
+  "edge-relay-transport.ts",
 ];
 const runtimeFiles = [...publicFiles, "directory-authority.ts"];
 
