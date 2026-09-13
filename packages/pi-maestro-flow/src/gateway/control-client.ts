@@ -13,6 +13,16 @@ import { canonicalizeWorkspacePath, gatewayConfigPath, gatewayOwnerPath, gateway
 import { TaskJournal, type GatewayTaskJournalRecord } from "./task-journal.ts";
 import { WorkspaceRegistry, type WorkspaceUnregisterOptions } from "./workspace-registry.ts";
 import type { GatewayTunnelPublicState } from "./tunnel/provider.ts";
+import type { GatewayPairingIssue } from "./pairing-store.ts";
+import type { FabricConnectorRevocationResult } from "./fabric/pairing-adapter.ts";
+import type { FabricConnectorServiceStatus } from "./fabric/connector-service.ts";
+import type {
+  FabricOriginGrantAcquireRequest,
+  FabricOriginGrantAcquired,
+  FabricOriginGrantReleaseRequest,
+  FabricOriginGrantRenewRequest,
+  FabricOriginGrantSnapshot,
+} from "./fabric/origin-runtime.ts";
 
 const START_TIMEOUT_MS = 30_000;
 const STOP_TIMEOUT_MS = 5_000;
@@ -354,6 +364,54 @@ export class GatewayControlClient {
     return this.tunnelControl("tunnel-restart", undefined, "default", options, true, profile) as Promise<GatewayTunnelPublicState>;
   }
 
+  async issueFabricPurposePairing(options: {
+    purpose: "fabric-enrollment" | "fabric-rotation";
+    connectorId: string;
+    ttlSeconds?: number;
+    generation?: number;
+    label?: string;
+  }): Promise<GatewayPairingIssue> {
+    return this.ownerControl("pair", {
+      purpose: options.purpose,
+      connectorId: options.connectorId,
+      ...(options.ttlSeconds === undefined ? {} : { ttlMs: options.ttlSeconds * 1_000 }),
+      ...(options.generation === undefined ? {} : { generation: options.generation }),
+      ...(options.label === undefined ? {} : { label: options.label }),
+    }) as Promise<GatewayPairingIssue>;
+  }
+
+  async revokeFabricConnector(options: {
+    connectorId: string;
+    requestId: string;
+    expectedRevision: number;
+  }): Promise<FabricConnectorRevocationResult> {
+    return this.ownerControl("fabric-connector-revoke", { ...options }) as Promise<FabricConnectorRevocationResult>;
+  }
+
+  async fabricConnectorStatus(): Promise<FabricConnectorServiceStatus | { configured: false; state: "stopped" | "failed"; running: false; reason?: string }> {
+    return this.ownerControl("fabric-connector-status", {}, STATUS_TIMEOUT_MS) as Promise<FabricConnectorServiceStatus | { configured: false; state: "stopped" | "failed"; running: false; reason?: string }>;
+  }
+
+  async fabricConnectorStart(): Promise<FabricConnectorServiceStatus> {
+    return this.ownerControl("fabric-connector-start", {}, this.startupTimeoutMs) as Promise<FabricConnectorServiceStatus>;
+  }
+
+  async fabricConnectorStop(): Promise<FabricConnectorServiceStatus> {
+    return this.ownerControl("fabric-connector-stop", {}, this.stopTimeoutMs + STATUS_TIMEOUT_MS) as Promise<FabricConnectorServiceStatus>;
+  }
+
+  async acquireFabricOriginGrant(input: FabricOriginGrantAcquireRequest): Promise<FabricOriginGrantAcquired> {
+    return this.ownerControl("fabric-origin-grant-acquire", { ...input }) as Promise<FabricOriginGrantAcquired>;
+  }
+
+  async renewFabricOriginGrant(input: FabricOriginGrantRenewRequest): Promise<FabricOriginGrantSnapshot> {
+    return this.ownerControl("fabric-origin-grant-renew", { ...input }) as Promise<FabricOriginGrantSnapshot>;
+  }
+
+  async releaseFabricOriginGrant(input: FabricOriginGrantReleaseRequest): Promise<unknown> {
+    return this.ownerControl("fabric-origin-grant-release", { ...input });
+  }
+
   async listWorkspaces(): Promise<GatewayWorkspace[]> {
     return (await this.registry()).list().then((workspaces) => workspaces.map(({ ownerToken: _ownerToken, ...workspace }) => workspace));
   }
@@ -438,6 +496,23 @@ export class GatewayControlClient {
       ownerToken: status.owner.ownerToken,
       action,
       data,
+    });
+  }
+
+  private async ownerControl(
+    action: "pair" | "fabric-connector-revoke" | "fabric-connector-status" | "fabric-connector-start" | "fabric-connector-stop"
+      | "fabric-origin-grant-acquire" | "fabric-origin-grant-renew" | "fabric-origin-grant-release",
+    data: Record<string, unknown>,
+    timeoutMs?: number,
+  ): Promise<unknown> {
+    const status = await this.status();
+    if (!status.online || !status.owner?.socket) throw new Error("Pi Maestro Gateway is offline. Start it with `pi-maestro-gateway serve`.");
+    return requestGatewayIpcControl({
+      address: status.owner.socket,
+      ownerToken: status.owner.ownerToken,
+      action,
+      data,
+      ...(timeoutMs === undefined ? {} : { timeoutMs }),
     });
   }
 

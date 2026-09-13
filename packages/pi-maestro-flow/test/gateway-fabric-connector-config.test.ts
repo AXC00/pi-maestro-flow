@@ -26,13 +26,47 @@ function document(overrides: Record<string, unknown> = {}): Record<string, unkno
 }
 
 test("a complete Connector document parses with its optional fields", () => {
-  const parsed = parseFabricConnectorConfig(document({ caPath: join(tmpdir(), "ca.pem"), heartbeatIntervalMs: 500 }));
+  const parsed = parseFabricConnectorConfig(document({
+    caPath: join(tmpdir(), "ca.pem"), heartbeatIntervalMs: 500,
+    devices: [{ deviceId: "device-1", connectorId: "connector-1", label: "Device", connectionMode: "https", enabled: true, revision: 1 }],
+    localDeviceId: "device-1", workspaceIds: [],
+    agentSources: {
+      roles: ["general"], taskTypes: ["development"], models: ["provider/model"],
+      backends: ["pi-subprocess"], maxConcurrency: 2,
+    },
+  }));
   assert.equal(parsed.connectorId, "connector-1");
   assert.equal(parsed.enabled, true);
   assert.equal(parsed.credentialGeneration, 1);
   assert.equal(parsed.caPath, join(tmpdir(), "ca.pem"));
   assert.equal(parsed.heartbeatIntervalMs, 500);
   assert.equal(parsed.reconnectDelayMs, undefined);
+  assert.equal(parsed.localDeviceId, "device-1");
+  assert.deepEqual(parsed.workspaceIds, []);
+  assert.deepEqual(parsed.agentSources, {
+    roles: ["general"], taskTypes: ["development"], models: ["provider/model"],
+    backends: ["pi-subprocess"], maxConcurrency: 2,
+  });
+});
+
+test("agentSources is strict, bounded, and complete when present", () => {
+  const valid = {
+    roles: ["general"], taskTypes: ["development"], models: ["provider/model"],
+    backends: ["pi-subprocess"], maxConcurrency: 1,
+  };
+  assert.throws(() => parseFabricConnectorConfig(document({ agentSources: { ...valid, typo: [] } })), /agentSources\.typo is not supported/u);
+  assert.throws(() => parseFabricConnectorConfig(document({ agentSources: { ...valid, roles: undefined } })), /agentSources\.roles must be an array/u);
+  assert.throws(() => parseFabricConnectorConfig(document({ agentSources: { ...valid, models: ["bad model"] } })), /whitespace or control/u);
+  assert.throws(() => parseFabricConnectorConfig(document({ agentSources: { ...valid, maxConcurrency: 1025 } })), /must be in \[1, 1024\]/u);
+  assert.throws(() => parseFabricConnectorConfig(document({ agentSources: { ...valid, backends: ["pi-subprocess", "pi-subprocess"] } })), /must not contain duplicates/u);
+});
+
+test("legacy v1 remains parseable but partial identity metadata is rejected", () => {
+  const legacy = parseFabricConnectorConfig(document());
+  assert.equal(legacy.devices, undefined);
+  assert.equal(legacy.agentSources, undefined);
+  assert.throws(() => parseFabricConnectorConfig(document({ localDeviceId: "device-1" })), /must be provided together/);
+  assert.throws(() => parseFabricConnectorConfig(document({ devices: [], localDeviceId: "device-1", workspaceIds: [] })), /must name a registered Device/);
 });
 
 test("an undeclared field is an error rather than a silently dropped setting", () => {

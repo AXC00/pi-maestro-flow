@@ -6,6 +6,7 @@ import type { GatewayAuthConfig, GatewayConfig } from "./config.ts";
 import type { GatewayPrincipal } from "./contracts.ts";
 import type { GatewayPairingStore } from "./pairing-store.ts";
 import { createGatewayPrincipal } from "./principal.ts";
+import type { FabricOriginDataPlaneGrantAuthority } from "./fabric/origin-runtime.ts";
 
 const OAUTH_BODY_LIMIT = 64 * 1024;
 
@@ -66,23 +67,31 @@ export interface GatewayHttpAuthResult {
 export class GatewayHttpAuth {
   private readonly auth: GatewayAuthConfig;
   private readonly pairingStore?: GatewayPairingStore;
+  private readonly fabricOriginGrants?: FabricOriginDataPlaneGrantAuthority;
   private readonly codes = new Map<string, OAuthCode>();
   private readonly tokens = new Map<string, OAuthToken>();
   private readonly clients = new Map<string, RegisteredClient>();
 
-  constructor(auth: GatewayAuthConfig, pairingStore?: GatewayPairingStore) {
+  constructor(
+    auth: GatewayAuthConfig,
+    pairingStore?: GatewayPairingStore,
+    fabricOriginGrants?: FabricOriginDataPlaneGrantAuthority,
+  ) {
     this.auth = auth;
     this.pairingStore = pairingStore;
+    this.fabricOriginGrants = fabricOriginGrants;
   }
 
   async authenticate(request: IncomingMessage, resourceMetadataUrl: string): Promise<GatewayHttpAuthResult> {
     const remote = request.socket.remoteAddress ?? "unknown";
-    if (this.auth.mode === "open") {
-      return { principal: createGatewayPrincipal("http", `open:${remote}`, { authenticated: false, source: remote, scopes: ["gateway"] }) };
-    }
     const header = request.headers.authorization;
     const match = typeof header === "string" ? /^Bearer\s+(.+)$/i.exec(header) : undefined;
     const token = match?.[1] ?? "";
+    const fabricGrantPrincipal = this.fabricOriginGrants?.authenticate(token);
+    if (fabricGrantPrincipal !== undefined) return { principal: fabricGrantPrincipal };
+    if (this.auth.mode === "open") {
+      return { principal: createGatewayPrincipal("http", `open:${remote}`, { authenticated: false, source: remote, scopes: ["gateway"] }) };
+    }
     let accepted = false;
     if ((this.auth.mode === "bearer" || this.auth.mode === "dual") && this.auth.token) {
       accepted = constantTimeEqual(token, this.auth.token);

@@ -73,6 +73,18 @@ test("an enrolled Connector proves possession of its key and is accepted", () =>
   assert.equal(security.pendingChallengeCount, 0, "a used challenge stayed pending");
 });
 
+test("fresh security instances use cryptographically random challenges even under a fixed clock", () => {
+  const first = hub();
+  const second = hub();
+  const key = keyPair();
+  for (const security of [first, second]) security.enroll({ connectorId: "connector-1", keyId: "key-1", publicKey: key.publicKey, scopes: ["fabric.connect"] });
+  const left = first.issueChallenge("connector-1");
+  const right = second.issueChallenge("connector-1");
+  assert.notEqual(left.challengeId, right.challengeId);
+  assert.notEqual(left.challengeNonce, right.challengeNonce);
+  assert.match(left.challengeNonce, /^[A-Za-z0-9_-]{43}$/u);
+});
+
 test("a challenge is single use, so a replayed proof fails closed", () => {
   const security = hub();
   const { pair } = enrolled(security);

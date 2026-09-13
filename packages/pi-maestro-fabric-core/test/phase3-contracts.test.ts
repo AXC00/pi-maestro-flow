@@ -90,6 +90,17 @@ test("control requests are explicit, bounded and fail closed", () => {
     version: FABRIC_CONTROL_VERSION, requestId: "request-disconnect", action: "device.disconnect", deadlineAt: now + 1_000,
     deviceId: "device-a", connectionId: "connection-a", expectedConnectionGeneration: 3,
   }, now));
+  const bind = {
+    version: FABRIC_CONTROL_VERSION, requestId: "request-bind", action: "workspace.bind", deadlineAt: now + 1_000,
+    deviceId: "device-a", connectionId: "connection-a", workspaceId: "remote-workspace-a",
+    expectedConnectionGeneration: 3, expectedWorkspaceGeneration: 4, requestedTtlMs: 500,
+  } as const;
+  assert.doesNotThrow(() => assertValidFabricControlRequest(bind, now), "legacy bind requests remain valid");
+  assert.doesNotThrow(() => assertValidFabricControlRequest({
+    ...bind, localWorkspaceId: "local-workspace-a", expectedLocalWorkspaceGeneration: 5,
+  }, now));
+  expectCode(() => assertValidFabricControlRequest({ ...bind, localWorkspaceId: "not/a/fabric/id" }, now), "invalid_argument");
+  expectCode(() => assertValidFabricControlRequest({ ...bind, expectedLocalWorkspaceGeneration: 0 }, now), "invalid_argument");
   expectCode(() => assertValidFabricControlRequest({
     version: FABRIC_CONTROL_VERSION, requestId: "request-pair", action: "device.pair", deadlineAt: now + 1_000,
     connectorId: "connector-a", deviceId: "device-a",

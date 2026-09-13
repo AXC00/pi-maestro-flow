@@ -3,6 +3,7 @@ import test from "node:test";
 import {
   FabricContractError,
   type EndpointRouteHandle,
+  type FabricConnectRequest,
   type FabricLiveConnection,
   type WorkspaceBinding,
 } from "pi-maestro-fabric-core/v1";
@@ -10,9 +11,12 @@ import {
   FabricAdmissionManager,
   FabricConnectionManager,
   FabricDirectory,
+  FabricStoreCoordinator,
   TransportRegistry,
   type FabricAdvertisementSnapshot,
+  type FabricAllocatedConnectRequest,
 } from "../src/index.ts";
+import { MemoryFabricStore } from "./memory-store.ts";
 
 const limits = {
   maxFrameBytes: 1024,
@@ -175,6 +179,61 @@ function expectCode(action: () => unknown, code: FabricContractError["code"]): v
   assert.throws(action, (error: unknown) => error instanceof FabricContractError && error.code === code);
 }
 
+async function setupDurableAuthorization() {
+  const now = { value: 1100 };
+  const store = new MemoryFabricStore();
+  let id = 0;
+  const coordinator = new FabricStoreCoordinator(store, { createId: () => `authorization-${++id}` });
+  const directory = new FabricDirectory();
+  const initial = advertisement();
+  directory.seedAuthority({
+    connector: {
+      connectorId: "connector-a", label: "Connector A", transport: "ssh", credentialGeneration: 1,
+      instanceNonce: "nonce-a", enabled: true, revision: 1,
+    },
+    devices: initial.devices,
+  });
+  const transports = new TransportRegistry();
+  transports.register({
+    kind: "ssh",
+    connect: async (request: FabricConnectRequest): Promise<FabricLiveConnection> => {
+      const allocated = request as FabricAllocatedConnectRequest;
+      return {
+        descriptor: {
+          protocolVersion: "fabric.v1",
+          limits,
+          lease: {
+            connectionId: allocated.allocatedConnectionId,
+            deviceId: request.deviceId,
+            connectorId: request.connectorId,
+            connectorInstanceNonce: "nonce-a",
+            generation: allocated.allocatedConnectionGeneration,
+            state: "connected",
+            capabilityDigest: "digest-a",
+            establishedAt: 1000,
+            expiresAt: 5000,
+            revision: 0,
+          },
+        },
+        exchange: async (envelope) => envelope,
+        close: async () => undefined,
+      };
+    },
+  });
+  const connections = new FabricConnectionManager(directory, transports, { coordinator, now: () => now.value });
+  const connection = await connections.connect({
+    requestId: "connect-durable", deviceId: "device-a", connectorId: "connector-a",
+    expectedCredentialGeneration: 1, deadlineAt: 3000, limits,
+  }, new AbortController().signal);
+  const advertised = { ...initial, connectionId: connection.connectionId, connectionGeneration: connection.generation };
+  connections.acceptAdvertisement(advertised);
+  const admissions = new FabricAdmissionManager(directory, connections, { coordinator, now: () => now.value });
+  const bindingInput = {
+    ...binding(), connectionId: connection.connectionId, connectionGeneration: connection.generation,
+  };
+  return { now, store, coordinator, directory, connections, admissions, connection, advertised, bindingInput };
+}
+
 test("workspace binding and route admission use current connection and generation fences", async () => {
   const { admissions } = await setup();
   const storedBinding = admissions.bind(binding());
@@ -255,4 +314,206 @@ test("stale workspace generation and policy are rejected before storage", async 
   expectCode(() => admissions.bind({ ...binding(), workspaceGeneration: 2 }), "stale_generation");
   expectCode(() => admissions.bind({ ...binding(), bindingId: "binding-policy", policyDigest: "wrong" }), "stale_generation");
   assert.equal(admissions.getBinding("binding-a"), undefined);
+});
+
+test("durable binding authorization is atomic, private, restart-resolvable, and authority-fenced", async () => {
+  const fixture = await setupDurableAuthorization();
+  const transactions: unknown[] = [];
+  fixture.store.beforeTransact = (transaction) => { transactions.push(structuredClone(transaction)); };
+  const issued = await fixture.admissions.bindDurable(fixture.bindingInput, {
+    localWorkspaceId: "local-workspace-a",
+    localWorkspaceGeneration: 7,
+  });
+  assert.equal("localWorkspaceId" in issued, false, "public binding must not expose host-local authority");
+
+  const record = await fixture.store.record("lease", issued.bindingId);
+  assert.equal(record?.localWorkspaceId, "local-workspace-a");
+  assert.equal(record?.localWorkspaceGeneration, 7);
+
+  const restarted = new FabricAdmissionManager(fixture.directory, fixture.connections, {
+    coordinator: fixture.coordinator,
+    now: () => fixture.now.value,
+  });
+  assert.deepEqual(await restarted.resolveLocalWorkspaceAuthorization("workspace-a"), {
+    localWorkspaceId: "local-workspace-a",
+    localWorkspaceGeneration: 7,
+  });
+  assert.deepEqual(await restarted.resolveLocalWorkspaceBindingAuthorization(issued.bindingId), {
+    localWorkspaceId: "local-workspace-a",
+    localWorkspaceGeneration: 7,
+  });
+  const renewed = await restarted.renewBinding(issued.bindingId, issued.revision, 2600);
+  assert.equal((await fixture.store.record("lease", issued.bindingId))?.localWorkspaceId, "local-workspace-a");
+  await restarted.unbind(issued.bindingId, renewed.revision);
+  assert.equal(await restarted.resolveLocalWorkspaceAuthorization("workspace-a"), undefined);
+  assert.equal(await restarted.resolveLocalWorkspaceBindingAuthorization(issued.bindingId), undefined);
+  const serializedEvents = JSON.stringify(transactions.flatMap((value) => (value as { events: unknown[] }).events));
+  assert.doesNotMatch(serializedEvents, /local-workspace-a|localWorkspaceId|localWorkspaceGeneration/);
+
+  const expired = await setupDurableAuthorization();
+  await expired.admissions.bindDurable(expired.bindingInput, { localWorkspaceId: "local-workspace-a", localWorkspaceGeneration: 7 });
+  expired.now.value = expired.bindingInput.expiresAt;
+  assert.equal(await expired.admissions.resolveLocalWorkspaceAuthorization("workspace-a"), undefined);
+  await assert.rejects(
+    () => expired.admissions.resolveLocalWorkspaceBindingAuthorization(expired.bindingInput.bindingId),
+    (error: unknown) => error instanceof FabricContractError,
+  );
+
+  const rotated = await setupDurableAuthorization();
+  await rotated.admissions.bindDurable(rotated.bindingInput, { localWorkspaceId: "local-workspace-a", localWorkspaceGeneration: 7 });
+  rotated.connections.acceptAdvertisement({
+    ...rotated.advertised,
+    advertisementRevision: 2,
+    workspaces: rotated.advertised.workspaces.map((workspace) => ({ ...workspace, generation: 2, revision: 2 })),
+  });
+  assert.equal(await rotated.admissions.resolveLocalWorkspaceAuthorization("workspace-a"), undefined);
+  await assert.rejects(
+    () => rotated.admissions.resolveLocalWorkspaceBindingAuthorization(rotated.bindingInput.bindingId),
+    (error: unknown) => error instanceof FabricContractError,
+  );
+
+  const replaced = await setupDurableAuthorization();
+  await replaced.admissions.bindDurable(replaced.bindingInput, { localWorkspaceId: "local-workspace-a", localWorkspaceGeneration: 7 });
+  await replaced.connections.disconnect(replaced.connection.connectionId, replaced.connection.generation);
+  const next = await replaced.connections.connect({
+    requestId: "connect-replacement", deviceId: "device-a", connectorId: "connector-a",
+    expectedCredentialGeneration: 1, deadlineAt: 3000, limits,
+  }, new AbortController().signal);
+  replaced.connections.acceptAdvertisement({ ...replaced.advertised, connectionId: next.connectionId, connectionGeneration: next.generation });
+  assert.equal(await replaced.admissions.resolveLocalWorkspaceAuthorization("workspace-a"), undefined);
+  await assert.rejects(
+    () => replaced.admissions.resolveLocalWorkspaceBindingAuthorization(replaced.bindingInput.bindingId),
+    (error: unknown) => error instanceof FabricContractError,
+  );
+});
+
+test("durable unbind atomically revokes a binding and closes every matching open Route without leaking private authority", async () => {
+  const fixture = await setupDurableAuthorization();
+  const issued = await fixture.admissions.bindDurable(fixture.bindingInput, {
+    localWorkspaceId: "local-workspace-a",
+    localWorkspaceGeneration: 7,
+  });
+  const first = await fixture.admissions.openRouteDurable({
+    ...route(),
+    connectionId: fixture.connection.connectionId,
+    connectionGeneration: fixture.connection.generation,
+    routeId: "route-cascade-a",
+  });
+  const second = await fixture.admissions.openRouteDurable({
+    ...route(),
+    connectionId: fixture.connection.connectionId,
+    connectionGeneration: fixture.connection.generation,
+    routeId: "route-cascade-b",
+  });
+  const alreadyClosed = await fixture.admissions.openRouteDurable({
+    ...route(),
+    connectionId: fixture.connection.connectionId,
+    connectionGeneration: fixture.connection.generation,
+    routeId: "route-already-closed",
+  });
+  await fixture.admissions.closeRoute(alreadyClosed.routeId, alreadyClosed.revision);
+
+  const before = await fixture.coordinator.readStore("lease");
+  const transactions: Array<{
+    readonly events: readonly { readonly eventKind: string; readonly payload?: unknown }[];
+  }> = [];
+  fixture.store.beforeTransact = (transaction) => {
+    transactions.push(structuredClone(transaction));
+  };
+  const result = await fixture.admissions.unbindWithRoutes(issued.bindingId, issued.revision);
+  const after = await fixture.coordinator.readStore("lease");
+
+  assert.equal(after.revision, before.revision + 1, "cascade must use one lease-store transaction");
+  assert.equal(transactions.length, 1);
+  assert.deepEqual(transactions[0]!.events.map((event) => event.eventKind), [
+    "binding.revoked", "route.closed", "route.closed",
+  ]);
+  assert.equal(result.binding.revision, issued.revision + 1);
+  assert.deepEqual(result.closedRoutes.map((entry) => [entry.routeId, entry.state, entry.revision]), [
+    [first.routeId, "closed", first.revision + 1],
+    [second.routeId, "closed", second.revision + 1],
+  ]);
+  assert.equal((await fixture.store.record("lease", issued.bindingId))?.revision, issued.revision + 1);
+  assert.equal((await fixture.store.record("lease", first.routeId))?.revision, first.revision + 1);
+  assert.equal((await fixture.store.record("lease", second.routeId))?.revision, second.revision + 1);
+  assert.equal((await fixture.store.record("lease", alreadyClosed.routeId))?.revision, alreadyClosed.revision + 1);
+  assert.equal(JSON.stringify(result).includes("localWorkspace"), false, "private authorization escaped in cleanup result");
+  assert.doesNotMatch(JSON.stringify(transactions[0]!.events), /local-workspace-a|localWorkspaceId|localWorkspaceGeneration/);
+  assert.throws(() => fixture.admissions.validateBinding(issued.bindingId), /not known/);
+  assert.throws(() => fixture.admissions.validateRoute(first.routeId), /must be open/);
+  assert.throws(() => fixture.admissions.validateRoute(second.routeId), /must be open/);
+});
+
+test("durable unbind CAS failure leaves binding and Route memory projections unchanged", async () => {
+  const fixture = await setupDurableAuthorization();
+  const issued = await fixture.admissions.bindDurable(fixture.bindingInput, {
+    localWorkspaceId: "local-workspace-a",
+    localWorkspaceGeneration: 7,
+  });
+  const first = await fixture.admissions.openRouteDurable({
+    ...route(),
+    connectionId: fixture.connection.connectionId,
+    connectionGeneration: fixture.connection.generation,
+    routeId: "route-cas-a",
+  });
+  const second = await fixture.admissions.openRouteDurable({
+    ...route(),
+    connectionId: fixture.connection.connectionId,
+    connectionGeneration: fixture.connection.generation,
+    routeId: "route-cas-b",
+  });
+  const restarted = new FabricAdmissionManager(fixture.directory, fixture.connections, {
+    coordinator: fixture.coordinator,
+    now: () => fixture.now.value,
+  });
+  fixture.store.beforeTransact = () => {
+    throw Object.assign(new Error("stale CAS revision"), { name: "FabricStoreConflictError" });
+  };
+
+  await assert.rejects(
+    () => restarted.unbindWithRoutes(issued.bindingId, issued.revision),
+    (error: unknown) => error instanceof FabricContractError && error.code === "conflict",
+  );
+  assert.equal(restarted.getBinding(issued.bindingId), undefined, "failed CAS populated binding memory");
+  assert.equal(restarted.getRoute(first.routeId), undefined, "failed CAS populated first Route memory");
+  assert.equal(restarted.getRoute(second.routeId), undefined, "failed CAS populated second Route memory");
+  assert.equal((await fixture.store.record("lease", issued.bindingId))?.revokedAt, undefined);
+  assert.equal((await fixture.store.record("lease", first.routeId))?.state, "open");
+  assert.equal((await fixture.store.record("lease", second.routeId))?.state, "open");
+  assert.deepEqual(await restarted.resolveLocalWorkspaceBindingAuthorization(issued.bindingId), {
+    localWorkspaceId: "local-workspace-a",
+    localWorkspaceGeneration: 7,
+  });
+});
+
+test("memory and durable workspace authorization select the same deterministic newest valid binding", async () => {
+  const memory = await setup();
+  const durable = await setupDurableAuthorization();
+  const candidates = [
+    { bindingId: "binding-old", issuedAt: 900, localWorkspaceId: "local-old" },
+    { bindingId: "binding-new-z", issuedAt: 1050, localWorkspaceId: "local-new-z" },
+    { bindingId: "binding-new-a", issuedAt: 1050, localWorkspaceId: "local-new-a" },
+  ];
+
+  for (const candidate of candidates) {
+    const authorization = { localWorkspaceId: candidate.localWorkspaceId, localWorkspaceGeneration: 1 };
+    await memory.admissions.bindDurable({ ...binding(), bindingId: candidate.bindingId, issuedAt: candidate.issuedAt }, authorization);
+    await durable.admissions.bindDurable({
+      ...durable.bindingInput,
+      bindingId: candidate.bindingId,
+      issuedAt: candidate.issuedAt,
+    }, authorization);
+  }
+
+  const expected = { localWorkspaceId: "local-new-a", localWorkspaceGeneration: 1 };
+  assert.deepEqual(await memory.admissions.resolveLocalWorkspaceAuthorization("workspace-a"), expected);
+  assert.deepEqual(await durable.admissions.resolveLocalWorkspaceAuthorization("workspace-a"), expected);
+  assert.deepEqual(await memory.admissions.resolveLocalWorkspaceBindingAuthorization("binding-new-z"), {
+    localWorkspaceId: "local-new-z",
+    localWorkspaceGeneration: 1,
+  });
+  assert.deepEqual(await durable.admissions.resolveLocalWorkspaceBindingAuthorization("binding-new-z"), {
+    localWorkspaceId: "local-new-z",
+    localWorkspaceGeneration: 1,
+  });
 });

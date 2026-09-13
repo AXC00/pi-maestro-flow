@@ -44,6 +44,11 @@ export interface FabricAgentEndpointLimits {
 export interface FabricAgentEndpointOptions {
   readonly support: GatewayFabricControlSupport;
   readonly runtimeOf?: () => FabricTeammateRuntimePort | undefined;
+  /** When present, ACK admission is fenced to this proven source capability set. */
+  readonly sourceBackends?: readonly {
+    readonly name: string;
+    readonly capabilities: BackendCapabilities;
+  }[];
   readonly limits?: Partial<FabricAgentEndpointLimits>;
   readonly now?: () => number;
 }
@@ -141,17 +146,32 @@ function capabilitiesJson(capabilities: BackendCapabilities): BackendCapabilitie
   return json(capabilities, "acceptedCapabilities") as BackendCapabilities & Readonly<Record<string, JsonValue>>;
 }
 
+function sameCapabilities(left: BackendCapabilities, right: BackendCapabilities): boolean {
+  return left.outputSchema === right.outputSchema && left.forkContext === right.forkContext &&
+    left.modelSelection === right.modelSelection && left.thinkingLevel === right.thinkingLevel &&
+    left.todoBinding === right.todoBinding && left.toolFilter === right.toolFilter &&
+    left.steer === right.steer && left.followUp === right.followUp && left.abort === right.abort;
+}
+
 /** Source-side Agent Endpoint. It runs one attempt and never publishes canonical completion. */
 export class FabricAgentEndpointBridge implements FabricEndpointHandler {
   readonly support: GatewayFabricControlSupport;
   readonly limits: Readonly<FabricAgentEndpointLimits>;
   readonly #runtimeOf: () => FabricTeammateRuntimePort | undefined;
+  readonly #sourceBackends?: ReadonlyMap<string, BackendCapabilities>;
   readonly #now: () => number;
   readonly #attempts = new Map<string, SourceAttemptState>();
 
   constructor(options: FabricAgentEndpointOptions) {
     this.support = options.support;
     this.#runtimeOf = options.runtimeOf ?? getFabricTeammateRuntimePort;
+    if (options.sourceBackends !== undefined) {
+      const entries = options.sourceBackends.map((backend) => [backend.name, structuredClone(backend.capabilities)] as const);
+      if (new Set(entries.map(([name]) => name)).size !== entries.length) {
+        throw new FabricContractError("invalid_argument", "sourceBackends must not contain duplicate names", "sourceBackends");
+      }
+      this.#sourceBackends = new Map(entries);
+    }
     this.#now = options.now ?? Date.now;
     this.limits = Object.freeze({
       maxAttempts: positiveLimit(options.limits?.maxAttempts, DEFAULT_LIMITS.maxAttempts, "maxAttempts"),
@@ -236,8 +256,18 @@ export class FabricAgentEndpointBridge implements FabricEndpointHandler {
     }, Math.max(0, input.placement.deadlineAt - this.#now()));
     timer.unref?.();
     state.deadlineTimer = timer;
+    const cancelStart = (): void => {
+      state.controller.abort(context.signal.reason ?? new FabricContractError("cancelled", "Fabric Agent start request was cancelled"));
+      state.handle?.abort();
+    };
+    context.signal.addEventListener("abort", cancelStart, { once: true });
+    if (context.signal.aborted) cancelStart();
     state.startPromise = this.#startAttempt(state, endpoint);
-    return json(await state.startPromise, "startAck");
+    try {
+      return json(await state.startPromise, "startAck");
+    } finally {
+      context.signal.removeEventListener("abort", cancelStart);
+    }
   }
 
   async #startAttempt(state: SourceAttemptState, endpoint: AgentRuntimeEndpoint): Promise<FabricAgentStartAckV1> {
@@ -551,6 +581,17 @@ export class FabricAgentEndpointBridge implements FabricEndpointHandler {
     handle: FabricTeammateAttempt,
   ): void {
     assertFabricIdentifier(handle.acceptedBackend, "acceptedBackend");
+    if (this.#sourceBackends !== undefined) {
+      const advertised = this.#sourceBackends.get(handle.acceptedBackend);
+      if (advertised === undefined) {
+        handle.abort();
+        throw new FabricContractError("permission_denied", "Source runtime selected a backend not admitted by this Agent Endpoint", "acceptedBackend");
+      }
+      if (!sameCapabilities(advertised, handle.acceptedCapabilities)) {
+        handle.abort();
+        throw new FabricContractError("stale_generation", "Source backend capabilities changed after advertisement", "acceptedCapabilities");
+      }
+    }
     if (handle.acceptedModel !== undefined && !endpoint.models.includes(handle.acceptedModel)) {
       handle.abort();
       throw new FabricContractError("conflict", "Source runtime selected a model not advertised by the Agent Endpoint", "acceptedModel");

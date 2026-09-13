@@ -16,7 +16,11 @@ import type {
 
 import type { TeammateRunSpec } from "pi-maestro-backend-core/v1/spec";
 import { TeammateBackendRegistry } from "pi-maestro-backends";
-import { createFabricBackend, type FabricBackendRouteResolver } from "pi-maestro-backends/fabric";
+import {
+  createFabricBackend,
+  type FabricBackendRouteResolver,
+  type FabricBackendRouteResolverAcquirer,
+} from "pi-maestro-backends/fabric";
 import { createRemoteBackend } from "pi-maestro-backends/remote";
 import type { RemoteWorkerManagerLike as RemoteManagerPort } from "pi-maestro-backends/remote";
 import { loadCliToolsConfigProjection, type CliToolsConfig } from "../cli-tools/cli-tools-config.ts";
@@ -30,6 +34,11 @@ import {
 } from "../models/model-registry.ts";
 import { createPiSubprocessBackend, type PiSubprocessRunExtras } from "./pi-subprocess.ts";
 import type { BackendRunOptions } from "pi-maestro-backend-core/v1/backend";
+
+/** Legacy resolver factories and generation-tracked dispatch acquirers are both accepted. */
+export type FabricRouteResolverDispatchWiring =
+  | (() => FabricBackendRouteResolver)
+  | FabricBackendRouteResolverAcquirer;
 
 /** Registration document name shared by global and project configuration. */
 const REGISTRY_FILE = "teammate-backends.json";
@@ -363,7 +372,7 @@ export function dispatchRegistryForProjectionSync(
   projection: CompiledModelRegistryPair["dispatch"],
   extrasOf: (spec: TeammateRunSpec, options: BackendRunOptions) => PiSubprocessRunExtras,
   remoteManagerOf?: () => RemoteManagerPort,
-  fabricRouteResolverOf?: () => FabricBackendRouteResolver,
+  fabricRouteResolverOf?: FabricRouteResolverDispatchWiring,
 ): TeammateBackendRegistry {
   const backends = Object.create(null) as BackendRegistryConfig["backends"];
   for (const [deploymentId, deployment] of projection.deploymentsById) {
@@ -394,7 +403,7 @@ export function dispatchRegistrySync(
   extrasOf: (spec: TeammateRunSpec, options: BackendRunOptions) => PiSubprocessRunExtras,
   remoteManagerOf?: () => RemoteManagerPort,
   globalFilePath: string = getGlobalBackendRegistryPath(),
-  fabricRouteResolverOf?: () => FabricBackendRouteResolver,
+  fabricRouteResolverOf?: FabricRouteResolverDispatchWiring,
 ): TeammateBackendRegistry | undefined {
   let config = backendRegistryConfigSync(workspaceRoot, globalFilePath);
   if (config.mode === "model-registry") {
@@ -440,7 +449,7 @@ export function dispatchSourceAttemptRegistrySync(
 export function dispatchFabricPlacementRegistrySync(
   workspaceRoot: string,
   extrasOf: (spec: TeammateRunSpec, options: BackendRunOptions) => PiSubprocessRunExtras,
-  fabricRouteResolverOf: () => FabricBackendRouteResolver,
+  fabricRouteResolverOf: FabricRouteResolverDispatchWiring,
   remoteManagerOf?: () => RemoteManagerPort,
   globalFilePath: string = getGlobalBackendRegistryPath(),
 ): TeammateBackendRegistry {
@@ -498,7 +507,7 @@ export function dispatchFabricPlacementRegistrySync(
 function backendLoader(
   extrasOf: (spec: TeammateRunSpec, options: BackendRunOptions) => PiSubprocessRunExtras,
   remoteManagerOf?: () => RemoteManagerPort,
-  fabricRouteResolverOf?: () => FabricBackendRouteResolver,
+  fabricRouteResolverOf?: FabricRouteResolverDispatchWiring,
 ): (module: string) => Promise<unknown> {
   // Pi is in this process already; importing it by specifier would load a
   // second copy with its own module state.
@@ -532,7 +541,11 @@ function backendLoader(
           + "but this dispatch supplied no Fabric wiring; a placed task cannot run on this machine",
         );
       }
-      return createFabricBackend(fabricRouteResolverOf());
+      return createFabricBackend(
+        typeof fabricRouteResolverOf === "function"
+          ? fabricRouteResolverOf()
+          : fabricRouteResolverOf,
+      );
     }
     return await import(module);
   };

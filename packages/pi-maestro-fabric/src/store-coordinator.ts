@@ -52,6 +52,14 @@ function clone<T>(value: T): T {
   return structuredClone(value);
 }
 
+const MAX_COMMIT_ATTEMPTS = 3;
+
+function isStoreRevisionConflict(error: unknown, storeKind: FabricStoreKind): boolean {
+  if (!(error instanceof Error) || error.name !== "FabricStoreConflictError") return false;
+  return error.message === "stale CAS revision"
+    || new RegExp(`^Fabric ${storeKind} store revision is \\d+$`, "u").test(error.message);
+}
+
 function conflictFromStore(error: unknown): never {
   if (error instanceof FabricContractError) throw error;
   if (error instanceof Error && (error.name === "FabricStoreConflictError" || /\b(?:CAS|revision)\b.*\b(?:stale|conflict|is)\b/iu.test(error.message))) {
@@ -95,72 +103,77 @@ export class FabricStoreCoordinator {
     prepare: (snapshot: FabricLogicalStoreSnapshot) => FabricStoreCommitPlan<T>,
   ): Promise<T> {
     assertEpochMilliseconds(committedAt, "committedAt");
-    const snapshot = await this.readStore(storeKind);
-    const plan = prepare(snapshot);
-    if (plan.mutations.length === 0) return clone(plan.value);
+    let attempt = 0;
+    while (true) {
+      attempt += 1;
+      const snapshot = await this.readStore(storeKind);
+      const plan = prepare(snapshot);
+      if (plan.mutations.length === 0) return clone(plan.value);
 
-    const subjects = new Set<string>();
-    const mutations: FabricStoreMutationV1[] = [];
-    const events: FabricStoreEventV1[] = [];
-    let sequence = snapshot.highWaterMark + 1;
-    for (const mutation of plan.mutations) {
-      assertFabricIdentifier(mutation.subjectId, "subjectId");
-      assertFabricIdentifier(mutation.eventKind, "eventKind");
-      if (subjects.has(mutation.subjectId)) {
-        throw new FabricContractError("invalid_argument", "A coordinated transaction cannot mutate one subject twice", "subjectId");
-      }
-      subjects.add(mutation.subjectId);
-      const current = snapshot.records[mutation.subjectId];
-      const currentRevision = current?.revision;
-      if (currentRevision !== undefined) assertRevision(currentRevision, `records.${mutation.subjectId}.revision`);
-      const expectedRevision = mutation.expectedRevision;
-      if (expectedRevision === undefined ? current !== undefined : currentRevision !== expectedRevision) {
-        throw new FabricContractError("conflict", "Durable Fabric subject revision is stale", mutation.subjectId);
-      }
-      const subjectRevision = (expectedRevision ?? 0) + 1;
-      if (mutation.kind === "upsert") {
-        if (mutation.value === undefined || mutation.value.revision !== subjectRevision) {
-          throw new FabricContractError("invalid_argument", "Upsert value must carry the next subject revision", "revision");
+      const subjects = new Set<string>();
+      const mutations: FabricStoreMutationV1[] = [];
+      const events: FabricStoreEventV1[] = [];
+      let sequence = snapshot.highWaterMark + 1;
+      for (const mutation of plan.mutations) {
+        assertFabricIdentifier(mutation.subjectId, "subjectId");
+        assertFabricIdentifier(mutation.eventKind, "eventKind");
+        if (subjects.has(mutation.subjectId)) {
+          throw new FabricContractError("invalid_argument", "A coordinated transaction cannot mutate one subject twice", "subjectId");
         }
-      } else if (mutation.value !== undefined) {
-        throw new FabricContractError("invalid_argument", "Delete mutation cannot carry a value", "value");
+        subjects.add(mutation.subjectId);
+        const current = snapshot.records[mutation.subjectId];
+        const currentRevision = current?.revision;
+        if (currentRevision !== undefined) assertRevision(currentRevision, `records.${mutation.subjectId}.revision`);
+        const expectedRevision = mutation.expectedRevision;
+        if (expectedRevision === undefined ? current !== undefined : currentRevision !== expectedRevision) {
+          throw new FabricContractError("conflict", "Durable Fabric subject revision is stale", mutation.subjectId);
+        }
+        const subjectRevision = (expectedRevision ?? 0) + 1;
+        if (mutation.kind === "upsert") {
+          if (mutation.value === undefined || mutation.value.revision !== subjectRevision) {
+            throw new FabricContractError("invalid_argument", "Upsert value must carry the next subject revision", "revision");
+          }
+        } else if (mutation.value !== undefined) {
+          throw new FabricContractError("invalid_argument", "Delete mutation cannot carry a value", "value");
+        }
+        mutations.push({
+          kind: mutation.kind,
+          subjectId: mutation.subjectId,
+          expectedRevision,
+          value: mutation.value === undefined ? undefined : clone(mutation.value),
+        });
+        events.push({
+          version: FABRIC_STORE_EVENT_VERSION,
+          eventId: this.#newId("eventId"),
+          storeKind,
+          sequence,
+          eventKind: mutation.eventKind,
+          subjectId: mutation.subjectId,
+          subjectRevision,
+          occurredAt: committedAt,
+          payload: clone(mutation.payload ?? {}),
+        });
+        sequence += 1;
       }
-      mutations.push({
-        kind: mutation.kind,
-        subjectId: mutation.subjectId,
-        expectedRevision,
-        value: mutation.value === undefined ? undefined : clone(mutation.value),
-      });
-      events.push({
-        version: FABRIC_STORE_EVENT_VERSION,
-        eventId: this.#newId("eventId"),
-        storeKind,
-        sequence,
-        eventKind: mutation.eventKind,
-        subjectId: mutation.subjectId,
-        subjectRevision,
-        occurredAt: committedAt,
-        payload: clone(mutation.payload ?? {}),
-      });
-      sequence += 1;
-    }
 
-    const transaction: FabricStoreTransactionV1 = {
-      version: FABRIC_STORE_TRANSACTION_VERSION,
-      transactionId: this.#newId("transactionId"),
-      storeKind,
-      expectedRevision: snapshot.revision,
-      nextRevision: snapshot.revision + 1,
-      committedAt,
-      mutations,
-      events,
-    };
-    try {
-      await this.store.transact(transaction);
-    } catch (error) {
-      conflictFromStore(error);
+      const transaction: FabricStoreTransactionV1 = {
+        version: FABRIC_STORE_TRANSACTION_VERSION,
+        transactionId: this.#newId("transactionId"),
+        storeKind,
+        expectedRevision: snapshot.revision,
+        nextRevision: snapshot.revision + 1,
+        committedAt,
+        mutations,
+        events,
+      };
+      try {
+        await this.store.transact(transaction);
+      } catch (error) {
+        if (attempt < MAX_COMMIT_ATTEMPTS && isStoreRevisionConflict(error, storeKind)) continue;
+        conflictFromStore(error);
+      }
+      return clone(plan.value);
     }
-    return clone(plan.value);
   }
 
   #newId(path: string): string {

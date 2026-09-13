@@ -41,12 +41,15 @@ export async function startGatewayHttpServer(runtime: GatewayRuntime, options: G
   const port = options.port ?? runtime.config.transport.http.port;
   const path = normalizeMcpPath(options.path ?? runtime.config.transport.http.path);
   validateGatewayHttpSecurity(runtime.config, host);
-  const auth = new GatewayHttpAuth(runtime.config.auth, runtime.pairingStore);
+  const auth = new GatewayHttpAuth(runtime.config.auth, runtime.pairingStore, runtime.fabricOriginDataPlaneGrants);
   const sessions = new Map<string, HttpSession>();
   let ready = true;
   const tls = runtime.config.transport.http.tls;
   if (runtime.fabricHttpChannelServer !== undefined && tls?.enabled !== true) {
     throw new Error("Gateway Fabric HTTP routes require native HTTPS");
+  }
+  if (runtime.fabricEnrollmentHttpServer !== undefined && tls?.enabled !== true) {
+    throw new Error("Gateway Fabric enrollment routes require native HTTPS");
   }
   const listener = (request: IncomingMessage, response: ServerResponse): void => {
     void handleRequest(request, response).catch((error) => {
@@ -68,6 +71,16 @@ export async function startGatewayHttpServer(runtime: GatewayRuntime, options: G
       const body = JSON.stringify({ status: healthy ? "ok" : "shutting_down" });
       response.writeHead(healthy ? 200 : 503, { "content-type": "application/json", "cache-control": "no-store", "content-length": Buffer.byteLength(body) });
       response.end(body);
+      return;
+    }
+    const enrollmentServer = runtime.fabricEnrollmentHttpServer;
+    if (enrollmentServer?.handles(url.pathname)) {
+      if (!ready || !runtime.isReady || !runtime.fabricAdmissionReady) {
+        response.writeHead(503, { "content-type": "application/json", "cache-control": "no-store" });
+        response.end(JSON.stringify({ error: { code: "unavailable", message: "Fabric registration is unavailable while the Gateway is shutting down" } }));
+        return;
+      }
+      await enrollmentServer.handle(request, response, url);
       return;
     }
     const fabricServer = runtime.fabricHttpChannelServer;

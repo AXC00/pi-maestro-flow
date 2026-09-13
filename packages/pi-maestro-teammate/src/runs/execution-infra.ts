@@ -261,7 +261,7 @@ export interface RunTeammateOptions {
    * backend fail to load and the dispatch refuse a placed task by name rather
    * than run it on this machine.
    */
-  fabricRouteResolverOf?: () => import("pi-maestro-backends/fabric").FabricBackendRouteResolver;
+  fabricRouteResolverOf?: import("../backends/registry-host.ts").FabricRouteResolverDispatchWiring;
   modelCapabilities?: readonly TeammateModelCapability[];
   modelCircuitBreaker?: ModelCircuitBreaker;
   /**

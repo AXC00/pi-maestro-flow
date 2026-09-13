@@ -571,6 +571,7 @@ export function assertValidFabricControlRequest(input: unknown, now?: number): a
   if (request.connectorId !== undefined) assertFabricIdentifier(request.connectorId, "connectorId");
   if (request.connectionId !== undefined) assertFabricIdentifier(request.connectionId, "connectionId");
   if (request.workspaceId !== undefined) assertFabricIdentifier(request.workspaceId, "workspaceId");
+  if (request.localWorkspaceId !== undefined) assertFabricIdentifier(request.localWorkspaceId, "localWorkspaceId");
   if (request.workspaceBindingId !== undefined) assertFabricIdentifier(request.workspaceBindingId, "workspaceBindingId");
   if (request.endpointId !== undefined) assertFabricIdentifier(request.endpointId, "endpointId");
   if (request.routeId !== undefined) assertFabricIdentifier(request.routeId, "routeId");
@@ -579,6 +580,7 @@ export function assertValidFabricControlRequest(input: unknown, now?: number): a
   if (request.expectedCredentialGeneration !== undefined) assertGeneration(request.expectedCredentialGeneration, "expectedCredentialGeneration");
   if (request.expectedConnectionGeneration !== undefined) assertGeneration(request.expectedConnectionGeneration, "expectedConnectionGeneration");
   if (request.expectedWorkspaceGeneration !== undefined) assertGeneration(request.expectedWorkspaceGeneration, "expectedWorkspaceGeneration");
+  if (request.expectedLocalWorkspaceGeneration !== undefined) assertGeneration(request.expectedLocalWorkspaceGeneration, "expectedLocalWorkspaceGeneration");
   if (request.expectedEndpointGeneration !== undefined) assertGeneration(request.expectedEndpointGeneration, "expectedEndpointGeneration");
   if (request.requestedTtlMs !== undefined) assertRequestedTtl(request.requestedTtlMs, "requestedTtlMs");
   if (request.endpointKind !== undefined) assertOneOf(request.endpointKind, ["agent", "mcp"], "endpointKind");

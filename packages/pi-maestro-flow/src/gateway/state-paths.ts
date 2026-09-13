@@ -251,6 +251,8 @@ function safePathToken(value: string): string {
 export interface AtomicWriteOptions {
   mode?: number;
   maximumBytes?: number;
+  /** Optional operation-owner fence checked at every atomic publication boundary. */
+  signal?: AbortSignal;
   /** Test-only crash seam around the atomic directory-entry replacement. */
   fault?: (point: "before-rename" | "after-rename") => void | Promise<void>;
 }
@@ -275,16 +277,22 @@ export async function writeGatewayFileAtomic(
   if (options.maximumBytes !== undefined && payload.byteLength > options.maximumBytes) {
     throw new Error(`Gateway state payload exceeds ${options.maximumBytes} bytes`);
   }
+  options.signal?.throwIfAborted();
   await mkdir(dirname(path), { recursive: true, mode: 0o700 });
+  options.signal?.throwIfAborted();
   const temporary = `${path}.${process.pid}.${randomUUID()}.tmp`;
   let handle: Awaited<ReturnType<typeof open>> | undefined;
   try {
     handle = await open(temporary, "wx", options.mode ?? 0o600);
+    options.signal?.throwIfAborted();
     await handle.writeFile(payload);
+    options.signal?.throwIfAborted();
     await handle.sync();
+    options.signal?.throwIfAborted();
     await handle.close();
     handle = undefined;
     await options.fault?.("before-rename");
+    options.signal?.throwIfAborted();
     await rename(temporary, path);
     await options.fault?.("after-rename");
     try { await chmod(path, options.mode ?? 0o600); } catch (error) {

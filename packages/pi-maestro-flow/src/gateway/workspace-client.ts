@@ -343,6 +343,17 @@ export function isGatewayConfigured(): boolean {
   }
 }
 
+/** Fabric origin wiring depends on Fabric+TLS, not the public HTTP auth mode. */
+export function isGatewayFabricEnabled(): boolean {
+  if (!existsSync(GATEWAY_CONFIG_PATH())) return false;
+  try {
+    const config = loadGatewayConfigSync(GATEWAY_CONFIG_PATH());
+    return config.fabric.enabled && config.transport.http.tls?.enabled === true;
+  } catch {
+    return false;
+  }
+}
+
 /**
  * Read the OAuth ops password (运维口令) from the native Gateway config.
  * gateway auto-generates one at startup when this is empty (kept in memory + the

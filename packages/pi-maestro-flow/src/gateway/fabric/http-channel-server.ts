@@ -12,6 +12,7 @@ import {
   type JsonValue,
 } from "pi-maestro-fabric-core/v1";
 import type { GatewayPrincipal } from "../contracts.ts";
+import type { FabricOriginGrantAuthorization } from "./origin-runtime.ts";
 import {
   FABRIC_HTTPS_EVENTS_PATH,
   FABRIC_HTTPS_EVENTS_VERSION,
@@ -42,6 +43,12 @@ export interface FabricHttpChannelServerOptions {
   readonly dispatcher: FabricEndpointDispatcher;
   readonly limits?: Partial<FabricHttpChannelServerLimits>;
   readonly now?: () => number;
+  readonly authorizeOriginGrant?: (principal: GatewayPrincipal, input: {
+    readonly routeId: string;
+    readonly endpointId: string;
+    readonly endpointGeneration: number;
+    readonly deadlineAt: number;
+  }) => FabricOriginGrantAuthorization | undefined;
 }
 
 interface ActiveExchange {
@@ -95,6 +102,7 @@ export class FabricHttpChannelServer {
   readonly dispatcher: FabricEndpointDispatcher;
   readonly limits: Readonly<FabricHttpChannelServerLimits>;
   readonly #now: () => number;
+  readonly #authorizeOriginGrant?: FabricHttpChannelServerOptions["authorizeOriginGrant"];
   readonly #events = new Map<string, FabricHttpsEventV1[]>();
   readonly #nextEventSequence = new Map<string, number>();
   readonly #channels: FabricChannelRouter;
@@ -104,6 +112,7 @@ export class FabricHttpChannelServer {
   constructor(options: FabricHttpChannelServerOptions) {
     this.dispatcher = options.dispatcher;
     this.#now = options.now ?? Date.now;
+    this.#authorizeOriginGrant = options.authorizeOriginGrant;
     this.#channels = new FabricChannelRouter(options.dispatcher.routes);
     this.limits = Object.freeze({
       maxRequestBytes: limit(options.limits?.maxRequestBytes, DEFAULT_LIMITS.maxRequestBytes, "maxRequestBytes"),
@@ -140,7 +149,7 @@ export class FabricHttpChannelServer {
         if (request.method !== "GET") {
           response.writeHead(405, { allow: "GET, OPTIONS" }); response.end(); return;
         }
-        await this.#readEvents(response, url);
+        await this.#readEvents(response, url, principal);
       }
     } catch (error) {
       const normalized = error instanceof FabricContractError ? error : new FabricContractError("unavailable", "Fabric HTTP channel failed");
@@ -178,6 +187,12 @@ export class FabricHttpChannelServer {
     const parsed = object(await this.#readJson(request), "exchangeRequest") as unknown as FabricHttpsExchangeRequestV1;
     this.#validateEnvelope(parsed);
     const frame = parsed.frame;
+    const grantAuthorization = this.#authorizeOriginGrant?.(principal, {
+      routeId: frame.routeId,
+      endpointId: parsed.endpointId,
+      endpointGeneration: parsed.endpointGeneration,
+      deadlineAt: parsed.deadlineAt,
+    });
 
     // Unary endpoint operations intentionally have no data/ack phase. Rejecting
     // these frame kinds at the boundary is part of the protocol shape rather
@@ -190,7 +205,7 @@ export class FabricHttpChannelServer {
     }
 
     const result = frame.kind === "open"
-      ? await this.#open(parsed, principal, requestSignal)
+      ? await this.#open(parsed, principal, requestSignal, grantAuthorization)
       : await this.#cancel(parsed);
     if (bytes(result.frame) > this.limits.maxFrameBytes || bytes(result) > this.limits.maxResultBytes) {
       throw new FabricContractError("resource_exhausted", "Fabric HTTPS result exceeds configured bounds");
@@ -198,7 +213,12 @@ export class FabricHttpChannelServer {
     this.#json(response, 200, result);
   }
 
-  async #open(parsed: FabricHttpsExchangeRequestV1, principal: GatewayPrincipal, requestSignal: AbortSignal): Promise<FabricHttpsExchangeResultV1> {
+  async #open(
+    parsed: FabricHttpsExchangeRequestV1,
+    principal: GatewayPrincipal,
+    requestSignal: AbortSignal,
+    grantAuthorization: FabricOriginGrantAuthorization | undefined,
+  ): Promise<FabricHttpsExchangeResultV1> {
     const frame = parsed.frame;
     if (frame.sequence !== 0) throw new FabricContractError("protocol_violation", "Fabric HTTPS open frame must start at sequence zero", "frame.sequence");
     const payload = object(frame.payload, "frame.payload");
@@ -216,8 +236,16 @@ export class FabricHttpChannelServer {
     this.#channels.bind(frame.routeId, frame.operationId, channel);
     channel.accept(frame);
     const controller = new AbortController();
-    const onRequestAbort = (): void => controller.abort();
+    const onRequestAbort = (): void => controller.abort(requestSignal.reason);
+    const onGrantAbort = (): void => controller.abort(grantAuthorization?.signal.reason);
     requestSignal.addEventListener("abort", onRequestAbort, { once: true });
+    grantAuthorization?.signal.addEventListener("abort", onGrantAbort, { once: true });
+    if (requestSignal.aborted) onRequestAbort();
+    if (grantAuthorization?.signal.aborted) onGrantAbort();
+    const grantTimer = grantAuthorization === undefined ? undefined : setTimeout(() => {
+      controller.abort(new FabricContractError("deadline_exceeded", "Fabric origin grant expired during dispatch"));
+    }, Math.max(0, grantAuthorization.expiresAt - this.#now()));
+    grantTimer?.unref?.();
     const state: ActiveExchange = { request: parsed, channel, controller };
     const key = operationKey(frame.routeId, frame.operationId);
     this.#active.set(key, state);
@@ -235,6 +263,12 @@ export class FabricHttpChannelServer {
           operation: payload.operation,
           input,
         }, principal, controller.signal);
+        this.#authorizeOriginGrant?.(principal, {
+          routeId: frame.routeId,
+          endpointId: parsed.endpointId,
+          endpointGeneration: parsed.endpointGeneration,
+          deadlineAt: parsed.deadlineAt,
+        });
         terminal = { ...frame, sequence: frame.sequence + 1, kind: "end", sentAt: this.#now(), payload: { result: value } };
       } catch (error) {
         const normalized = error instanceof FabricContractError ? error : new FabricContractError("unavailable", "Fabric Endpoint dispatch failed");
@@ -242,7 +276,9 @@ export class FabricHttpChannelServer {
       }
       return this.#result(parsed, terminal);
     } finally {
+      if (grantTimer !== undefined) clearTimeout(grantTimer);
       requestSignal.removeEventListener("abort", onRequestAbort);
+      grantAuthorization?.signal.removeEventListener("abort", onGrantAbort);
       if (this.#active.get(key) === state) this.#active.delete(key);
       this.#channels.unbind(frame.routeId, frame.operationId);
       await channel.close("Fabric HTTPS exchange completed").catch(() => undefined);
@@ -300,7 +336,7 @@ export class FabricHttpChannelServer {
     };
   }
 
-  async #readEvents(response: ServerResponse, url: URL): Promise<void> {
+  async #readEvents(response: ServerResponse, url: URL, principal: GatewayPrincipal): Promise<void> {
     const requestId = url.searchParams.get("requestId") ?? "";
     const routeId = url.searchParams.get("routeId") ?? "";
     const endpointId = url.searchParams.get("endpointId") ?? "";
@@ -313,6 +349,7 @@ export class FabricHttpChannelServer {
     assertFabricIdentifier(routeId, "routeId");
     assertFabricIdentifier(endpointId, "endpointId");
     if (requestedLimit > this.limits.maxEventRead) throw new FabricContractError("resource_exhausted", "Fabric event read exceeds maxEventRead", "limit");
+    this.#authorizeOriginGrant?.(principal, { routeId, endpointId, endpointGeneration, deadlineAt });
     this.dispatcher.authorize({ routeId, endpointId, endpointKind: kind, endpointGeneration, deadlineAt });
     const events = (this.#events.get(routeId) ?? []).filter((event) => event.sequence > afterSequence).slice(0, requestedLimit);
     const nextSequence = events.at(-1)?.sequence ?? afterSequence;

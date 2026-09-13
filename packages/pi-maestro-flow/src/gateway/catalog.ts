@@ -146,8 +146,10 @@ const WORKSPACE_SCHEMA = actions(
     deviceId: fabricId,
     connectionId: fabricId,
     workspaceId: fabricId,
+    localWorkspaceId: fabricId,
     expectedConnectionGeneration: integer({ minimum: 1 }),
     expectedWorkspaceGeneration: integer({ minimum: 1 }),
+    expectedLocalWorkspaceGeneration: integer({ minimum: 1 }),
     requestedTtlMs: integer({ minimum: 1, maximum: 86_400_000 }),
   }, ["deviceId", "connectionId", "workspaceId", "expectedConnectionGeneration", "expectedWorkspaceGeneration", "requestedTtlMs"]),
   fabricAction("renew", {

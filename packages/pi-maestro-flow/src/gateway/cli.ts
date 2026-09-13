@@ -1,6 +1,8 @@
 /** Command line entry for the packaged Gateway daemon and stdio relay. */
-import { readFile } from "node:fs/promises";
+import { mkdir, open, readFile, rm } from "node:fs/promises";
+import { dirname, resolve } from "node:path";
 import type { Readable, Writable } from "node:stream";
+import { assertBoundedString, assertFabricIdentifier } from "pi-maestro-fabric-core/v1";
 import { GatewayDaemon } from "./daemon.ts";
 import { connectGatewayIpc, requestGatewayIpcControl } from "./ipc.ts";
 import { GatewayOwnerActiveError, GatewayOwnerStore } from "./owner-store.ts";
@@ -13,6 +15,8 @@ import { GatewayControlClient } from "./control-client.ts";
 import { migrateLegacyGateway } from "./config-migration.ts";
 import { serializeGatewayLegacyMigrationError } from "./migration-contracts.ts";
 import { gatewayConfigPath } from "./state-paths.ts";
+import { enforceGatewayPrivatePath, type GatewayWindowsAclRunner } from "./private-path.ts";
+import type { FabricConnectorRegistrationHttp } from "./fabric/connector-registration-cli.ts";
 
 export interface GatewayCliIo {
   stdin?: Readable;
@@ -20,6 +24,11 @@ export interface GatewayCliIo {
   stderr?: Writable;
   /** Test seam for lifecycle sequencing; production always constructs the native client. */
   createControlClient?: (configPath?: string) => GatewayControlClient;
+  /** Test seams for Connector registration; production uses cwd, native HTTPS, and the host platform. */
+  connectorRoot?: string;
+  fabricRegistrationHttp?: FabricConnectorRegistrationHttp;
+  connectorPlatform?: NodeJS.Platform;
+  connectorWindowsAclRunner?: GatewayWindowsAclRunner;
 }
 
 interface ServeFlags {
@@ -150,6 +159,107 @@ function requiredValue(args: string[], index: number, flag: string): string {
   return value;
 }
 
+function requiredDefined<T>(value: T | undefined, message: string): T {
+  if (value === undefined) throw new Error(message);
+  return value;
+}
+
+interface FabricEnrollmentDeviceInput {
+  readonly deviceId: string;
+  readonly label: string;
+  readonly connectionMode: "https";
+  readonly platform?: string;
+  readonly architecture?: string;
+  readonly enabled: boolean;
+}
+
+const MAX_FABRIC_INVENTORY_BYTES = 64 * 1024;
+const FABRIC_INVENTORY_DEVICE_KEYS = new Set([
+  "deviceId", "label", "connectionMode", "platform", "architecture", "enabled",
+]);
+
+async function readFabricEnrollmentInventory(pathInput: string): Promise<FabricEnrollmentDeviceInput[]> {
+  const raw = await readFile(resolve(pathInput), "utf8");
+  if (Buffer.byteLength(raw, "utf8") > MAX_FABRIC_INVENTORY_BYTES) {
+    throw new Error("--inventory-file exceeds 64 KiB");
+  }
+  const parsed: unknown = JSON.parse(raw);
+  if (!Array.isArray(parsed) || parsed.length < 1 || parsed.length > 256) {
+    throw new Error("--inventory-file must contain 1 to 256 Devices");
+  }
+  return parsed.map((entry, index) => {
+    if (typeof entry !== "object" || entry === null || Array.isArray(entry)) {
+      throw new Error(`--inventory-file Device ${index} must be an object`);
+    }
+    const source = entry as Readonly<Record<string, unknown>>;
+    for (const key of Object.keys(source)) {
+      if (!FABRIC_INVENTORY_DEVICE_KEYS.has(key)) {
+        throw new Error(`--inventory-file Device ${index} has unsupported field ${JSON.stringify(key)}`);
+      }
+    }
+    assertFabricIdentifier(source.deviceId, `devices[${index}].deviceId`);
+    assertBoundedString(source.label, `devices[${index}].label`, 256);
+    if (source.connectionMode !== "https" || typeof source.enabled !== "boolean") {
+      throw new Error(`--inventory-file Device ${index} must use connectionMode https and declare enabled`);
+    }
+    if (source.platform !== undefined) assertBoundedString(source.platform, `devices[${index}].platform`, 256);
+    if (source.architecture !== undefined) assertBoundedString(source.architecture, `devices[${index}].architecture`, 256);
+    return {
+      deviceId: source.deviceId,
+      label: source.label,
+      connectionMode: "https",
+      ...(source.platform === undefined ? {} : { platform: source.platform }),
+      ...(source.architecture === undefined ? {} : { architecture: source.architecture }),
+      enabled: source.enabled,
+    };
+  });
+}
+
+async function readPrivateTokenInput(input: Readable): Promise<string> {
+  const chunks: Buffer[] = [];
+  let bytes = 0;
+  for await (const chunk of input) {
+    const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    bytes += buffer.byteLength;
+    if (bytes > 2_048) throw new Error("Fabric purpose token input exceeds 2048 bytes");
+    chunks.push(buffer);
+  }
+  const secret = Buffer.concat(chunks);
+  try {
+    const token = secret.toString("utf8").trim();
+    if (!/^[A-Za-z0-9_-]{1,1024}$/u.test(token)) throw new Error("Fabric purpose token input is invalid");
+    return token;
+  } finally {
+    secret.fill(0);
+    for (const chunk of chunks) chunk.fill(0);
+  }
+}
+
+export async function writePrivateToken(
+  pathInput: string,
+  token: string,
+  options: { platform?: NodeJS.Platform; windowsAclRunner?: GatewayWindowsAclRunner } = {},
+): Promise<string> {
+  const path = resolve(pathInput);
+  const directory = dirname(path);
+  await mkdir(directory, { recursive: true, mode: 0o700 });
+  await enforceGatewayPrivatePath(directory, "directory", options);
+  const handle = await open(path, "wx", 0o600);
+  try {
+    await handle.writeFile(`${token}\n`, "utf8");
+    await handle.sync();
+  } finally {
+    await handle.close();
+  }
+  try {
+    await enforceGatewayPrivatePath(path, "file", options);
+  } catch (error) {
+    await rm(path, { force: true });
+    throw error;
+  }
+  return path;
+}
+
 async function packageVersion(): Promise<string> {
   try {
     const raw = await readFile(new URL("../../package.json", import.meta.url), "utf8");
@@ -179,17 +289,116 @@ export async function main(argv = process.argv.slice(2), io: GatewayCliIo = {}):
     }
     if (command === "connector") {
       const action = args[0];
+      if (action === "enroll" || action === "rotate") {
+        let hub: string | undefined;
+        let connectorId: string | undefined;
+        let deviceId: string | undefined;
+        let inventoryFile: string | undefined;
+        let localDeviceId: string | undefined;
+        let caPath: string | undefined;
+        let expectedRevision: number | undefined;
+        let expectedGeneration: number | undefined;
+        let tokenStdin = false;
+        let json = false;
+        for (let index = 1; index < args.length; index += 1) {
+          const arg = args[index]!;
+          if (arg === "--json") json = true;
+          else if (arg === "--token-stdin") tokenStdin = true;
+          else if (arg === "--hub") hub = requiredValue(args, ++index, arg);
+          else if (arg === "--connector-id") connectorId = requiredValue(args, ++index, arg);
+          else if (arg === "--device-id") deviceId = requiredValue(args, ++index, arg);
+          else if (arg === "--inventory-file") inventoryFile = requiredValue(args, ++index, arg);
+          else if (arg === "--local-device-id") localDeviceId = requiredValue(args, ++index, arg);
+          else if (arg === "--ca") caPath = requiredValue(args, ++index, arg);
+          else if (arg === "--expected-revision") expectedRevision = positiveCliInteger(requiredValue(args, ++index, arg), arg);
+          else if (arg === "--expected-generation") expectedGeneration = positiveCliInteger(requiredValue(args, ++index, arg), arg);
+          else throw new Error(`connector ${action} received an unsupported option; purpose tokens are never accepted in argv`);
+        }
+        if (!tokenStdin) throw new Error(`connector ${action} requires --token-stdin; tokens are never accepted in argv`);
+        if (action === "enroll") {
+          if (hub === undefined || connectorId === undefined) throw new Error("connector enroll requires --hub and --connector-id");
+          if ((deviceId === undefined) === (inventoryFile === undefined)) throw new Error("connector enroll requires exactly one of --device-id or --inventory-file");
+          if (inventoryFile !== undefined && localDeviceId === undefined) throw new Error("connector enroll with --inventory-file requires --local-device-id");
+        } else {
+          if (expectedRevision === undefined || expectedGeneration === undefined) throw new Error("connector rotate requires --expected-revision and --expected-generation");
+          if (hub !== undefined || connectorId !== undefined || deviceId !== undefined || inventoryFile !== undefined || localDeviceId !== undefined) throw new Error("connector rotate reads identity and Hub from the active config");
+        }
+        const token = await readPrivateTokenInput(stdin);
+        const { fabricConnectorEnroll, fabricConnectorRotate } = await import("./fabric/connector-registration-cli.ts");
+        const root = io.connectorRoot ?? process.cwd();
+        const config = action === "enroll" ? await (async () => {
+          let devices: Array<{ deviceId: string; label: string; connectionMode: "https"; platform?: string; architecture?: string; enabled: boolean }>;
+          if (deviceId !== undefined) {
+            devices = [{ deviceId, label: deviceId, connectionMode: "https", platform: process.platform, architecture: process.arch, enabled: true }];
+            localDeviceId = localDeviceId ?? deviceId;
+          } else {
+            devices = await readFabricEnrollmentInventory(
+              requiredDefined(inventoryFile, "connector enroll requires --inventory-file"),
+            );
+          }
+          return fabricConnectorEnroll({
+            root, token,
+            hub: requiredDefined(hub, "connector enroll requires --hub"),
+            connectorId: requiredDefined(connectorId, "connector enroll requires --connector-id"),
+            devices,
+            localDeviceId: requiredDefined(localDeviceId, "connector enroll requires --local-device-id"),
+            ...(caPath === undefined ? {} : { caPath }),
+            ...(io.fabricRegistrationHttp === undefined ? {} : { http: io.fabricRegistrationHttp }),
+            ...(io.connectorPlatform === undefined ? {} : { platform: io.connectorPlatform }),
+            ...(io.connectorWindowsAclRunner === undefined ? {} : { windowsAclRunner: io.connectorWindowsAclRunner }),
+          });
+        })() : await (async () => {
+          return fabricConnectorRotate({
+            root, token,
+            expectedRevision: requiredDefined(expectedRevision, "connector rotate requires --expected-revision"),
+            expectedCredentialGeneration: requiredDefined(expectedGeneration, "connector rotate requires --expected-generation"),
+            ...(caPath === undefined ? {} : { caPath }),
+            ...(io.fabricRegistrationHttp === undefined ? {} : { http: io.fabricRegistrationHttp }),
+            ...(io.connectorPlatform === undefined ? {} : { platform: io.connectorPlatform }),
+            ...(io.connectorWindowsAclRunner === undefined ? {} : { windowsAclRunner: io.connectorWindowsAclRunner }),
+          });
+        })();
+        const safe = { status: "active", connectorId: config.connectorId, keyId: config.keyId, credentialGeneration: config.credentialGeneration, revision: config.revision, configPath: resolve(root, ".pi", "fabric-connector.json") };
+        write(stdout, json ? JSON.stringify(safe) : JSON.stringify(safe, null, 2));
+        return 0;
+      }
+      if (action === "revoke") {
+        const connectorId = requiredValue(args, 1, "connector revoke");
+        let configPath: string | undefined;
+        let requestId: string | undefined;
+        let expectedRevision: number | undefined;
+        let json = false;
+        for (let index = 2; index < args.length; index += 1) {
+          const arg = args[index]!;
+          if (arg === "--json") json = true;
+          else if (arg === "--config") configPath = requiredValue(args, ++index, arg);
+          else if (arg === "--request-id") requestId = requiredValue(args, ++index, arg);
+          else if (arg === "--expected-revision") expectedRevision = positiveCliInteger(requiredValue(args, ++index, arg), arg);
+          else throw new Error(`Unknown connector revoke option: ${arg}`);
+        }
+        if (requestId === undefined) throw new Error("connector revoke requires --request-id");
+        if (expectedRevision === undefined) throw new Error("connector revoke requires --expected-revision");
+        const receipt = await createControlClient(configPath).revokeFabricConnector({ connectorId, requestId, expectedRevision });
+        write(stdout, json ? JSON.stringify(receipt) : JSON.stringify(receipt, null, 2));
+        return 0;
+      }
       if (action !== "start" && action !== "stop" && action !== "status") {
-        throw new Error("Usage: pi-maestro-gateway connector start|stop|status [--json]");
+        throw new Error("Usage: pi-maestro-gateway connector start|stop|status [--json] | connector enroll|rotate|revoke ...");
       }
       const flags = args.slice(1);
       const unknown = flags.filter((arg) => arg !== "--json");
       if (unknown.length > 0) throw new Error(`connector ${action} does not accept ${unknown[0]}`);
       const { fabricConnectorStart, fabricConnectorStatus, fabricConnectorStop } = await import("./fabric/connector-cli.ts");
-      const io = { stdout: (text: string) => write(stdout, text.trimEnd()), stderr: (text: string) => write(stderr, text.trimEnd()), root: process.cwd(), json: flags.includes("--json") };
-      if (action === "status") return await fabricConnectorStatus(io);
-      if (action === "start") return await fabricConnectorStart(io);
-      return await fabricConnectorStop(io);
+      const connectorIo = {
+        stdout: (text: string) => write(stdout, text.trimEnd()),
+        stderr: (text: string) => write(stderr, text.trimEnd()),
+        root: io.connectorRoot ?? process.cwd(),
+        json: flags.includes("--json"),
+        control: io.createControlClient?.() ?? new GatewayControlClient({ cwd: io.connectorRoot ?? process.cwd() }),
+      };
+      if (action === "status") return await fabricConnectorStatus(connectorIo);
+      if (action === "start") return await fabricConnectorStart(connectorIo);
+      return await fabricConnectorStop(connectorIo);
     }
     if (command === "config") {
       const { runGatewayConfigCommand } = await import("./config-tui.ts");
@@ -385,7 +594,45 @@ export async function main(argv = process.argv.slice(2), io: GatewayCliIo = {}):
       const action = args[0];
       if (!action || !["create", "bootstrap", "list", "revoke"].includes(action)) throw new Error("Usage: pi-maestro-gateway pair create|bootstrap|list|revoke [ID] [--ttl SECONDS] [--label LABEL]");
       const configIndex = args.indexOf("--config");
-      const config = await loadGatewayConfig(configIndex < 0 ? undefined : requiredValue(args, configIndex + 1, "--config"));
+      const configPath = configIndex < 0 ? undefined : requiredValue(args, configIndex + 1, "--config");
+      const purposeIndex = args.indexOf("--purpose");
+      if (purposeIndex >= 0) {
+        if (action !== "create") throw new Error("Fabric purpose tokens are issued only by pair create");
+        const purpose = requiredValue(args, purposeIndex + 1, "--purpose");
+        if (purpose !== "fabric-enrollment" && purpose !== "fabric-rotation") throw new Error("--purpose must be fabric-enrollment or fabric-rotation");
+        const valueFlags = new Set(["--purpose", "--connector-id", "--token-out", "--ttl", "--generation", "--label", "--config"]);
+        for (let index = 1; index < args.length; index += 1) {
+          const arg = args[index]!;
+          if (!valueFlags.has(arg)) throw new Error(`Unknown Fabric purpose-token option: ${arg}`);
+          requiredValue(args, ++index, arg);
+        }
+        const connectorIndex = args.indexOf("--connector-id");
+        const tokenOutIndex = args.indexOf("--token-out");
+        if (connectorIndex < 0) throw new Error("Fabric purpose token issuance requires --connector-id");
+        if (tokenOutIndex < 0) throw new Error("Fabric purpose token issuance requires --token-out");
+        const ttlIndex = args.indexOf("--ttl");
+        const generationIndex = args.indexOf("--generation");
+        const labelIndex = args.indexOf("--label");
+        const ttlSeconds = ttlIndex < 0 ? 600 : positiveCliInteger(requiredValue(args, ttlIndex + 1, "--ttl"), "--ttl");
+        if (ttlSeconds > 600) throw new Error("Fabric purpose-token --ttl cannot exceed 600 seconds");
+        const generation = generationIndex < 0 ? undefined : positiveCliInteger(requiredValue(args, generationIndex + 1, "--generation"), "--generation");
+        if (purpose === "fabric-rotation" && generation === undefined) throw new Error("fabric-rotation requires --generation");
+        if (purpose === "fabric-enrollment" && generation !== undefined) throw new Error("fabric-enrollment does not accept --generation");
+        const value = await createControlClient(configPath).issueFabricPurposePairing({
+          purpose,
+          connectorId: requiredValue(args, connectorIndex + 1, "--connector-id"),
+          ttlSeconds,
+          ...(generation === undefined ? {} : { generation }),
+          ...(labelIndex < 0 ? {} : { label: requiredValue(args, labelIndex + 1, "--label") }),
+        });
+        const issued = value;
+        if (typeof issued.token !== "string" || issued.token.length === 0) throw new Error("Gateway returned an invalid purpose-token response");
+        const tokenOut = await writePrivateToken(requiredValue(args, tokenOutIndex + 1, "--token-out"), issued.token);
+        const { token: _token, ...safe } = issued;
+        write(stdout, JSON.stringify({ ...safe, tokenOut }));
+        return 0;
+      }
+      const config = await loadGatewayConfig(configPath);
       const owner = await new GatewayOwnerStore({ ownerPath: config.state.ownerPath }).read();
       if (!owner?.socket) throw new Error(GATEWAY_OFFLINE_MESSAGE);
       const ttlIndex = args.indexOf("--ttl");
@@ -434,13 +681,17 @@ export async function main(argv = process.argv.slice(2), io: GatewayCliIo = {}):
         "  connect --stdio",
         "  config [--config PATH]  # standalone terminal UI; no Pi host required",
         "  config-sync apply",
+        "  connector enroll --hub https://HOST --connector-id ID --device-id ID --token-stdin [--ca PATH] [--json]",
+        "  connector rotate --expected-generation N --expected-revision N --token-stdin [--ca PATH] [--json]",
         "  connector start|stop|status [--json]  # Fabric Connector for this workspace",
+        "  connector revoke ID --expected-revision N --request-id ID [--config PATH] [--json]",
         "  migrate-legacy --dry-run|--apply [--json]",
         "  service install|ensure|start|stop|restart|status|uninstall [--config PATH] [--json]",
         "    install|ensure [--windows-startup | --detached-fallback]",
         "    --windows-startup persists for the next interactive sign-in; it is not a Windows Service.",
         "    In a non-interactive SSH session, ensure guarantees readiness only until that session ends.",
         "  pair create|bootstrap|list|revoke [ID]",
+        "  pair create --purpose fabric-enrollment|fabric-rotation --connector-id ID [--generation N] [--ttl SECONDS] --token-out FILE [--config PATH]",
         "  tunnel status|start|stop|restart [PROVIDER] [INSTANCE] [--timeout-ms MS] [--generation N] [--local-port PORT] [--binary PATH] [--json]",
         "  tunnel profile list|status|start|stop|restart|enable|disable [PROFILE] [--timeout-ms MS] [--generation N] [--config PATH] [--json]",
         "    persisted profiles support Cloudflare Quick/Named, OpenAI Secure, and Managed OpenSSH Reverse modes; legacy provider commands remain compatible",

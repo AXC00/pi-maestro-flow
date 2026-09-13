@@ -47,6 +47,11 @@ export interface FabricEndpointRegistration {
   readonly endpointId: string;
   readonly kind: FabricEndpointKind;
   readonly handler: FabricEndpointHandler;
+  /** Present only for a remote, generation-owned transport registration. */
+  readonly ownerId?: string;
+  readonly connectionId?: string;
+  readonly connectionGeneration?: number;
+  readonly endpointGeneration?: number;
 }
 
 export interface FabricEndpointDispatcherOptions {
@@ -106,19 +111,37 @@ export class FabricEndpointDispatcher {
     for (const registration of options.registrations ?? []) this.register(registration);
   }
 
-  register(registration: FabricEndpointRegistration): void {
+  register(registration: FabricEndpointRegistration): () => boolean {
     assertFabricIdentifier(registration.endpointId, "endpointId");
     if (registration.kind !== "mcp" && registration.kind !== "agent") {
       throw new FabricContractError("invalid_argument", "Unsupported Fabric Endpoint kind", "kind");
+    }
+    const ownedFields = [registration.ownerId, registration.connectionId, registration.connectionGeneration, registration.endpointGeneration];
+    if (ownedFields.some((value) => value !== undefined) && ownedFields.some((value) => value === undefined)) {
+      throw new FabricContractError("invalid_argument", "Owned Endpoint registration requires its complete generation tuple", "ownerId");
+    }
+    if (registration.ownerId !== undefined) {
+      assertFabricIdentifier(registration.ownerId, "ownerId");
+      assertFabricIdentifier(registration.connectionId, "connectionId");
+      assertGeneration(registration.connectionGeneration, "connectionGeneration");
+      assertGeneration(registration.endpointGeneration, "endpointGeneration");
     }
     if (this.#registrations.has(registration.endpointId)) {
       throw new FabricContractError("conflict", "Fabric Endpoint already has a dispatcher registration", "endpointId");
     }
     this.#registrations.set(registration.endpointId, registration);
+    let disposed = false;
+    return () => {
+      if (disposed) return false;
+      disposed = true;
+      return this.unregister(registration.endpointId, registration);
+    };
   }
 
-  unregister(endpointId: string): boolean {
+  unregister(endpointId: string, expected?: FabricEndpointRegistration): boolean {
     assertFabricIdentifier(endpointId, "endpointId");
+    const current = this.#registrations.get(endpointId);
+    if (current === undefined || (expected !== undefined && current !== expected)) return false;
     return this.#registrations.delete(endpointId);
   }
 
@@ -175,6 +198,13 @@ export class FabricEndpointDispatcher {
       const registration = this.#registrations.get(endpoint.endpointId);
       if (registration === undefined) throw new FabricContractError("not_found", "Fabric Endpoint has no local transport registration", "endpointId");
       if (registration.kind !== endpoint.kind) throw new FabricContractError("conflict", "Fabric Endpoint registration kind is stale", "endpointKind");
+      if (registration.ownerId !== undefined && (
+        registration.connectionId !== route.connectionId ||
+        registration.connectionGeneration !== route.connectionGeneration ||
+        registration.endpointGeneration !== endpoint.generation
+      )) {
+        throw new FabricContractError("stale_generation", "Fabric Endpoint transport registration is stale", "endpointGeneration");
+      }
 
       // Observe both fulfillment and rejection even if cancellation wins. The
       // dispatcher must release admission capacity without waiting for a
@@ -202,7 +232,15 @@ export class FabricEndpointDispatcher {
           ? new FabricContractError("deadline_exceeded", "Fabric Endpoint request deadline has passed", "deadlineAt")
           : new FabricContractError("cancelled", "Fabric Endpoint request was cancelled");
       }
-      this.authorize(request);
+      const current = this.authorize(request);
+      if (this.#registrations.get(endpoint.endpointId) !== registration ||
+        (registration.ownerId !== undefined && (
+          registration.connectionId !== current.route.connectionId ||
+          registration.connectionGeneration !== current.route.connectionGeneration ||
+          registration.endpointGeneration !== current.endpoint.generation
+        ))) {
+        throw new FabricContractError("stale_generation", "Fabric Endpoint transport owner changed while dispatch awaited", "connectionGeneration");
+      }
       if (byteLength(settled.value) > this.#maxResultBytes) throw new FabricContractError("resource_exhausted", "Fabric Endpoint result is too large", "maxResultBytes");
       return structuredClone(settled.value);
     } finally {

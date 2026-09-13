@@ -1,7 +1,9 @@
+import { randomUUID } from "node:crypto";
 import {
   FABRIC_AGENT_ATTEMPT_VERSION,
   assertFabricAgentEvent,
   type FabricAgentControlReceiptV1,
+  type FabricAgentEventPageV1,
   type FabricAgentRecoveryReceiptV1,
   type FabricAgentReclamationReceiptV1,
   type FabricAgentSendRequestV1,
@@ -13,14 +15,13 @@ import {
 } from "pi-maestro-backends/fabric";
 import {
   FabricContractError,
-  assertValidFabricPlacementEvent,
   type AgentRuntimeEndpoint,
   type EndpointRecord,
   type EndpointRouteHandle,
   type FabricPlacementEventV1,
   type JsonValue,
 } from "pi-maestro-fabric-core/v1";
-import type { FabricHttpsDispatchInput, FabricHttpsEventsResultV1 } from "./https-transport.ts";
+import type { FabricHttpsDispatchInput } from "./https-transport.ts";
 import type { FabricHttpsTransport } from "./https-transport.ts";
 import { registerFabricRouteResolverProvider } from "pi-maestro-teammate/v1/fabric-runtime";
 
@@ -39,16 +40,6 @@ export interface FabricAgentChannelAuthority {
 /** The paired Gateway transport, narrowed to what an agent route needs. */
 export interface FabricAgentChannelTransport {
   dispatch(input: FabricHttpsDispatchInput, signal: AbortSignal): Promise<JsonValue>;
-  events(input: {
-    requestId: string;
-    routeId: string;
-    endpointId: string;
-    endpointKind: "agent";
-    endpointGeneration: number;
-    deadlineAt: number;
-    afterSequence: number;
-    limit?: number;
-  }, signal: AbortSignal): Promise<FabricHttpsEventsResultV1>;
 }
 
 export interface FabricAgentRouteResolverOptions {
@@ -85,8 +76,11 @@ class FabricAgentChannel implements PreparedFabricBackendChannel {
   readonly #options: FabricAgentRouteResolverOptions;
   readonly #now: () => number;
   readonly #pollIntervalMs: number;
+  readonly #maxEventBatch: number;
   readonly #listeners = new Set<(event: FabricPlacementEventV1) => void>();
   #afterSequence = 0;
+  #attemptId?: string;
+  #attemptDeadlineAt?: number;
   #placementId?: string;
   #pump?: Promise<void>;
   #pumpController?: AbortController;
@@ -105,6 +99,7 @@ class FabricAgentChannel implements PreparedFabricBackendChannel {
     this.endpoint = endpoint;
     this.#now = options.now ?? Date.now;
     this.#pollIntervalMs = positive(options.pollIntervalMs, 250, "pollIntervalMs");
+    this.#maxEventBatch = positive(options.maxEventBatch, 128, "maxEventBatch");
   }
 
   subscribe(listener: (event: FabricPlacementEventV1) => void): () => void {
@@ -113,11 +108,17 @@ class FabricAgentChannel implements PreparedFabricBackendChannel {
   }
 
   async start(request: FabricAgentStartRequestV1, signal: AbortSignal): Promise<FabricAgentStartAckV1> {
-    // The pump starts first so no source event is lost while start is in flight.
+    this.#attemptId = request.attemptId;
+    this.#attemptDeadlineAt = request.placement.deadlineAt;
     this.#placementId = request.placement.placementId;
-    this.#startPump();
-    const ack = await this.#dispatch(request.attemptId, "agent.start", request as unknown as Record<string, JsonValue>, signal);
-    return ack as unknown as FabricAgentStartAckV1;
+    try {
+      const ack = await this.#dispatch(request.attemptId, "agent.start", request as unknown as Record<string, JsonValue>, signal);
+      return ack as unknown as FabricAgentStartAckV1;
+    } finally {
+      // The Endpoint retains attempt events, so starting the pump after the
+      // unary ACK settles cannot lose output and also covers an uncertain ACK.
+      this.#startPump();
+    }
   }
 
   async wait(signal: AbortSignal): Promise<{ status: "completed" | "transport-lost"; reason?: string }> {
@@ -196,10 +197,10 @@ class FabricAgentChannel implements PreparedFabricBackendChannel {
       endpointId: this.endpoint.endpointId,
       endpointKind: "agent",
       endpointGeneration: this.endpoint.generation,
-      deadlineAt: Math.min(this.route.expiresAt, this.#now() + 60_000),
+      deadlineAt: Math.min(this.route.expiresAt, this.#attemptDeadlineAt ?? this.route.expiresAt, this.#now() + 60_000),
       operation,
       input,
-      operationId: `${attemptId}:${operation}`,
+      operationId: randomUUID(),
     }, signal);
   }
 
@@ -210,30 +211,40 @@ class FabricAgentChannel implements PreparedFabricBackendChannel {
     this.#pump = (async () => {
       while (!controller.signal.aborted && !this.#terminal) {
         try {
-          const page = await this.#options.transport.events({
-            requestId: `agent-events-${this.route.routeId}-${this.#afterSequence}`,
-            routeId: this.route.routeId,
-            endpointId: this.endpoint.endpointId,
-            endpointKind: "agent",
-            endpointGeneration: this.endpoint.generation,
-            deadlineAt: Math.min(this.route.expiresAt, this.#now() + 60_000),
-            afterSequence: this.#afterSequence,
-          }, controller.signal);
-          for (const event of page.events) {
-            if (event.sequence <= this.#afterSequence) continue;
-            this.#afterSequence = event.sequence;
-            // Validated before delivery: an event the contract or this attempt's
-            // own placement rejects must not reach host publication just because
-            // it crossed the wire.
-            const candidate = event as unknown as FabricPlacementEventV1;
-            if (this.#placementId === undefined) assertValidFabricPlacementEvent(candidate);
-            else assertFabricAgentEvent(candidate, this.#placementId);
+          if (this.#attemptId === undefined || this.#placementId === undefined) return;
+          const priorSequence = this.#afterSequence;
+          const page = await this.#dispatch(
+            this.#attemptId,
+            "agent.events",
+            {
+              version: FABRIC_AGENT_ATTEMPT_VERSION,
+              attemptId: this.#attemptId,
+              placementId: this.#placementId,
+              afterSequence: priorSequence,
+              limit: this.#maxEventBatch,
+            },
+            controller.signal,
+          ) as unknown as FabricAgentEventPageV1;
+          if (!Array.isArray(page.events) || !Number.isSafeInteger(page.nextSequence) || page.nextSequence < priorSequence) {
+            throw new FabricContractError("protocol_violation", "Fabric Agent event page is invalid", "events");
+          }
+          let nextSequence = priorSequence;
+          for (const candidate of page.events) {
+            assertFabricAgentEvent(candidate, this.#placementId);
+            if (candidate.sequence <= nextSequence) {
+              throw new FabricContractError("protocol_violation", "Fabric Agent event sequence is not increasing", "sequence");
+            }
+            nextSequence = candidate.sequence;
+            this.#afterSequence = candidate.sequence;
             for (const listener of this.#listeners) listener(candidate);
             if (candidate.kind === "completion" || candidate.kind === "error") {
               this.#terminal = true;
               this.#settle?.({ status: "completed" });
               break;
             }
+          }
+          if (!this.#terminal && page.nextSequence !== nextSequence) {
+            throw new FabricContractError("protocol_violation", "Fabric Agent event cursor is invalid", "nextSequence");
           }
         } catch (error) {
           if (controller.signal.aborted) return;

@@ -38,6 +38,8 @@ export interface FabricControlRequestV1 {
   connectorId?: ConnectorId;
   connectionId?: ConnectionId;
   workspaceId?: WorkspaceId;
+  /** Host-local Gateway workspace selected when creating a durable binding. */
+  localWorkspaceId?: WorkspaceId;
   workspaceBindingId?: WorkspaceBindingId;
   endpointId?: EndpointId;
   routeId?: RouteId;
@@ -46,6 +48,8 @@ export interface FabricControlRequestV1 {
   expectedCredentialGeneration?: number;
   expectedConnectionGeneration?: number;
   expectedWorkspaceGeneration?: number;
+  /** Generation fence for localWorkspaceId. */
+  expectedLocalWorkspaceGeneration?: number;
   expectedEndpointGeneration?: number;
   requestedTtlMs?: number;
   endpointKind?: "agent" | "mcp";

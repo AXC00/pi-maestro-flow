@@ -1,4 +1,4 @@
-import { createPublicKey, verify as verifySignature } from "node:crypto";
+import { createPublicKey, randomBytes, randomUUID, verify as verifySignature } from "node:crypto";
 import {
   FabricContractError,
   assertBoundedString,
@@ -7,7 +7,6 @@ import {
   assertGeneration,
   assertRevision,
   utf8ByteLength,
-  type JsonValue,
 } from "pi-maestro-fabric-core/v1";
 
 export const FABRIC_CONNECTOR_CREDENTIAL_VERSION = "fabric.connector-credential.v1" as const;
@@ -77,6 +76,16 @@ export interface FabricConnectorEnrollmentInput {
   scopes: readonly string[];
 }
 
+export interface FabricConnectorCredentialAuthority {
+  credentialOf(connectorId: string): FabricConnectorCredentialV1 | undefined;
+}
+
+export interface FabricMutableConnectorCredentialAuthority extends FabricConnectorCredentialAuthority {
+  enroll(input: FabricConnectorEnrollmentInput): FabricConnectorCredentialV1;
+  rotate(connectorId: string, input: FabricConnectorEnrollmentInput, expectedRevision: number): FabricConnectorCredentialV1;
+  revoke(connectorId: string, expectedRevision: number): FabricConnectorCredentialV1;
+}
+
 export interface FabricConnectorSecurityOptions {
   /** Audience every challenge and proof must name. */
   readonly audience: string;
@@ -86,6 +95,8 @@ export interface FabricConnectorSecurityOptions {
   readonly maxPendingChallenges?: number;
   readonly maxConnectors?: number;
   readonly credentialExpiresAt?: number;
+  /** Production supplies the durable registration authority; omission creates an explicit in-memory test authority. */
+  readonly credentialAuthority?: FabricConnectorCredentialAuthority;
 }
 
 /**
@@ -163,17 +174,82 @@ function decodeSignature(signature: string): Buffer {
   return bytes;
 }
 
-function jsonScopes(scopes: readonly string[]): readonly JsonValue[] {
-  return scopes as unknown as readonly JsonValue[];
+/** Explicit volatile credential authority for isolated unit tests and embeddings. */
+export class InMemoryFabricConnectorCredentialAuthority implements FabricMutableConnectorCredentialAuthority {
+  readonly #audience: string;
+  readonly #now: () => number;
+  readonly #maxConnectors: number;
+  readonly #credentialExpiresAt?: number;
+  readonly #credentials = new Map<string, FabricConnectorCredentialV1>();
+
+  constructor(options: Pick<FabricConnectorSecurityOptions, "audience" | "now" | "maxConnectors" | "credentialExpiresAt">) {
+    this.#audience = options.audience;
+    this.#now = options.now ?? Date.now;
+    this.#maxConnectors = positive(options.maxConnectors, 256, "maxConnectors");
+    this.#credentialExpiresAt = options.credentialExpiresAt;
+  }
+
+  enroll(input: FabricConnectorEnrollmentInput): FabricConnectorCredentialV1 {
+    assertFabricIdentifier(input.connectorId, "connectorId");
+    assertFabricIdentifier(input.keyId, "keyId");
+    decodeEd25519Key(input.publicKey, "publicKey");
+    if (!Array.isArray(input.scopes) || input.scopes.length === 0) throw new FabricContractError("invalid_argument", "scopes must name at least one Fabric grant", "scopes");
+    for (const [index, scope] of input.scopes.entries()) assertFabricScope(scope, `scopes[${index}]`);
+    if (this.#credentials.has(input.connectorId)) throw new FabricContractError("conflict", "Connector is already enrolled; rotate it instead", "connectorId");
+    if (this.#credentials.size >= this.#maxConnectors) throw new FabricContractError("resource_exhausted", "Connector enrollment capacity is full", "maxConnectors");
+    const credential: FabricConnectorCredentialV1 = {
+      version: FABRIC_CONNECTOR_CREDENTIAL_VERSION, connectorId: input.connectorId, keyId: input.keyId,
+      publicKey: input.publicKey, audience: this.#audience, scopes: [...input.scopes], credentialGeneration: 1,
+      createdAt: this.#now(), ...(this.#credentialExpiresAt === undefined ? {} : { expiresAt: this.#credentialExpiresAt }),
+      revoked: false, revision: 0,
+    };
+    this.#credentials.set(credential.connectorId, credential);
+    return structuredClone(credential);
+  }
+
+  rotate(connectorId: string, input: FabricConnectorEnrollmentInput, expectedRevision: number): FabricConnectorCredentialV1 {
+    assertFabricIdentifier(connectorId, "connectorId");
+    assertRevision(expectedRevision, "expectedRevision");
+    const current = this.#credentials.get(connectorId);
+    if (current === undefined) throw new FabricContractError("unauthenticated", "Connector is not enrolled", "connectorId");
+    if (current.revision !== expectedRevision) throw new FabricContractError("conflict", "Connector credential revision is stale", "expectedRevision");
+    assertFabricIdentifier(input.keyId, "keyId");
+    decodeEd25519Key(input.publicKey, "publicKey");
+    if (!Array.isArray(input.scopes) || input.scopes.length === 0) throw new FabricContractError("invalid_argument", "scopes must name at least one Fabric grant", "scopes");
+    for (const [index, scope] of input.scopes.entries()) assertFabricScope(scope, `scopes[${index}]`);
+    const next: FabricConnectorCredentialV1 = { ...current, keyId: input.keyId, publicKey: input.publicKey, scopes: [...input.scopes], credentialGeneration: current.credentialGeneration + 1, createdAt: this.#now(), revoked: false, revision: current.revision + 1 };
+    this.#credentials.set(connectorId, next);
+    return structuredClone(next);
+  }
+
+  revoke(connectorId: string, expectedRevision: number): FabricConnectorCredentialV1 {
+    assertFabricIdentifier(connectorId, "connectorId");
+    assertRevision(expectedRevision, "expectedRevision");
+    const current = this.#credentials.get(connectorId);
+    if (current === undefined) throw new FabricContractError("unauthenticated", "Connector is not enrolled", "connectorId");
+    if (current.revision !== expectedRevision) throw new FabricContractError("conflict", "Connector credential revision is stale", "expectedRevision");
+    const next = { ...current, revoked: true, revision: current.revision + 1 };
+    this.#credentials.set(connectorId, next);
+    return structuredClone(next);
+  }
+
+  credentialOf(connectorId: string): FabricConnectorCredentialV1 | undefined {
+    const credential = this.#credentials.get(connectorId);
+    return credential === undefined ? undefined : structuredClone(credential);
+  }
+}
+
+function isMutableCredentialAuthority(
+  authority: FabricConnectorCredentialAuthority,
+): authority is FabricMutableConnectorCredentialAuthority {
+  return "enroll" in authority && typeof authority.enroll === "function" &&
+    "rotate" in authority && typeof authority.rotate === "function" &&
+    "revoke" in authority && typeof authority.revoke === "function";
 }
 
 /**
- * Hub-side Connector security: enrollment, single-use challenges, and proof
- * verification.
- *
- * Every rejection is fail-closed and indistinguishable where it matters: an
- * unknown, revoked, or expired Connector is reported as unauthenticated so the
- * Hub never confirms which connector ids exist.
+ * Hub-side Connector security. Durable identity comes from one credential
+ * authority; only random, single-use challenges live in this object.
  */
 export class FabricConnectorSecurity {
   readonly #audience: string;
@@ -181,11 +257,8 @@ export class FabricConnectorSecurity {
   readonly #now: () => number;
   readonly #challengeTtlMs: number;
   readonly #maxPendingChallenges: number;
-  readonly #maxConnectors: number;
-  readonly #credentialExpiresAt?: number;
-  readonly #credentials = new Map<string, FabricConnectorCredentialV1>();
+  readonly #authority: FabricConnectorCredentialAuthority;
   readonly #challenges = new Map<string, FabricChallengeV1>();
-  #sequence = 0;
 
   constructor(options: FabricConnectorSecurityOptions) {
     assertBoundedString(options.audience, "audience", 256);
@@ -194,41 +267,13 @@ export class FabricConnectorSecurity {
     this.#now = options.now ?? Date.now;
     this.#challengeTtlMs = positive(options.challengeTtlMs, 30_000, "challengeTtlMs");
     this.#maxPendingChallenges = positive(options.maxPendingChallenges, 64, "maxPendingChallenges");
-    this.#maxConnectors = positive(options.maxConnectors, 256, "maxConnectors");
-    this.#credentialExpiresAt = options.credentialExpiresAt;
-    if (this.#credentialExpiresAt !== undefined) assertEpochMilliseconds(this.#credentialExpiresAt, "credentialExpiresAt");
+    if (options.credentialExpiresAt !== undefined) assertEpochMilliseconds(options.credentialExpiresAt, "credentialExpiresAt");
+    this.#authority = options.credentialAuthority ?? new InMemoryFabricConnectorCredentialAuthority(options);
   }
 
-  /** Enroll a Connector from its out-of-band published key. */
+  /** Compatibility mutation seam, available only with the explicit in-memory authority. */
   enroll(input: FabricConnectorEnrollmentInput): FabricConnectorCredentialV1 {
-    assertFabricIdentifier(input.connectorId, "connectorId");
-    assertFabricIdentifier(input.keyId, "keyId");
-    decodeEd25519Key(input.publicKey, "publicKey");
-    if (!Array.isArray(input.scopes) || input.scopes.length === 0) {
-      throw new FabricContractError("invalid_argument", "scopes must name at least one Fabric grant", "scopes");
-    }
-    for (const [index, scope] of input.scopes.entries()) assertFabricScope(scope, `scopes[${index}]`);
-    if (this.#credentials.has(input.connectorId)) {
-      throw new FabricContractError("conflict", "Connector is already enrolled; rotate it instead", "connectorId");
-    }
-    if (this.#credentials.size >= this.#maxConnectors) {
-      throw new FabricContractError("resource_exhausted", "Connector enrollment capacity is full", "maxConnectors");
-    }
-    const credential: FabricConnectorCredentialV1 = {
-      version: FABRIC_CONNECTOR_CREDENTIAL_VERSION,
-      connectorId: input.connectorId,
-      keyId: input.keyId,
-      publicKey: input.publicKey,
-      audience: this.#audience,
-      scopes: [...input.scopes],
-      credentialGeneration: 1,
-      createdAt: this.#now(),
-      ...(this.#credentialExpiresAt === undefined ? {} : { expiresAt: this.#credentialExpiresAt }),
-      revoked: false,
-      revision: 0,
-    };
-    this.#credentials.set(credential.connectorId, credential);
-    return structuredClone(credential);
+    return this.#mutableAuthority().enroll(input);
   }
 
   /**
@@ -239,62 +284,21 @@ export class FabricConnectorSecurity {
    * again.
    */
   rotate(connectorId: string, input: FabricConnectorEnrollmentInput, expectedRevision: number): FabricConnectorCredentialV1 {
-    assertFabricIdentifier(connectorId, "connectorId");
-    assertRevision(expectedRevision, "expectedRevision");
-    const current = this.#credentials.get(connectorId);
-    if (current === undefined) {
-      throw new FabricContractError("unauthenticated", "Connector is not enrolled", "connectorId");
-    }
-    if (current.revision !== expectedRevision) {
-      throw new FabricContractError("conflict", "Connector credential revision is stale", "expectedRevision");
-    }
-    assertFabricIdentifier(input.keyId, "keyId");
-    decodeEd25519Key(input.publicKey, "publicKey");
-    if (!Array.isArray(input.scopes) || input.scopes.length === 0) {
-      throw new FabricContractError("invalid_argument", "scopes must name at least one Fabric grant", "scopes");
-    }
-    for (const [index, scope] of input.scopes.entries()) assertFabricScope(scope, `scopes[${index}]`);
-    const next: FabricConnectorCredentialV1 = {
-      ...current,
-      keyId: input.keyId,
-      publicKey: input.publicKey,
-      scopes: [...input.scopes],
-      credentialGeneration: current.credentialGeneration + 1,
-      createdAt: this.#now(),
-      revoked: false,
-      revision: current.revision + 1,
-    };
-    this.#credentials.set(connectorId, next);
-    // Any challenge minted under the predecessor generation is dead with it.
-    for (const [id, challenge] of this.#challenges) {
-      if (challenge.connectorId === connectorId) this.#challenges.delete(id);
-    }
-    return structuredClone(next);
+    const next = this.#mutableAuthority().rotate(connectorId, input, expectedRevision);
+    this.invalidateChallenges(connectorId);
+    return next;
   }
 
   /** Revoke a Connector and drop its outstanding challenges. */
   revoke(connectorId: string, expectedRevision: number): FabricConnectorCredentialV1 {
-    assertFabricIdentifier(connectorId, "connectorId");
-    assertRevision(expectedRevision, "expectedRevision");
-    const current = this.#credentials.get(connectorId);
-    if (current === undefined) {
-      throw new FabricContractError("unauthenticated", "Connector is not enrolled", "connectorId");
-    }
-    if (current.revision !== expectedRevision) {
-      throw new FabricContractError("conflict", "Connector credential revision is stale", "expectedRevision");
-    }
-    const next: FabricConnectorCredentialV1 = { ...current, revoked: true, revision: current.revision + 1 };
-    this.#credentials.set(connectorId, next);
-    for (const [id, challenge] of this.#challenges) {
-      if (challenge.connectorId === connectorId) this.#challenges.delete(id);
-    }
-    return structuredClone(next);
+    const next = this.#mutableAuthority().revoke(connectorId, expectedRevision);
+    this.invalidateChallenges(connectorId);
+    return next;
   }
 
   /** Public, secret-free view of one enrollment. */
   credentialOf(connectorId: string): FabricConnectorCredentialV1 | undefined {
-    const credential = this.#credentials.get(connectorId);
-    return credential === undefined ? undefined : structuredClone(credential);
+    return this.#authority.credentialOf(connectorId);
   }
 
   /** Public projection for inventory: identity and grants, never key material. */
@@ -318,12 +322,11 @@ export class FabricConnectorSecurity {
     if (this.#challenges.size >= this.#maxPendingChallenges) {
       throw new FabricContractError("resource_exhausted", "Fabric challenge capacity is full", "maxPendingChallenges");
     }
-    this.#sequence += 1;
     const challenge: FabricChallengeV1 = {
       version: FABRIC_CHALLENGE_VERSION,
-      challengeId: `challenge-${credential.connectorId}-${this.#sequence}`,
+      challengeId: `challenge:${randomUUID()}`,
       connectorId: credential.connectorId,
-      challengeNonce: `nonce-${this.#sequence}-${this.#now().toString(36)}`,
+      challengeNonce: randomBytes(32).toString("base64url"),
       audience: this.#audience,
       protocolVersion: this.#protocolVersion,
       issuedAt: now,
@@ -389,8 +392,14 @@ export class FabricConnectorSecurity {
     return this.#challenges.size;
   }
 
+  /** Post-commit lifecycle fence used by durable rotation/revocation wiring. */
+  invalidateChallenges(connectorId?: string): void {
+    if (connectorId === undefined) this.#challenges.clear();
+    else for (const [id, challenge] of this.#challenges) if (challenge.connectorId === connectorId) this.#challenges.delete(id);
+  }
+
   #liveCredential(connectorId: string): FabricConnectorCredentialV1 {
-    const credential = this.#credentials.get(connectorId);
+    const credential = this.#authority.credentialOf(connectorId);
     // Unknown, revoked, and expired are one answer on purpose: the Hub must not
     // confirm which connector ids exist or why one stopped being accepted.
     if (credential === undefined || credential.revoked) {
@@ -400,6 +409,14 @@ export class FabricConnectorSecurity {
       throw new FabricContractError("unauthenticated", "Connector credential has expired", "connectorId");
     }
     return credential;
+  }
+
+  #mutableAuthority(): FabricMutableConnectorCredentialAuthority {
+    const authority = this.#authority;
+    if (!isMutableCredentialAuthority(authority)) {
+      throw new FabricContractError("invalid_state", "Durable Connector credentials mutate through the registration authority", "credentialAuthority");
+    }
+    return authority;
   }
 
   #takeChallenge(proof: FabricChallengeProofV1): FabricChallengeV1 {

@@ -55,7 +55,12 @@ import {
   type TeammateTaskType,
 } from "../models/model-routing.ts";
 import type { TeammateModelCapability } from "../models/model-catalog.ts";
-import { deriveModelRuntimeDescriptor } from "../models/model-registry.ts";
+import {
+  deriveModelRuntimeDescriptor,
+  exactBackendCapabilities,
+  isFabricSourceLocalTransport,
+  type ModelRuntimeDescriptor,
+} from "../models/model-registry.ts";
 import {
   rankModelsByHealth,
   sharedModelCircuitBreaker,
@@ -345,9 +350,13 @@ function modelRegistrationBackendSpecOf(
     // backend selector exactly as before.
     backend: params.placement === undefined ? candidate.route.deploymentId : FABRIC_BACKEND,
     ...(params.context === undefined ? {} : { context: params.context }),
-    // Fixed and deployment-default routes are selected by registration alone.
-    // Only adapter-model owns a backend model selector value.
-    ...(selector.kind === "adapter-model" ? { model: selector.value } : {}),
+    // Fabric's wire namespace is always the canonical model registration id.
+    // Only a source Device may translate it to an adapter-owned selector.
+    ...(params.placement !== undefined
+      ? { model: candidate.modelRegistrationId }
+      : selector.kind === "adapter-model"
+        ? { model: selector.value }
+        : {}),
     ...(params.thinking === undefined ? {} : { thinking: params.thinking as TeammateRunSpec["thinking"] }),
     ...(params.outputSchema === undefined ? {} : { outputSchema: params.outputSchema }),
     ...(params.todos === undefined ? {} : { todos: params.todos }),
@@ -714,16 +723,22 @@ async function prepareBackendAttemptOnce(
   preflight?: ResolvedBackend,
 ): Promise<PreparedBackendAttempt> {
   const { backend, config, capabilities } = preflight ?? await registry.resolve(spec, requestedBackend);
+  const exactCapabilities = exactBackendCapabilities(capabilities);
+  if (exactCapabilities === undefined) {
+    throw new BackendCapabilityAdmissionError([
+      `Teammate backend ${JSON.stringify(backend.name)} must expose exactly the nine valid BackendCapabilities entries`,
+    ]);
+  }
   const errors = validateBackendCapabilities(
     [{ spec, ...(spec.name === undefined ? {} : { name: spec.name }) }],
-    () => ({ name: backend.name, capabilities }),
+    () => ({ name: backend.name, capabilities: exactCapabilities }),
   ).errors;
   if (errors.length > 0) throw new BackendCapabilityAdmissionError(errors);
   let started = false;
   return {
     backendName: backend.name,
     config,
-    capabilities,
+    capabilities: exactCapabilities,
     async start(startSpec, options) {
       if (started) throw new Error(`teammate backend ${JSON.stringify(backend.name)} attempt was already started`);
       started = true;
@@ -764,14 +779,12 @@ function sourceModelRegistrationPlan(
 
 function assertFabricSourceLocalDeployment(
   deploymentId: string,
-  transportKind: ReturnType<typeof deriveModelRuntimeDescriptor>["transport"]["kind"],
+  runtime: ModelRuntimeDescriptor,
 ): void {
-  if (transportKind === "remote-worker"
-    || transportKind === "acp-direct-ssh"
-    || transportKind === "dsh-direct-ssh") {
+  if (!isFabricSourceLocalTransport(runtime)) {
     throw new Error(
       `Fabric source runtime refuses non-local deployment ${JSON.stringify(deploymentId)} `
-      + `with transport ${JSON.stringify(transportKind)}`,
+      + `with transport ${JSON.stringify(runtime.transport.kind)}`,
     );
   }
 }
@@ -864,11 +877,17 @@ export async function startFabricSourceBackendAttempt(
   assertValidTeammatePlacement(input.placement);
   if (input.signal.aborted) throw new Error("Fabric source attempt was aborted before launch");
 
+  let acceptedModel = input.spec.model;
+  const canonicalResult = (result: SingleResult): SingleResult => acceptedModel === undefined
+    ? result
+    : { ...result, model: acceptedModel };
   const hostOptions: RunTeammateOptions = {
     baseCwd: cwd,
     signal: input.signal,
     ...(input.onChildEvent === undefined ? {} : { onChildEvent: input.onChildEvent }),
-    ...(input.onTurnComplete === undefined ? {} : { onTurnComplete: input.onTurnComplete }),
+    ...(input.onTurnComplete === undefined ? {} : {
+      onTurnComplete: (result, terminalStatus) => input.onTurnComplete!(canonicalResult(result), terminalStatus),
+    }),
   };
   const extrasOf = () => ({ hostOptions, cwd, replyTo: "caller" as const });
   let registry = runtimeOptions.backendRegistry;
@@ -888,10 +907,11 @@ export async function startFabricSourceBackendAttempt(
       }
       assertFabricSourceLocalDeployment(
         candidate.route.deploymentId,
-        candidate.deployment.runtime.transport.kind,
+        candidate.deployment.runtime,
       );
       requestedBackend = candidate.route.deploymentId;
       selectedModule = candidate.deployment.registration.module;
+      acceptedModel = candidate.modelRegistrationId;
       const selector = candidate.route.selector;
       localSpec = {
         ...localSpec,
@@ -906,7 +926,7 @@ export async function startFabricSourceBackendAttempt(
       if (selectedRegistration !== undefined) {
         assertFabricSourceLocalDeployment(
           requestedBackend,
-          deriveModelRuntimeDescriptor(requestedBackend, selectedRegistration).transport.kind,
+          deriveModelRuntimeDescriptor(requestedBackend, selectedRegistration),
         );
       }
       localSpec = { ...localSpec, backend: requestedBackend };
@@ -934,18 +954,21 @@ export async function startFabricSourceBackendAttempt(
     prepared.config,
   );
   const run = await prepared.start(localSpec, backendOptions);
+  const outcome = acceptedModel !== undefined && localSpec.model !== acceptedModel
+    ? run.outcome.then((settled) => ({ ...settled, result: canonicalResult(settled.result) }))
+    : run.outcome;
   const abortRun = (): void => { run.abort(); };
   input.signal.addEventListener("abort", abortRun, { once: true });
   if (input.signal.aborted) abortRun();
-  void run.outcome.then(
+  void outcome.then(
     () => input.signal.removeEventListener("abort", abortRun),
     () => input.signal.removeEventListener("abort", abortRun),
   );
   return {
     acceptedBackend: prepared.backendName,
-    ...(localSpec.model === undefined ? {} : { acceptedModel: localSpec.model }),
+    ...(acceptedModel === undefined ? {} : { acceptedModel }),
     acceptedCapabilities: prepared.capabilities,
-    outcome: run.outcome,
+    outcome,
     send: run.send.bind(run),
     abort: run.abort.bind(run),
   };

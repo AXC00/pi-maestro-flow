@@ -10,9 +10,15 @@ Fabric Core contains no secret IO, key storage, signing library, TLS implementat
 
 ## Pairing and rotation
 
-Pairing yields a Connector ID plus one rotatable credential. The Hub persists only a hash, audience, scopes, expiry, revoke state, and `credentialGeneration`. A proof binds Connector ID, fresh process nonce, challenge nonce, selected protocol, audience, and credential generation. Rotation commits the new hash and generation while revoking the predecessor in one store transaction. Old generations fail closed.
+Pairing yields a Connector ID plus one rotatable credential. Enrollment requires possession of a short-lived token with audience `fabric`, an exact purpose scope, and a Connector binding. The Hub atomically records a single-use consumption tombstone with Connector/Device registration; knowledge of the pairing ID is not authorization. A domain-separated token verifier may remain private for bounded lost-response receipt recovery, which can return only an existing receipt.
 
-Raw credentials, hashes, signing keys, route-ticket proofs, and credential references are excluded from public projections and safe events.
+For Ed25519 Connector credentials the private registry persists the canonical SPKI public key, its SHA-256 fingerprint, audience, operational scope, expiry/revoke state, and `credentialGeneration`. Private keys and raw tokens are never persisted there. A proof binds Connector ID, fresh process nonce, cryptographically random challenge nonce, selected protocol, audience, and credential generation. Rotation replaces the SPKI and increments the generation in one registry transaction. Old generations fail closed.
+
+Raw credentials, private keys, persisted public-key material and fingerprints, token verifiers, route-ticket proofs, and credential references are excluded from public projections and safe events.
+
+The Device CLI accepts enrollment and rotation tokens only on stdin. It derives fixed HTTPS registration and receipt routes plus the canonical WSS Connector route from a credential-free HTTPS origin, refuses redirects, and generates Ed25519 keys locally. The private key, pending-operation journal, and final Connector config are atomic private files; Windows installations apply and verify a protected owner-only ACL rather than relying on POSIX mode bits. An uncertain response leaves the old config active and the non-secret pending journal intact. Repeating the command with the same token performs receipt recovery only and never invents a second rotation.
+
+Shutdown fences registration HTTP and new WSS admission before channel draining begins. Durable Connector revocation and physical cleanup are reported separately: `revoked-cleanup-pending` is retryable, and an exact revoke retry repeats cleanup without advancing the durable revision.
 
 ## Route tickets
 

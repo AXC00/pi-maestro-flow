@@ -122,7 +122,11 @@ function harness(runtime: FakeRuntime, endpoint: AgentRuntimeEndpoint = structur
   });
   const principal = createGatewayPrincipal("http", "paired-source", { authenticated: true, scopes: ["fabric.data"] });
   let requestSequence = 0;
-  const dispatch = (operation: string, input: Record<string, JsonValue>) => dispatcher.dispatch({
+  const dispatch = (
+    operation: string,
+    input: Record<string, JsonValue>,
+    signal: AbortSignal = new AbortController().signal,
+  ) => dispatcher.dispatch({
     version: "fabric.endpoint-request.v1",
     requestId: `request-${++requestSequence}`,
     routeId: ROUTE.routeId,
@@ -132,12 +136,33 @@ function harness(runtime: FakeRuntime, endpoint: AgentRuntimeEndpoint = structur
     deadlineAt: START.placement.deadlineAt,
     operation,
     input,
-  }, principal, new AbortController().signal);
+  }, principal, signal);
   return { bridge, dispatch };
 }
 
 const asInput = (value: unknown): Record<string, JsonValue> => structuredClone(value) as Record<string, JsonValue>;
 const flush = (): Promise<void> => new Promise((resolve) => setImmediate(resolve));
+
+test("agent.start links relay cancellation through start settlement", async () => {
+  class PendingStartRuntime extends FakeRuntime {
+    override async startAttempt(request: FabricTeammateAttemptRequest): Promise<never> {
+      this.starts.push(request);
+      return new Promise<never>((_resolve, reject) => {
+        const cancelled = (): void => reject(new Error("source start observed cancellation"));
+        request.signal.addEventListener("abort", cancelled, { once: true });
+        if (request.signal.aborted) cancelled();
+      });
+    }
+  }
+  const runtime = new PendingStartRuntime();
+  const { dispatch } = harness(runtime);
+  const controller = new AbortController();
+  const starting = dispatch("agent.start", asInput(START), controller.signal);
+  while (runtime.starts.length === 0) await flush();
+  controller.abort(new Error("relay cancelled"));
+  await assert.rejects(() => starting, /cancelled/u);
+  assert.equal(runtime.starts[0]!.signal.aborted, true);
+});
 
 test("Agent Endpoint starts one source attempt, ACKs first, and keeps canonical publication at origin", async () => {
   const runtime = new FakeRuntime();

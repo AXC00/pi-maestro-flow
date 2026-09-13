@@ -2,9 +2,10 @@
 import { randomUUID } from "node:crypto";
 import { isAbsolute, join, resolve } from "node:path";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
+import { FabricStoreCoordinator } from "pi-maestro-fabric";
 import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import type { GatewayConfig } from "./config.ts";
-import { loadGatewayConfig } from "./config.ts";
+import { FABRIC_DEFAULT_AUDIENCE, loadGatewayConfig } from "./config.ts";
 import type { GatewayPrincipal, GatewayResult, GatewayToolName } from "./contracts.ts";
 import { GATEWAY_DEFAULT_LIMITS, GATEWAY_PROTOCOL_VERSION } from "./contracts.ts";
 import { GATEWAY_MONITOR_STREAM_FEATURE, type GatewayEventNotification } from "./event-contracts.ts";
@@ -32,11 +33,21 @@ import { FabricAgentEndpointBridge } from "./fabric/agent-endpoint.ts";
 import { McpEndpointBridge, type FabricMcpSourceRegistration } from "./fabric/mcp-endpoint.ts";
 import { GATEWAY_FABRIC_CONTROL_LIMITS, GatewayFabricControlSupport, type GatewayFabricControlRuntime } from "./fabric/control-support.ts";
 import { createGatewayFabricComposition, type GatewayFabricComposition } from "./fabric/composition.ts";
+import { GatewayFabricRegistrationAuthority } from "./fabric/registration.ts";
+import { GatewayFabricAdvertisementStore } from "./fabric/advertisement-store.ts";
+import {
+  FabricPairingAdapter,
+  FabricRegistrationLifecycleGate,
+  type FabricPostCommitResult,
+  type FabricRegistrationOperation,
+} from "./fabric/pairing-adapter.ts";
+import { FabricEnrollmentHttpServer } from "./fabric/enrollment-http.ts";
 import { GatewayFabricDeviceService } from "./fabric/device-service.ts";
 import { GatewayFabricWorkspaceService } from "./fabric/workspace-service.ts";
 import { GatewayFabricEndpointService } from "./fabric/endpoint-service.ts";
 import { GatewayFabricRouteService } from "./fabric/route-service.ts";
 import { GatewayFabricMonitorProjection } from "./fabric/monitor-projection.ts";
+import type { FabricOriginDataPlaneGrantAuthority } from "./fabric/origin-runtime.ts";
 import { ExecService } from "./services/exec-service.ts";
 import { FileService } from "./services/file-service.ts";
 import { HostService } from "./services/host-service.ts";
@@ -84,6 +95,8 @@ export interface GatewayRuntimeOptions {
   fabricEndpointRegistrations?: readonly FabricEndpointRegistration[];
   fabricEndpointDispatcher?: FabricEndpointDispatcher;
   fabricMonitorProjection?: GatewayFabricMonitorProjection;
+  /** Daemon-owned memory-only authority for owner-issued origin data-plane grants. */
+  fabricOriginDataPlaneGrants?: FabricOriginDataPlaneGrantAuthority;
   /** Explicitly enable auto-wiring of the native-TLS Fabric HTTP data plane. Default: false. */
   fabricHttpChannelEnabled?: boolean;
   fabricHttpChannelServer?: FabricHttpChannelServer;
@@ -135,6 +148,11 @@ export class GatewayRuntime {
   readonly operationReceipts: GatewayOperationReceiptStore;
   readonly fabricStore: GatewayFabricStore;
   readonly fabricEvents: GatewayFabricEventAdapter;
+  readonly fabricRegistration?: GatewayFabricRegistrationAuthority;
+  readonly fabricAdvertisements?: GatewayFabricAdvertisementStore;
+  readonly fabricRegistrationGate?: FabricRegistrationLifecycleGate;
+  readonly fabricPairingAdapter?: FabricPairingAdapter;
+  readonly fabricEnrollmentHttpServer?: FabricEnrollmentHttpServer;
   readonly fabricComposition?: GatewayFabricComposition;
   readonly fabricControlRuntime?: GatewayFabricControlRuntime;
   readonly fabricDevice: GatewayFabricDeviceService;
@@ -142,6 +160,7 @@ export class GatewayRuntime {
   readonly fabricEndpoint: GatewayFabricEndpointService;
   readonly fabricRoute: GatewayFabricRouteService;
   readonly fabricMonitor?: GatewayFabricMonitorProjection;
+  readonly fabricOriginDataPlaneGrants?: FabricOriginDataPlaneGrantAuthority;
   readonly fabricEndpointDispatcher?: FabricEndpointDispatcher;
   readonly fabricHttpChannelServer?: FabricHttpChannelServer;
   readonly fabricAgentEndpoint?: FabricAgentEndpointBridge;
@@ -164,6 +183,14 @@ export class GatewayRuntime {
   private activeRequests = 0;
   private readonly drainWaiters = new Set<() => void>();
   private warnedOpenMutation = false;
+  private fabricAdmission = false;
+  private fabricAdmissionGeneration = 0;
+  private fabricPostCommitFence?: (connectorId: string, operation: FabricRegistrationOperation) => FabricPostCommitResult | Promise<FabricPostCommitResult>;
+  private fabricRemoteRouteCloserGeneration = 0;
+  private fabricRemoteRouteCloser?: {
+    readonly generation: number;
+    readonly close: (routeId: string, reason: string) => void | Promise<void>;
+  };
 
   private constructor(config: GatewayConfig, options: GatewayRuntimeOptions) {
     this.config = config;
@@ -252,12 +279,44 @@ export class GatewayRuntime {
     if (this.fabricEvents.store !== this.fabricStore || this.fabricEvents.journal !== this.teammate.eventJournal) {
       throw new Error("Gateway Fabric event adapter must use the runtime Fabric store and event journal");
     }
+    const injectedFabricRuntime = options.fabricControlRuntime as (GatewayFabricControlRuntime & {
+      readonly coordinator?: FabricStoreCoordinator;
+      readonly registration?: GatewayFabricRegistrationAuthority;
+      readonly advertisements?: GatewayFabricAdvertisementStore;
+    }) | undefined;
+    if (config.fabric.enabled && injectedFabricRuntime !== undefined) {
+      if (
+        injectedFabricRuntime.coordinator === undefined || injectedFabricRuntime.registration === undefined ||
+        injectedFabricRuntime.advertisements === undefined || injectedFabricRuntime.assertAuthorityGraph === undefined
+      ) {
+        throw new Error("An injected enabled Fabric runtime must provide its explicit composition assertion plus registration, advertisement, and coordinator authorities");
+      }
+      injectedFabricRuntime.assertAuthorityGraph(injectedFabricRuntime, {
+        store: this.fabricStore,
+        audience: config.fabric.audience ?? FABRIC_DEFAULT_AUDIENCE,
+      });
+    }
     this.fabricComposition = options.fabricControlRuntime !== undefined || !config.fabric.enabled
       ? undefined
       : createGatewayFabricComposition(this.fabricStore, {
         limits: { ...GATEWAY_FABRIC_CONTROL_LIMITS, ...config.fabric.limits },
+        audience: config.fabric.audience ?? FABRIC_DEFAULT_AUDIENCE,
       });
     this.fabricControlRuntime = options.fabricControlRuntime ?? this.fabricComposition;
+    this.fabricRegistration = this.fabricComposition?.registration ?? (!config.fabric.enabled ? undefined : injectedFabricRuntime?.registration);
+    this.fabricAdvertisements = this.fabricComposition?.advertisements ?? (!config.fabric.enabled ? undefined : injectedFabricRuntime?.advertisements);
+    this.fabricRegistrationGate = this.fabricRegistration === undefined ? undefined : new FabricRegistrationLifecycleGate();
+    this.fabricPairingAdapter = this.fabricRegistration === undefined ? undefined : new FabricPairingAdapter({
+      pairings: this.pairingStore,
+      authority: this.fabricRegistration,
+      gate: this.fabricRegistrationGate,
+      afterCommit: (connectorId, operation) => this.afterFabricRegistrationCommit(connectorId, operation),
+    });
+    this.fabricEnrollmentHttpServer = this.fabricPairingAdapter === undefined || this.fabricRegistration === undefined ? undefined : new FabricEnrollmentHttpServer({
+      adapter: this.fabricPairingAdapter,
+      authority: this.fabricRegistration,
+      maximumBytes: Math.min(config.limits.maxRequestBytes, 64 * 1024),
+    });
     const fabricControl = new GatewayFabricControlSupport(this.fabricControlRuntime, this.policy, this.registry);
     this.fabricAgentEndpoint = options.fabricAgentEndpoint ?? (options.fabricAgentEndpointIds === undefined ? undefined : new FabricAgentEndpointBridge({
       support: fabricControl,
@@ -310,19 +369,38 @@ export class GatewayRuntime {
     }
     this.fabricHttpChannelServer = options.fabricHttpChannelServer ?? (!fabricHttpEnabled ? undefined : new FabricHttpChannelServer({
       dispatcher: this.fabricEndpointDispatcher!,
+      ...(options.fabricOriginDataPlaneGrants === undefined ? {} : {
+        authorizeOriginGrant: (principal, input) => options.fabricOriginDataPlaneGrants!.authorize(principal, input),
+      }),
       limits: {
         maxRequestBytes: config.limits.maxRequestBytes,
         maxResultBytes: config.limits.maxOutputBytes,
         maxPendingRequests: config.limits.maxConcurrentRequests,
       },
     }));
-    this.fabricDevice = new GatewayFabricDeviceService(fabricControl);
-    this.fabricWorkspace = new GatewayFabricWorkspaceService(fabricControl);
-    this.fabricEndpoint = new GatewayFabricEndpointService(fabricControl);
-    this.fabricRoute = new GatewayFabricRouteService(fabricControl, async (routeId, reason) => {
+    this.fabricOriginDataPlaneGrants = options.fabricOriginDataPlaneGrants;
+    const closeFabricRouteChannels = async (routeId: string, reason: string): Promise<void> => {
+      this.fabricOriginDataPlaneGrants?.fenceRoute(routeId);
       this.fabricAgentEndpoint?.closeRoute(routeId);
-      await this.fabricHttpChannelServer?.closeRoute(routeId, reason);
-    });
+      const remoteCloser = this.fabricRemoteRouteCloser;
+      const cleanups: Promise<void>[] = [];
+      if (this.fabricHttpChannelServer !== undefined) {
+        cleanups.push(Promise.resolve().then(() => this.fabricHttpChannelServer!.closeRoute(routeId, reason)));
+      }
+      if (remoteCloser !== undefined) {
+        cleanups.push(Promise.resolve().then(() => remoteCloser.close(routeId, reason)));
+      }
+      const results = await Promise.allSettled(cleanups);
+      const failures = results
+        .filter((result): result is PromiseRejectedResult => result.status === "rejected")
+        .map((result) => result.reason);
+      if (failures.length === 1) throw failures[0];
+      if (failures.length > 1) throw new AggregateError(failures, "Fabric route channel cleanup failed");
+    };
+    this.fabricDevice = new GatewayFabricDeviceService(fabricControl);
+    this.fabricWorkspace = new GatewayFabricWorkspaceService(fabricControl, closeFabricRouteChannels);
+    this.fabricEndpoint = new GatewayFabricEndpointService(fabricControl);
+    this.fabricRoute = new GatewayFabricRouteService(fabricControl, closeFabricRouteChannels);
     this.eventStream = new GatewayEventStream(this.teammate.eventJournal, { observer: this.observer });
     this.fabricMonitor = options.fabricMonitorProjection ?? (this.fabricControlRuntime === undefined ? undefined : new GatewayFabricMonitorProjection({
       directory: this.fabricControlRuntime.directory,
@@ -413,8 +491,18 @@ export class GatewayRuntime {
 
   static async create(options: GatewayRuntimeOptions = {}): Promise<GatewayRuntime> {
     const config = options.config ?? await loadGatewayConfig(options.configPath);
-    const runtime = new GatewayRuntime(config, options);
+    const fabricStore = await selectGatewayFabricStore(config, options);
+    const runtime = new GatewayRuntime(config, { ...options, fabricStore });
+    await runtime.fabricRegistration?.validate();
+    await runtime.fabricAdvertisements?.validate();
     await recoverGatewayFabric({ store: runtime.fabricStore, eventAdapter: runtime.fabricEvents });
+    if (runtime.fabricRegistration !== undefined && runtime.fabricControlRuntime !== undefined) {
+      await runtime.fabricRegistration.hydrate(runtime.fabricControlRuntime.directory);
+      if (runtime.fabricAdvertisements === undefined) throw new Error("Fabric runtime is missing its durable advertisement authority");
+      await runtime.fabricAdvertisements.hydrate(runtime.fabricControlRuntime.directory);
+      runtime.fabricAdmissionGeneration += 1;
+      runtime.fabricAdmission = true;
+    }
     await runtime.operationReceipts.recoverInterrupted();
     return runtime;
   }
@@ -552,11 +640,62 @@ export class GatewayRuntime {
   get isQuiescing(): boolean { return this.phase === "quiescing"; }
   get canAcceptNewSessions(): boolean { return this.phase === "running"; }
   get inFlightRequestCount(): number { return this.activeRequests; }
+  get fabricAdmissionReady(): boolean { return this.fabricAdmission; }
+
+  /** Daemon-only live fence installed before enrollment routes become reachable. */
+  setFabricPostCommitFence(fence: (connectorId: string, operation: FabricRegistrationOperation) => FabricPostCommitResult | Promise<FabricPostCommitResult>): void {
+    this.fabricPostCommitFence = fence;
+  }
+
+  /** Install one generation-owned remote Route cleanup path. */
+  installFabricRemoteRouteCloser(
+    close: (routeId: string, reason: string) => void | Promise<void>,
+  ): () => void {
+    const generation = ++this.fabricRemoteRouteCloserGeneration;
+    this.fabricRemoteRouteCloser = { generation, close };
+    return () => {
+      if (this.fabricRemoteRouteCloser?.generation !== generation) return;
+      this.fabricRemoteRouteCloser = undefined;
+      this.fabricRemoteRouteCloserGeneration += 1;
+    };
+  }
+
+  /** Immediate synchronous admission/publication fence used at shutdown entry. */
+  fenceFabricAdmission(): void {
+    this.fabricAdmissionGeneration += 1;
+    this.fabricAdmission = false;
+    this.fabricOriginDataPlaneGrants?.fence();
+    this.fabricControlRuntime?.connections.fenceAdvertisementAdmission("Gateway Fabric admission was fenced");
+  }
+
+  /** Rebuilds projection solely from durable registration state. */
+  async reconcileFabricRegistration(): Promise<void> {
+    if (this.fabricRegistration === undefined || this.fabricControlRuntime === undefined) return;
+    const generation = ++this.fabricAdmissionGeneration;
+    this.fabricAdmission = false;
+    await this.#hydrateFabricRegistration(generation);
+  }
+
+  private async afterFabricRegistrationCommit(connectorId: string, operation: FabricRegistrationOperation): Promise<FabricPostCommitResult> {
+    const generation = ++this.fabricAdmissionGeneration;
+    this.fabricAdmission = false;
+    const cleanup = await this.fabricPostCommitFence?.(connectorId, operation) ?? { cleanupComplete: true };
+    await this.#hydrateFabricRegistration(generation);
+    return cleanup;
+  }
+
+  async #hydrateFabricRegistration(generation: number): Promise<void> {
+    if (this.fabricRegistration === undefined || this.fabricControlRuntime === undefined) return;
+    if (generation !== this.fabricAdmissionGeneration || this.phase !== "running") return;
+    await this.fabricRegistration.hydrate(this.fabricControlRuntime.directory);
+    if (generation === this.fabricAdmissionGeneration && this.phase === "running") this.fabricAdmission = true;
+  }
 
   /** Fence new work immediately, then wait only until the caller's absolute deadline. */
   async beginQuiesce(deadlineAt: number): Promise<boolean> {
     if (this.phase === "closed") return true;
     this.phase = "quiescing";
+    this.fenceFabricAdmission();
     this.observer.observe({ category: "lifecycle", event: "quiesce", outcome: "started" });
     if (this.activeRequests === 0) {
       this.observer.observe({ category: "lifecycle", event: "drain", outcome: "completed" });
@@ -584,8 +723,12 @@ export class GatewayRuntime {
   }
 
   async close(): Promise<void> {
+    // Independent idempotent security fence: callers need not quiesce first.
+    this.fenceFabricAdmission();
     if (this.phase === "closed") return;
     this.phase = "closed";
+    this.fabricRemoteRouteCloser = undefined;
+    this.fabricRemoteRouteCloserGeneration += 1;
     for (const resolve of this.drainWaiters) resolve();
     this.drainWaiters.clear();
     await Promise.allSettled([
@@ -596,6 +739,47 @@ export class GatewayRuntime {
       this.fabricMcpEndpoint?.close(),
     ]);
   }
+}
+
+function fabricDocumentHasState(document: Awaited<ReturnType<GatewayFabricStore["load"]>>): boolean {
+  if (document.revision > 0 || document.outbox.length > 0 || document.transactions.length > 0) return true;
+  return Object.values(document.stores).some((store) =>
+    store.revision > 0 || store.highWaterMark > 0 || store.events.length > 0 ||
+    store.cursors.length > 0 || Object.keys(store.records).length > 0,
+  );
+}
+
+async function selectGatewayFabricStore(config: GatewayConfig, options: GatewayRuntimeOptions): Promise<GatewayFabricStore> {
+  if (options.fabricStore !== undefined) {
+    if (config.fabric.enrollmentPath !== undefined) {
+      throw new Error("fabric.enrollmentPath cannot be combined with an injected Fabric store");
+    }
+    await options.fabricStore.load();
+    return options.fabricStore;
+  }
+  const cwd = options.cwd ?? process.cwd();
+  const defaultPath = config.state.rootDir === undefined
+    ? gatewayFabricStorePath()
+    : resolve(cwd, config.state.rootDir, "fabric", "state.json");
+  const configuredPath = config.fabric.enrollmentPath === undefined
+    ? undefined
+    : resolve(cwd, config.fabric.enrollmentPath);
+  const targetPath = configuredPath ?? defaultPath;
+  const target = new GatewayFabricStore({ path: targetPath });
+  const targetDocument = await target.load();
+  if (configuredPath === undefined || resolve(configuredPath) === resolve(defaultPath)) return target;
+
+  const defaultStore = new GatewayFabricStore({ path: defaultPath });
+  const defaultDocument = await defaultStore.load();
+  const defaultHasState = fabricDocumentHasState(defaultDocument);
+  const targetHasState = fabricDocumentHasState(targetDocument);
+  if (defaultHasState && !targetHasState) {
+    throw new Error("fabric.enrollmentPath is empty while the default Fabric authority contains state; move or copy the complete document offline before startup");
+  }
+  if (defaultHasState && targetHasState && JSON.stringify(defaultDocument) !== JSON.stringify(targetDocument)) {
+    throw new Error("fabric.enrollmentPath and the default Fabric authority contain divergent non-empty state");
+  }
+  return target;
 }
 
 export const createGatewayRuntime = (options?: GatewayRuntimeOptions): Promise<GatewayRuntime> => GatewayRuntime.create(options);

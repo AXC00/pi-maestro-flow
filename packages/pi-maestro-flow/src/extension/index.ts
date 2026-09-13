@@ -164,7 +164,13 @@ import {
 import { SessionOverlay, type SessionOverlayAction } from "../tui/session-overlay.ts";
 import { GatewayOverlay } from "../tui/gateway-overlay.ts";
 import { GATEWAY_FABRIC_MONITOR_EVENT } from "../gateway/fabric/monitor-projection.ts";
-import { startWorkspaceLease, stopWorkspaceLease, registerGatewayWorkspacePermanent, removeGatewayWorkspaceByPath, isGatewayConfigured } from "../gateway/workspace-client.ts";
+import { GatewayControlClient } from "../gateway/control-client.ts";
+import {
+  FabricOriginRouteResolverProvider,
+  type GenerationTrackedFabricRouteResolverProvider,
+} from "../gateway/fabric/origin-runtime.ts";
+import { registerFabricRouteResolverProvider } from "pi-maestro-teammate/v1/fabric-runtime";
+import { startWorkspaceLease, stopWorkspaceLease, registerGatewayWorkspacePermanent, removeGatewayWorkspaceByPath, isGatewayConfigured, isGatewayFabricEnabled } from "../gateway/workspace-client.ts";
 import { TodoOverlay } from "../tui/todo-overlay.ts";
 import { GoalOverlay, type GoalOverlayAction } from "../tui/goal-overlay.ts";
 import { KnowledgeOverlay, type KnowledgeOverlayAction } from "../tui/knowledge-overlay.ts";
@@ -1405,6 +1411,7 @@ export default function registerMaestroExtension(pi: ExtensionAPI): void {
   let childTodoMutationQueue: Promise<void> = Promise.resolve();
   let teammateRegistrationGeneration = 0;
   let teammateRegistrationDisposers: Array<() => void> = [];
+  let disposeFabricOriginProvider: (() => void) | undefined;
   const childTodoBroker = (request: Parameters<Parameters<typeof registerTeammateChildToolBroker>[1]>[0]) => {
     const execute = async (): Promise<FlowToolResult> => {
       const ctx = todoRootContext;
@@ -3380,6 +3387,8 @@ When NOT to use:
     maestroUiSessionActive = true;
     artifactKnowledgeSessionId = undefined;
     artifactKnowledgeCandidateCount = 0;
+    disposeFabricOriginProvider?.();
+    disposeFabricOriginProvider = undefined;
     await disposeTeammateSessionRegistrations();
     state.baseCwd = ctx.cwd;
     // K9: inject the host session identity into the process environment so all
@@ -3454,6 +3463,20 @@ When NOT to use:
     updateTodoWidget();
     publishMaestroUi();
     await activateTeammateSessionRegistrations(ctx);
+    // Registration is process-local and lazy: no owner IPC or bearer grant is
+    // acquired until a dispatch carries an explicit Fabric placement.
+    if (isGatewayFabricEnabled()) {
+      const control = new GatewayControlClient({ cwd: ctx.cwd });
+      const registerGenerationTrackedProvider = registerFabricRouteResolverProvider as unknown as (
+        provider: GenerationTrackedFabricRouteResolverProvider,
+        options: { readonly ownerId: string },
+      ) => { dispose(): void };
+      const registration = registerGenerationTrackedProvider(
+        new FabricOriginRouteResolverProvider({ control }),
+        { ownerId: `flow-${process.pid}-${teammateRegistrationGeneration}` },
+      );
+      disposeFabricOriginProvider = registration.dispose;
+    }
     if (guiEnabled()) {
       const guiSessionId =
         (ctx.sessionManager as { getSessionId?: () => string }).getSessionId?.() ?? "unknown";
@@ -3520,6 +3543,10 @@ When NOT to use:
     // hides it from new dispatches; dispatch pins keep admitted publications on
     // this exact generation until teammate shutdown drains them.
     midTurnAutoCompaction.onSessionShutdown(ctx);
+    // Fence provider discovery before any awaited shutdown work. Backend-held
+    // leases retain their exact grant object until their own cleanup releases it.
+    disposeFabricOriginProvider?.();
+    disposeFabricOriginProvider = undefined;
     preserveCompletedTurnFromNativeThreshold = false;
     lastCompactionCancel = undefined;
     newContextController.onSessionShutdown();

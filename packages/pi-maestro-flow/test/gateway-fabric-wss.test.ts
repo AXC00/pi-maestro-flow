@@ -5,9 +5,23 @@ import { createServer as createHttpsServer, type Server as HttpsServer } from "n
 import { join } from "node:path";
 import { generateKeyPairSync, sign as signPayload, type KeyObject } from "node:crypto";
 import WebSocket from "ws";
-import { FABRIC_PROTOCOL_VERSION } from "pi-maestro-fabric-core/v1";
+import {
+  FABRIC_HUB_RELAY_VERSION,
+  FABRIC_PROTOCOL_VERSION,
+  FabricContractError,
+  type AgentRuntimeEndpoint,
+  type FabricEnvelopeV1,
+  type EndpointRouteHandle,
+} from "pi-maestro-fabric-core/v1";
 import { FabricConnectorSecurity, fabricChallengeProofPayload } from "../src/gateway/fabric/security.ts";
 import { FabricConnectorRuntime } from "../src/gateway/fabric/connector-runtime.ts";
+import { FabricEndpointDispatcher, FABRIC_ENDPOINT_REQUEST_VERSION } from "../src/gateway/fabric/endpoint-dispatcher.ts";
+import {
+  FabricHubRelay,
+  type FabricHubRelayWssPort,
+  type FabricRelaySocketTransport,
+} from "../src/gateway/fabric/hub-relay.ts";
+import { createLocalGatewayPrincipal } from "../src/gateway/principal.ts";
 import {
   FABRIC_WSS_PATH,
   FabricWssServer,
@@ -33,7 +47,7 @@ async function harness(
   limits: { heartbeatIntervalMs: number; heartbeatTimeoutMs: number; maxFrameBytes?: number; maxInFlightOperations?: number },
   authority?: FabricWssAuthority,
   onSessionClosed?: () => void | Promise<void>,
-  callbacks: Pick<FabricWssServerOptions, "onReady" | "onAdvertisement"> = {},
+  callbacks: Pick<FabricWssServerOptions, "onReady" | "onAdvertisement" | "relay"> = {},
 ): Promise<Harness> {
   const ca = await readFile(certificatePath);
   const key = await readFile(keyPath);
@@ -138,6 +152,7 @@ async function admit(
     maxAdvertisementItems: 1_024,
     maxResultBytes: 1024 * 1024,
   },
+  relayVersions?: readonly string[],
 ): Promise<number> {
   client.send(envelope("client_hello", {
     connectorId: CONNECTOR,
@@ -145,6 +160,7 @@ async function admit(
     instanceNonce,
     credentialGeneration: 1,
     supportedVersions: [FABRIC_PROTOCOL_VERSION],
+    ...(relayVersions === undefined ? {} : { relayVersions }),
     capabilityDigest: "d",
     limits: clientLimits,
   }));
@@ -217,9 +233,11 @@ test("a real TLS WSS Connector completes enrollment proof, advertises, and reach
   }
 });
 
-test("authority allocation and serialized acceptance gate ready and heartbeat ACKs", async () => {
+test("authority allocation and serialized persistence gate ready, delta acceptance, and heartbeat ACKs", async () => {
   let releaseSnapshot!: () => void;
   const snapshotGate = new Promise<void>((resolve) => { releaseSnapshot = resolve; });
+  let releaseDelta!: () => void;
+  const deltaGate = new Promise<void>((resolve) => { releaseDelta = resolve; });
   let releaseHeartbeat!: () => void;
   const heartbeatGate = new Promise<void>((resolve) => { releaseHeartbeat = resolve; });
   const calls: string[] = [];
@@ -236,7 +254,7 @@ test("authority allocation and serialized acceptance gate ready and heartbeat AC
       calls.push(`snapshot:${String(payload.advertisementRevision)}`);
       await snapshotGate;
     },
-    acceptDelta: async () => { calls.push("delta"); },
+    acceptDelta: async () => { calls.push("delta"); await deltaGate; },
     heartbeat: async (_session, input) => {
       calls.push(`heartbeat:${input.sequence}`);
       await heartbeatGate;
@@ -275,6 +293,14 @@ test("authority allocation and serialized acceptance gate ready and heartbeat AC
       "number",
     );
 
+    client.send(envelope("advertise_delta", {
+      baseRevision: 1, advertisementRevision: 2, capabilityDigest: "d",
+    }));
+    await waitUntil(() => calls.includes("delta"));
+    assert.equal(harnessed.hub.sessionOf(CONNECTOR)?.advertisementRevision, 1, "delta was acknowledged before authority resolution");
+    releaseDelta();
+    await waitUntil(() => harnessed.hub.sessionOf(CONNECTOR)?.advertisementRevision === 2);
+
     client.send(envelope("heartbeat", { sequence: 1, observedAt: Date.now() }, {
       connectionId: "manager-connection-7", connectionGeneration: 7,
     }));
@@ -285,7 +311,33 @@ test("authority allocation and serialized acceptance gate ready and heartbeat AC
     client.socket.close();
     await client.closed;
     await waitUntil(() => calls.includes("close:manager-connection-7:7"));
-    assert.deepEqual(calls.slice(0, 3), ["admit:connector-1:d", "snapshot:1", "heartbeat:1"]);
+    assert.deepEqual(calls.slice(0, 4), ["admit:connector-1:d", "snapshot:1", "delta", "heartbeat:1"]);
+  } finally {
+    await harnessed.close();
+  }
+});
+
+test("snapshot persistence failure closes the admitted owner and never emits ready", async () => {
+  const closes: string[] = [];
+  const harnessed = await harness({ heartbeatIntervalMs: 1_000, heartbeatTimeoutMs: 5_000 }, authorityStub({
+    acceptSnapshot: async () => { throw new Error("durable advertisement commit failed"); },
+    close: async (_session, reason) => { closes.push(reason); },
+  }));
+  try {
+    const identity = connectorIdentity();
+    harnessed.security.enroll({ connectorId: CONNECTOR, keyId: "k-1", publicKey: identity.publicKey, scopes: ["fabric.data.*"] });
+    const client = rawClient(harnessed.url, harnessed.ca);
+    await new Promise<void>((resolve) => client.socket.on("open", () => resolve()));
+    await admit(client, identity, "failed-persistence");
+    client.send(envelope("advertise_snapshot", {
+      advertisementRevision: 1, capabilityDigest: "d", devices: [], workspaces: [], endpoints: [], capabilities: [],
+    }));
+    const failure = await client.waitFor("error");
+    assert.equal((failure.payload as Record<string, unknown>).code, "unavailable");
+    assert.equal(client.received.some((entry) => entry.kind === "ready"), false);
+    await client.closed;
+    await waitUntil(() => closes.length === 1);
+    assert.equal(harnessed.hub.sessionOf(CONNECTOR), undefined);
   } finally {
     await harnessed.close();
   }
@@ -668,13 +720,14 @@ test("Connector negotiated-frame send failures are contained and reconnect to a 
   }
 });
 
-test("WSS authority cleanup watchdog retries after a never-settling close and completes once", async () => {
+test("WSS retirement reports pending cleanup and exact retry completes it", async () => {
   const never = new Promise<void>(() => undefined);
   let closeAttempts = 0;
+  let cleanupAvailable = false;
   const harnessed = await harness({ heartbeatIntervalMs: 1_000, heartbeatTimeoutMs: 5_000 }, authorityStub({
     close: async () => {
       closeAttempts += 1;
-      if (closeAttempts === 1) await never;
+      if (!cleanupAvailable) await never;
     },
   }));
   try {
@@ -685,11 +738,14 @@ test("WSS authority cleanup watchdog retries after a never-settling close and co
     await admit(client, identity, "retry-close");
     client.send(envelope("advertise_snapshot", { advertisementRevision: 1, capabilityDigest: "d" }));
     await client.waitFor("ready");
-    client.socket.close();
+    assert.equal(await harnessed.hub.retireConnector(CONNECTOR, "operator revoke"), false);
     await client.closed;
-    await waitUntil(() => closeAttempts === 2);
+    assert.equal(closeAttempts >= 1, true);
+    cleanupAvailable = true;
+    assert.equal(await harnessed.hub.retireConnector(CONNECTOR, "operator revoke retry"), true);
+    const completedAttempts = closeAttempts;
     await new Promise((resolve) => setTimeout(resolve, 150));
-    assert.equal(closeAttempts, 2);
+    assert.equal(closeAttempts, completedAttempts);
   } finally {
     await harnessed.close();
   }
@@ -865,6 +921,26 @@ test("async WSS continuations cannot publish readiness after socket retirement",
   }
 });
 
+test("post-commit retirement targets the exact owned Connector session", async () => {
+  const harnessed = await harness({ heartbeatIntervalMs: 1_000, heartbeatTimeoutMs: 5_000 });
+  try {
+    const identity = connectorIdentity();
+    harnessed.security.enroll({ connectorId: CONNECTOR, keyId: "k-1", publicKey: identity.publicKey, scopes: ["fabric.data.*"] });
+    const client = rawClient(harnessed.url, harnessed.ca);
+    await new Promise<void>((resolve) => client.socket.on("open", () => resolve()));
+    await admit(client, identity, "operator-retire");
+    client.send(envelope("advertise_snapshot", { advertisementRevision: 1, capabilityDigest: "d" }));
+    await client.waitFor("ready");
+
+    await harnessed.hub.retireConnector(CONNECTOR, "credential rotation committed");
+    await client.closed;
+    assert.equal(harnessed.hub.sessionOf(CONNECTOR), undefined);
+    await harnessed.hub.retireConnector("connector-not-live");
+  } finally {
+    await harnessed.close();
+  }
+});
+
 test("multibyte Hub and Connector close reasons are UTF-8 bounded", async () => {
   const harnessed = await harness({ heartbeatIntervalMs: 1_000, heartbeatTimeoutMs: 5_000 });
   const identity = connectorIdentity();
@@ -880,6 +956,138 @@ test("multibyte Hub and Connector close reasons are UTF-8 bounded", async () => 
   assert.equal(runtime.state, "closed");
   await harnessed.hub.close("😀".repeat(100));
   await new Promise<void>((resolve) => harnessed.listener.close(() => resolve()));
+});
+
+test("WSS Route cleanup exposes and awaits the correlated Hub relay closer", async () => {
+  let release!: () => void;
+  let observed: string | undefined;
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  const relay: FabricHubRelayWssPort = {
+    version: FABRIC_HUB_RELAY_VERSION,
+    hubRuntimeEpoch: "hub-route-cleanup",
+    accepted: () => undefined,
+    ready: () => undefined,
+    advertisement: () => undefined,
+    accept: () => undefined,
+    closeRoute: async (routeId, reason) => {
+      observed = `${routeId}:${reason}`;
+      await gate;
+    },
+    retire: () => undefined,
+  };
+  const harnessed = await harness(
+    { heartbeatIntervalMs: 1_000, heartbeatTimeoutMs: 5_000 },
+    undefined,
+    undefined,
+    { relay },
+  );
+  try {
+    let settled = false;
+    const cleanup = harnessed.hub.closeRoute("route-cleanup-1", "durably closed").then(() => { settled = true; });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    assert.equal(observed, "route-cleanup-1:durably closed");
+    assert.equal(settled, false);
+    release();
+    await cleanup;
+  } finally {
+    await harnessed.close();
+  }
+});
+
+test("Hub shutdown fences the relay synchronously before waiting for peer drain", async () => {
+  let retired = false;
+  const relay: FabricHubRelayWssPort = {
+    version: FABRIC_HUB_RELAY_VERSION,
+    hubRuntimeEpoch: "hub-shutdown-fence",
+    accepted: () => undefined,
+    ready: () => undefined,
+    advertisement: () => undefined,
+    accept: () => undefined,
+    closeRoute: async () => undefined,
+    retire: () => { retired = true; },
+  };
+  const harnessed = await harness(
+    { heartbeatIntervalMs: 1_000, heartbeatTimeoutMs: 5_000 },
+    undefined,
+    undefined,
+    { relay },
+  );
+  const identity = connectorIdentity();
+  harnessed.security.enroll({ connectorId: CONNECTOR, keyId: "k-1", publicKey: identity.publicKey, scopes: ["fabric.data.*"] });
+  const client = rawClient(harnessed.url, harnessed.ca);
+  await new Promise<void>((resolve) => client.socket.on("open", () => resolve()));
+  await admit(client, identity, "shutdown-fence", undefined, [FABRIC_HUB_RELAY_VERSION]);
+  client.send(envelope("advertise_snapshot", { advertisementRevision: 1, capabilityDigest: "d", endpoints: [] }));
+  await client.waitFor("ready");
+  const closing = harnessed.hub.close("shutdown fence test");
+  assert.equal(retired, true, "shutdown waited before retiring executable relay ownership");
+  await closing;
+  await new Promise<void>((resolve) => harnessed.listener.close(() => resolve()));
+});
+
+test("negotiated capacity one retains two independent control-write reserve slots", async () => {
+  let transport: FabricRelaySocketTransport | undefined;
+  let finishWrites!: (error?: Error) => void;
+  const writes = new Promise<void>((resolve, reject) => {
+    finishWrites = (error) => error === undefined ? resolve() : reject(error);
+  });
+  const relay: FabricHubRelayWssPort = {
+    version: FABRIC_HUB_RELAY_VERSION,
+    hubRuntimeEpoch: "hub-control-reserve",
+    accepted: (_session, acceptedTransport) => { transport = acceptedTransport; },
+    closeRoute: async () => undefined,
+    ready: () => {
+      queueMicrotask(() => {
+        try {
+          if (transport === undefined) throw new Error("relay transport was not accepted");
+          const frame = (messageId: string, kind: "stream" | "heartbeat_ack"): FabricEnvelopeV1 => ({
+            version: FABRIC_PROTOCOL_VERSION,
+            messageId,
+            kind,
+            sentAt: Date.now(),
+            payload: {},
+          });
+          transport.send(frame("reserve-operation", "stream"), "operation");
+          transport.send(frame("reserve-control-1", "heartbeat_ack"), "control");
+          transport.send(frame("reserve-control-2", "heartbeat_ack"), "control");
+          finishWrites();
+        } catch (error) {
+          finishWrites(error instanceof Error ? error : new Error(String(error)));
+        }
+      });
+    },
+    advertisement: () => undefined,
+    accept: () => undefined,
+    retire: () => undefined,
+  };
+  const harnessed = await harness(
+    { heartbeatIntervalMs: 1_000, heartbeatTimeoutMs: 5_000, maxInFlightOperations: 1 },
+    undefined,
+    undefined,
+    { relay },
+  );
+  try {
+    const identity = connectorIdentity();
+    harnessed.security.enroll({ connectorId: CONNECTOR, keyId: "k-1", publicKey: identity.publicKey, scopes: ["fabric.data.*"] });
+    const client = rawClient(harnessed.url, harnessed.ca);
+    await new Promise<void>((resolve) => client.socket.on("open", () => resolve()));
+    await admit(client, identity, "control-reserve", {
+      maxFrameBytes: 4_096,
+      maxInFlightOperations: 1,
+      heartbeatIntervalMs: 1_000,
+      heartbeatTimeoutMs: 5_000,
+      maxAdvertisementItems: 10,
+      maxResultBytes: 4_096,
+    }, [FABRIC_HUB_RELAY_VERSION]);
+    client.send(envelope("advertise_snapshot", { advertisementRevision: 1, capabilityDigest: "d", endpoints: [] }));
+    await client.waitFor("ready");
+    await writes;
+    assert.equal(harnessed.hub.sessionOf(CONNECTOR)?.state, "ready");
+    client.socket.close();
+    await client.closed;
+  } finally {
+    await harnessed.close();
+  }
 });
 
 test("Hub shutdown is bounded when authority close and callbacks never settle", async () => {
@@ -916,4 +1124,150 @@ test("Hub shutdown is bounded even when a peer never closes", async () => {
   await harnessed.hub.close("test shutdown");
   assert.ok(Date.now() - started < 3_000, "Hub shutdown waited on a peer that never closed");
   await new Promise<void>((resolve) => harnessed.listener.close(() => resolve()));
+});
+
+test("negotiated WSS relay keeps heartbeats and cancellation responsive during a blocked Agent handler", async () => {
+  const identity = connectorIdentity();
+  const endpoint: AgentRuntimeEndpoint = {
+    kind: "agent", endpointId: "agent-wss-1", deviceId: "device-1", connectorId: CONNECTOR,
+    scope: { kind: "workspace", workspaceId: "workspace-1" }, generation: 1,
+    contractHash: "agent-wss-contract", status: "online", revision: 1,
+    roles: ["general"], taskTypes: ["development"], models: ["test/model"], maxConcurrency: 1,
+  };
+  const route: EndpointRouteHandle = {
+    routeId: "route-wss-1", connectionId: "manager-connection-1", workspaceBindingId: "binding-wss-1",
+    endpointId: endpoint.endpointId, deviceId: endpoint.deviceId, connectionGeneration: 1,
+    workspaceGeneration: 1, endpointGeneration: 1, issuedAt: Date.now() - 10,
+    expiresAt: Date.now() + 30_000, state: "open", revision: 1,
+  };
+  const dispatcher = new FabricEndpointDispatcher({
+    routes: { validateRoute: (id) => {
+      if (id !== route.routeId) throw new FabricContractError("not_found", "route not found");
+      return { ...route };
+    } },
+    endpoints: { getEndpoint: (id) => id === endpoint.endpointId ? structuredClone(endpoint) : undefined },
+  });
+  const relay = new FabricHubRelay({
+    dispatcher,
+    hubRuntimeEpoch: "hub-wss-epoch",
+    originSubjectOf: () => "origin-wss-1",
+  });
+  let heartbeatCount = 0;
+  const harnessed = await harness(
+    { heartbeatIntervalMs: 20, heartbeatTimeoutMs: 500 },
+    authorityStub({ heartbeat: async () => { heartbeatCount += 1; } }),
+    undefined,
+    { relay },
+  );
+  try {
+    harnessed.security.enroll({ connectorId: CONNECTOR, keyId: "k-1", publicKey: identity.publicKey, scopes: ["fabric.data.*"] });
+    let entered!: () => void;
+    const started = new Promise<void>((resolve) => { entered = resolve; });
+    let cancelled = false;
+    const runtime = new FabricConnectorRuntime({
+      url: harnessed.url,
+      connectorId: CONNECTOR,
+      keyId: "k-1",
+      audience: AUDIENCE,
+      credentialGeneration: 1,
+      ca: harnessed.ca,
+      limits: { heartbeatIntervalMs: 20, heartbeatTimeoutMs: 500 },
+      sign: (payload) => signPayload(null, Buffer.from(payload, "utf8"), identity.privateKey).toString("base64"),
+      advertisementOf: () => ({
+        advertisementRevision: 1,
+        capabilityDigest: "relay-digest",
+        payload: { endpoints: [endpoint] },
+      }),
+      relayHandler: { handle: async ({ signal }) => {
+        entered();
+        await new Promise<void>((resolve) => signal.addEventListener("abort", () => {
+          cancelled = true;
+          resolve();
+        }, { once: true }));
+        return { late: true };
+      } },
+    });
+    await runtime.start();
+    const controller = new AbortController();
+    const operation = dispatcher.dispatch({
+      version: FABRIC_ENDPOINT_REQUEST_VERSION,
+      requestId: "wss-blocked-operation",
+      routeId: route.routeId,
+      endpointId: endpoint.endpointId,
+      endpointKind: "agent",
+      endpointGeneration: endpoint.generation,
+      deadlineAt: Date.now() + 10_000,
+      operation: "agent.events",
+      input: { version: "fabric.agent-attempt.v1", attemptId: "attempt-1", placementId: "placement-1" },
+    }, createLocalGatewayPrincipal("wss-relay-test", { authenticated: true, scopes: ["fabric.data"] }), controller.signal);
+    await started;
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    assert(heartbeatCount >= 2, `expected heartbeats while Agent handler blocked, received ${heartbeatCount}`);
+    assert.equal(harnessed.hub.sessionOf(CONNECTOR)?.state, "ready");
+    controller.abort();
+    await assert.rejects(operation, (error) => error instanceof FabricContractError && error.code === "cancelled");
+    await waitUntil(() => cancelled);
+    await runtime.stop("relay test complete");
+  } finally {
+    await harnessed.close();
+  }
+});
+
+test("pre-ready, unnegotiated, and wrong-direction Device relay frames retire the exact WSS session", async () => {
+  const relay = {
+    version: FABRIC_HUB_RELAY_VERSION,
+    hubRuntimeEpoch: "hub-direction-epoch",
+    accepted: () => undefined,
+    ready: () => undefined,
+    advertisement: () => undefined,
+    accept: () => undefined,
+    closeRoute: async () => undefined,
+    retire: () => undefined,
+  } as const;
+  const harnessed = await harness(
+    { heartbeatIntervalMs: 1_000, heartbeatTimeoutMs: 5_000 },
+    undefined,
+    undefined,
+    { relay },
+  );
+  try {
+    const identity = connectorIdentity();
+    harnessed.security.enroll({ connectorId: CONNECTOR, keyId: "k-1", publicKey: identity.publicKey, scopes: ["fabric.data.*"] });
+
+    const preReady = rawClient(harnessed.url, harnessed.ca);
+    await new Promise<void>((resolve) => preReady.socket.on("open", () => resolve()));
+    const preReadyGeneration = await admit(preReady, identity, "pre-ready-relay", undefined, [FABRIC_HUB_RELAY_VERSION]);
+    preReady.send(envelope("receipt", {}, {
+      connectionId: `connection-${CONNECTOR}-${preReadyGeneration}`,
+      connectionGeneration: preReadyGeneration,
+    }));
+    assert.equal(((await preReady.waitFor("error")).payload as Record<string, unknown>).code, "invalid_state");
+    await preReady.closed;
+
+    const legacy = rawClient(harnessed.url, harnessed.ca);
+    await new Promise<void>((resolve) => legacy.socket.on("open", () => resolve()));
+    const legacyGeneration = await admit(legacy, identity, "legacy-no-relay");
+    legacy.send(envelope("advertise_snapshot", { advertisementRevision: 1, capabilityDigest: "d", endpoints: [] }));
+    await legacy.waitFor("ready");
+    legacy.send(envelope("receipt", {}, {
+      connectionId: `connection-${CONNECTOR}-${legacyGeneration}`,
+      connectionGeneration: legacyGeneration,
+    }));
+    assert.equal(((await legacy.waitFor("error")).payload as Record<string, unknown>).code, "invalid_state");
+    await legacy.closed;
+
+    const wrongDirection = rawClient(harnessed.url, harnessed.ca);
+    await new Promise<void>((resolve) => wrongDirection.socket.on("open", () => resolve()));
+    const directionGeneration = await admit(wrongDirection, identity, "wrong-direction-relay", undefined, [FABRIC_HUB_RELAY_VERSION]);
+    wrongDirection.send(envelope("advertise_snapshot", { advertisementRevision: 1, capabilityDigest: "d", endpoints: [] }));
+    await wrongDirection.waitFor("ready");
+    wrongDirection.send(envelope("invoke", {}, {
+      connectionId: `connection-${CONNECTOR}-${directionGeneration}`,
+      connectionGeneration: directionGeneration,
+    }));
+    assert.equal(((await wrongDirection.waitFor("error")).payload as Record<string, unknown>).code, "invalid_state");
+    await wrongDirection.closed;
+  } finally {
+    await harnessed.close();
+  }
 });

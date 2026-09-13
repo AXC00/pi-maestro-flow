@@ -1,6 +1,7 @@
 import {
   FabricContractError,
   assertBoundedString,
+  assertEpochMilliseconds,
   assertFabricIdentifier,
   assertGeneration,
   assertRevision,
@@ -26,7 +27,11 @@ import {
 } from "pi-maestro-fabric-core/v1";
 import {
   FABRIC_DIRECTORY_ADVERTISEMENT_AUTHORITY,
+  FABRIC_DIRECTORY_PUBLISH_ADVERTISEMENT,
+  FABRIC_DIRECTORY_RECORD_PERSISTED_ADVERTISEMENT,
   FABRIC_DIRECTORY_REGISTRY_AUTHORITY,
+  FABRIC_DIRECTORY_STAGE_ADVERTISEMENT,
+  FABRIC_DIRECTORY_WITHDRAW_ADVERTISEMENT,
   type DirectoryAdvertisementAuthorityContext,
 } from "./directory-authority.ts";
 
@@ -76,6 +81,59 @@ export interface AcceptedAdvertisementMetadata {
   advertisementRevision: number;
 }
 
+export interface FabricAdvertisementRemovalTombstone {
+  readonly subjectId: string;
+  readonly generation: number;
+  readonly revision: number;
+}
+
+export interface FabricCapabilityRemovalTombstone {
+  readonly capabilityId: string;
+  readonly endpointGeneration: number;
+}
+
+export interface FabricAdvertisementRemovalSet {
+  readonly workspaces: readonly FabricAdvertisementRemovalTombstone[];
+  readonly endpoints: readonly FabricAdvertisementRemovalTombstone[];
+  readonly capabilities: readonly FabricCapabilityRemovalTombstone[];
+}
+
+/**
+ * Immutable, fully validated persistence input. Production adapters commit all
+ * rows represented here in one registry transaction before returning.
+ */
+export interface FabricStagedAdvertisementCandidate extends AcceptedAdvertisementMetadata {
+  readonly kind: "snapshot" | "delta";
+  readonly credentialGeneration: number;
+  readonly preparedAt: number;
+  readonly devices: readonly DeviceRecord[];
+  readonly workspaces: readonly WorkspaceRecord[];
+  readonly endpoints: readonly EndpointRecord[];
+  readonly capabilities: readonly CapabilityBinding[];
+  readonly removals: FabricAdvertisementRemovalSet;
+}
+
+export interface FabricOfflineInventorySeed extends AcceptedAdvertisementMetadata {
+  readonly credentialGeneration: number;
+  readonly acceptedAt: number;
+  readonly devices: readonly DeviceRecord[];
+  readonly workspaces: readonly WorkspaceRecord[];
+  readonly endpoints: readonly EndpointRecord[];
+  readonly capabilities: readonly CapabilityBinding[];
+  readonly tombstones?: Partial<FabricAdvertisementRemovalSet>;
+}
+
+/** Durable evidence only. This view never authorizes execution or readiness. */
+export interface FabricOfflineInventoryView extends AcceptedAdvertisementMetadata {
+  readonly credentialGeneration: number;
+  readonly acceptedAt: number;
+  readonly devices: readonly DeviceRecord[];
+  readonly workspaces: readonly PublicWorkspaceRecord[];
+  readonly endpoints: readonly EndpointRecord[];
+  readonly capabilities: readonly CapabilityBinding[];
+  readonly tombstones: FabricAdvertisementRemovalSet;
+}
+
 export interface FabricDirectorySnapshot {
   connectors: readonly PublicConnectorRecord[];
   devices: readonly DeviceRecord[];
@@ -99,17 +157,43 @@ export interface CapabilityQuery {
 }
 
 interface OwnedSnapshot extends AcceptedAdvertisementMetadata {
+  credentialGeneration: number;
+  acceptedAt: number;
   devices: readonly DeviceRecord[];
   workspaces: readonly WorkspaceRecord[];
   endpoints: readonly EndpointRecord[];
   capabilities: readonly CapabilityBinding[];
 }
 
+interface StoredOfflineInventory extends OwnedSnapshot {
+  tombstones: FabricAdvertisementRemovalSet;
+}
+
 interface GenerationFence {
   generation: number;
+  revision: number;
+  fingerprint: string;
+  recordFingerprint: string;
+  present: boolean;
+  connectorId: string;
+}
+
+interface CapabilityFence {
   fingerprint: string;
   present: boolean;
   connectorId: string;
+  endpointGeneration: number;
+}
+
+const OFFLINE_INVENTORY_MAX_ITEMS = 10_000;
+const STAGED_OWNER = Symbol("fabric-staged-advertisement-owner");
+const STAGED_PREVIOUS = Symbol("fabric-staged-advertisement-previous");
+const STAGED_OFFLINE_PREVIOUS = Symbol("fabric-staged-advertisement-offline-previous");
+
+interface InternalStagedAdvertisement extends FabricStagedAdvertisementCandidate {
+  readonly [STAGED_OWNER]: FabricDirectory;
+  readonly [STAGED_PREVIOUS]: OwnedSnapshot | undefined;
+  readonly [STAGED_OFFLINE_PREVIOUS]: StoredOfflineInventory | undefined;
 }
 
 function conflict(message: string, path: string): never {
@@ -158,14 +242,47 @@ function endpointFingerprint(record: EndpointRecord): string {
   return JSON.stringify({ ...projected, generation: undefined, revision: undefined, status: undefined });
 }
 
+function generationRecordFingerprint(record: WorkspaceRecord | EndpointRecord): string {
+  if ("workspaceId" in record) {
+    return JSON.stringify({
+      workspaceId: record.workspaceId,
+      deviceId: record.deviceId,
+      localWorkspaceId: record.localWorkspaceId,
+      label: record.label,
+      mode: record.mode,
+      generation: record.generation,
+      policyDigest: record.policyDigest,
+      endpointIds: [...record.endpointIds],
+      revision: record.revision,
+    });
+  }
+  return JSON.stringify(projectEndpoint(record));
+}
+
+function capabilityFingerprint(record: CapabilityBinding): string {
+  return JSON.stringify(projectCapability(record));
+}
+
+function deepFreeze<T>(value: T): T {
+  if (value !== null && typeof value === "object" && !Object.isFrozen(value)) {
+    for (const child of Object.values(value)) deepFreeze(child);
+    Object.freeze(value);
+  }
+  return value;
+}
+
 function cloneOwnedSnapshot(
   snapshot: FabricAdvertisementSnapshot,
   connectorId: string,
+  credentialGeneration: number,
+  acceptedAt: number,
 ): OwnedSnapshot {
   return {
     connectionId: snapshot.connectionId,
     connectionGeneration: snapshot.connectionGeneration,
     connectorId,
+    credentialGeneration,
+    acceptedAt,
     capabilityDigest: snapshot.capabilityDigest,
     advertisementRevision: snapshot.advertisementRevision,
     devices: snapshot.devices.map(projectDevice),
@@ -173,6 +290,34 @@ function cloneOwnedSnapshot(
     endpoints: snapshot.endpoints.map(projectEndpoint),
     capabilities: snapshot.capabilities.map(projectCapability),
   };
+}
+
+function sameAcceptedOwner(left: OwnedSnapshot | undefined, right: OwnedSnapshot | undefined): boolean {
+  return left === right;
+}
+
+function removedGenerationRecords<T extends { generation: number; revision: number }>(
+  before: readonly T[],
+  after: readonly T[],
+  identity: (record: T) => string,
+): readonly FabricAdvertisementRemovalTombstone[] {
+  const nextIds = new Set(after.map(identity));
+  return before.filter((record) => !nextIds.has(identity(record))).map((record) => ({
+    subjectId: identity(record), generation: record.generation, revision: record.revision,
+  }));
+}
+
+function removedCapabilities(
+  before: readonly CapabilityBinding[],
+  after: readonly CapabilityBinding[],
+  beforeEndpoints: readonly EndpointRecord[],
+): readonly FabricCapabilityRemovalTombstone[] {
+  const nextIds = new Set(after.map((record) => record.capabilityId));
+  const endpointById = new Map(beforeEndpoints.map((record) => [record.endpointId, record]));
+  return before.filter((record) => !nextIds.has(record.capabilityId)).map((record) => ({
+    capabilityId: record.capabilityId,
+    endpointGeneration: endpointById.get(record.endpointId)!.generation,
+  }));
 }
 
 function compareText(left: string, right: string): number {
@@ -208,8 +353,10 @@ export class FabricDirectory {
   readonly #connectorRevisionHighWater = new Map<string, number>();
   readonly #deviceRevisionHighWater = new Map<string, number>();
   readonly #advertisements = new Map<string, OwnedSnapshot>();
+  readonly #offlineInventories = new Map<string, StoredOfflineInventory>();
   readonly #workspaceFences = new Map<string, GenerationFence>();
   readonly #endpointFences = new Map<string, GenerationFence>();
+  readonly #capabilityFences = new Map<string, CapabilityFence>();
 
   /** Seeds durable host authority. It never makes advertisement data executable. */
   seedAuthority(seed: FabricAuthoritySeed): void {
@@ -253,25 +400,35 @@ export class FabricDirectory {
         Math.max(this.#deviceRevisionHighWater.get(device.deviceId) ?? -1, device.revision),
       );
     }
+    const accepted = this.#advertisements.get(seed.connector.connectorId);
+    const acceptedAuthorityChanged = accepted !== undefined && (
+      !sameRecord(currentConnector ?? {}, seed.connector) ||
+      accepted.devices.length !== seed.devices.length ||
+      accepted.devices.some((advertised) => {
+        const current = devices.get(advertised.deviceId);
+        return current === undefined || !sameRecord(advertised, current);
+      })
+    );
     this.#devices.clear();
     for (const [deviceId, device] of nextDevices) this.#devices.set(deviceId, device);
+    if (acceptedAuthorityChanged) this.#advertisements.delete(seed.connector.connectorId);
   }
 
-  /** Internal package seam: only FabricConnectionManager supplies this symbol-keyed authority context. */
-  [FABRIC_DIRECTORY_ADVERTISEMENT_AUTHORITY](
-    context: DirectoryAdvertisementAuthorityContext,
-    snapshot: FabricAdvertisementSnapshot,
-  ): AcceptedAdvertisementMetadata;
-  /** Applies a monotonic delta only to the exact accepted connection snapshot. */
-  [FABRIC_DIRECTORY_ADVERTISEMENT_AUTHORITY](
-    context: DirectoryAdvertisementAuthorityContext,
-    delta: FabricAdvertisementDelta,
-  ): AcceptedAdvertisementMetadata;
+  /** Compatibility seam for explicit synchronous in-memory embeddings. */
   [FABRIC_DIRECTORY_ADVERTISEMENT_AUTHORITY](
     context: DirectoryAdvertisementAuthorityContext,
     input: FabricAdvertisementSnapshot | FabricAdvertisementDelta,
   ): AcceptedAdvertisementMetadata {
-    if (!("baseRevision" in input)) return this.#acceptSnapshot(context, input);
+    const candidate = this[FABRIC_DIRECTORY_STAGE_ADVERTISEMENT](context, input);
+    return this[FABRIC_DIRECTORY_PUBLISH_ADVERTISEMENT](candidate);
+  }
+
+  /** Validates and clones an immutable candidate without changing executable Directory state. */
+  [FABRIC_DIRECTORY_STAGE_ADVERTISEMENT](
+    context: DirectoryAdvertisementAuthorityContext,
+    input: FabricAdvertisementSnapshot | FabricAdvertisementDelta,
+  ): FabricStagedAdvertisementCandidate {
+    if (!("baseRevision" in input)) return this.#stageSnapshot(context, input, "snapshot");
     const delta = input;
     assertFabricIdentifier(delta.connectionId, "connectionId");
     assertGeneration(delta.connectionGeneration, "connectionGeneration");
@@ -286,14 +443,14 @@ export class FabricDirectory {
       delta.connectionId !== context.connectionId || delta.connectionGeneration !== context.connectionGeneration ||
       delta.capabilityDigest !== context.capabilityDigest
     ) {
-      throw new FabricContractError("stale_generation", "Advertisement delta does not match the accepted connection", "connectionId");
+      throw new FabricContractError("stale_generation", "Advertisement delta requires the exact current accepted snapshot; reconnects require a full snapshot", "connectionId");
     }
     if (delta.baseRevision !== previous.advertisementRevision || delta.advertisementRevision !== delta.baseRevision + 1) {
-      throw new FabricContractError("stale_generation", "Advertisement delta must advance the current revision by one", "baseRevision");
+      throw new FabricContractError("stale_generation", "Advertisement delta must advance the current revision by exactly one", "baseRevision");
     }
     const upserts = delta.upserts ?? {};
     const removals = delta.removals ?? {};
-    return this.#acceptSnapshot(context, {
+    return this.#stageSnapshot(context, {
       connectionId: delta.connectionId,
       connectionGeneration: delta.connectionGeneration,
       capabilityDigest: delta.capabilityDigest,
@@ -302,15 +459,18 @@ export class FabricDirectory {
       workspaces: applyDeltaRecords(previous.workspaces, upserts.workspaces ?? [], removals.workspaceIds ?? [], (record) => record.workspaceId, "workspaces"),
       endpoints: applyDeltaRecords(previous.endpoints, upserts.endpoints ?? [], removals.endpointIds ?? [], (record) => record.endpointId, "endpoints"),
       capabilities: applyDeltaRecords(previous.capabilities, upserts.capabilities ?? [], removals.capabilityIds ?? [], (record) => record.capabilityId, "capabilities"),
-    });
+    }, "delta");
   }
 
-  #acceptSnapshot(
+  #stageSnapshot(
     context: DirectoryAdvertisementAuthorityContext,
     snapshot: FabricAdvertisementSnapshot,
-  ): AcceptedAdvertisementMetadata {
+    kind: "snapshot" | "delta",
+  ): InternalStagedAdvertisement {
     assertFabricIdentifier(snapshot.connectionId, "connectionId");
     assertGeneration(snapshot.connectionGeneration, "connectionGeneration");
+    assertGeneration(context.credentialGeneration, "credentialGeneration");
+    assertEpochMilliseconds(context.preparedAt, "preparedAt");
     assertBoundedString(snapshot.capabilityDigest, "capabilityDigest", 256);
     assertRevision(snapshot.advertisementRevision, "advertisementRevision");
     if (
@@ -320,21 +480,18 @@ export class FabricDirectory {
     ) {
       throw new FabricContractError("stale_generation", "Advertisement does not match current connection authority", "connectionId");
     }
-
-    const categories = [snapshot.devices, snapshot.workspaces, snapshot.endpoints, snapshot.capabilities] as const;
-    for (const [index, items] of categories.entries()) {
-      if (items.length > context.limits.maxAdvertisementItems) {
-        throw new FabricContractError("resource_exhausted", "Advertisement category exceeds negotiated item limit", `advertisement[${index}]`);
-      }
-    }
-    const total = categories.reduce((sum, items) => sum + items.length, 0);
-    if (total > context.limits.maxAdvertisementItems) {
-      throw new FabricContractError("resource_exhausted", "Advertisement exceeds negotiated total item limit", "advertisement");
-    }
+    this.#assertSnapshotBounds(snapshot, context.limits.maxAdvertisementItems);
 
     const currentConnector = this.#connectors.get(context.connectorId);
     if (currentConnector === undefined) throw new FabricContractError("not_found", "Connector authority is not registered", "connectorId");
+    if (currentConnector.credentialGeneration !== context.credentialGeneration) {
+      throw new FabricContractError("stale_generation", "Advertisement credential generation is stale", "credentialGeneration");
+    }
     const previous = this.#advertisements.get(context.connectorId);
+    const persistedPrevious = this.#offlineInventories.get(context.connectorId);
+    if (previous === undefined && persistedPrevious !== undefined && snapshot.connectionGeneration <= persistedPrevious.connectionGeneration) {
+      throw new FabricContractError("stale_generation", "A reconnect must use a newer connection generation and a full snapshot", "connectionGeneration");
+    }
     if (previous !== undefined) {
       if (snapshot.connectionGeneration < previous.connectionGeneration) {
         throw new FabricContractError("stale_generation", "Advertisement connection generation cannot roll back", "connectionGeneration");
@@ -347,23 +504,108 @@ export class FabricDirectory {
       }
     }
 
+    this.#assertSnapshotRecords(context.connectorId, snapshot);
+    this.#assertGenerationFences(snapshot.workspaces, context.connectorId, this.#workspaceFences, (record) => record.workspaceId, workspaceFingerprint);
+    this.#assertGenerationFences(snapshot.endpoints, context.connectorId, this.#endpointFences, (record) => record.endpointId, endpointFingerprint);
+    this.#assertCapabilityFences(snapshot.capabilities, snapshot.endpoints, context.connectorId);
+
+    const owned = cloneOwnedSnapshot(snapshot, context.connectorId, context.credentialGeneration, context.preparedAt);
+    this.#assertCandidateGloballyUnique(context.connectorId, owned);
+    const durableBefore = previous ?? this.#offlineInventories.get(context.connectorId);
+    const candidate: InternalStagedAdvertisement = {
+      kind,
+      connectorId: context.connectorId,
+      credentialGeneration: context.credentialGeneration,
+      preparedAt: context.preparedAt,
+      connectionId: snapshot.connectionId,
+      connectionGeneration: snapshot.connectionGeneration,
+      capabilityDigest: snapshot.capabilityDigest,
+      advertisementRevision: snapshot.advertisementRevision,
+      devices: owned.devices,
+      workspaces: owned.workspaces,
+      endpoints: owned.endpoints,
+      capabilities: owned.capabilities,
+      removals: {
+        workspaces: removedGenerationRecords(durableBefore?.workspaces ?? [], owned.workspaces, (record) => record.workspaceId),
+        endpoints: removedGenerationRecords(durableBefore?.endpoints ?? [], owned.endpoints, (record) => record.endpointId),
+        capabilities: removedCapabilities(durableBefore?.capabilities ?? [], owned.capabilities, durableBefore?.endpoints ?? []),
+      },
+      [STAGED_OWNER]: this,
+      [STAGED_PREVIOUS]: previous,
+      [STAGED_OFFLINE_PREVIOUS]: this.#offlineInventories.get(context.connectorId),
+    };
+    return deepFreeze(candidate);
+  }
+
+  /** Records a successful durable commit as non-executable evidence before owner revalidation. */
+  [FABRIC_DIRECTORY_RECORD_PERSISTED_ADVERTISEMENT](candidate: FabricStagedAdvertisementCandidate): void {
+    const staged = this.#requireStagedCandidate(candidate);
+    if (this.#offlineInventories.get(staged.connectorId) !== staged[STAGED_OFFLINE_PREVIOUS]) {
+      throw new FabricContractError("stale_generation", "Offline inventory changed while admission was persisted", "advertisementRevision");
+    }
+    this.#assertGenerationFences(staged.workspaces, staged.connectorId, this.#workspaceFences, (record) => record.workspaceId, workspaceFingerprint);
+    this.#assertGenerationFences(staged.endpoints, staged.connectorId, this.#endpointFences, (record) => record.endpointId, endpointFingerprint);
+    this.#assertCapabilityFences(staged.capabilities, staged.endpoints, staged.connectorId);
+    this.#assertCandidateGloballyUnique(staged.connectorId, this.#ownedFromCandidate(staged));
+    const offline = this.#offlineFromCandidate(staged);
+    this.#commitCandidateFences(staged);
+    this.#offlineInventories.set(staged.connectorId, offline);
+  }
+
+  /** Publishes only the still-current staged owner. Persistence is handled by the caller. */
+  [FABRIC_DIRECTORY_PUBLISH_ADVERTISEMENT](candidate: FabricStagedAdvertisementCandidate): AcceptedAdvertisementMetadata {
+    const staged = this.#requireStagedCandidate(candidate);
+    if (!sameAcceptedOwner(this.#advertisements.get(staged.connectorId), staged[STAGED_PREVIOUS])) {
+      throw new FabricContractError("stale_generation", "Executable advertisement changed while admission was staged", "advertisementRevision");
+    }
+    this.#assertGenerationFences(staged.workspaces, staged.connectorId, this.#workspaceFences, (record) => record.workspaceId, workspaceFingerprint);
+    this.#assertGenerationFences(staged.endpoints, staged.connectorId, this.#endpointFences, (record) => record.endpointId, endpointFingerprint);
+    this.#assertCapabilityFences(staged.capabilities, staged.endpoints, staged.connectorId);
+    const owned = this.#ownedFromCandidate(staged);
+    this.#assertCandidateGloballyUnique(staged.connectorId, owned);
+    this.#commitCandidateFences(staged);
+    this.#advertisements.set(staged.connectorId, owned);
+    return {
+      connectorId: staged.connectorId,
+      connectionId: staged.connectionId,
+      connectionGeneration: staged.connectionGeneration,
+      capabilityDigest: staged.capabilityDigest,
+      advertisementRevision: staged.advertisementRevision,
+    };
+  }
+
+  /** Removes only an exact connection generation from executable visibility. */
+  [FABRIC_DIRECTORY_WITHDRAW_ADVERTISEMENT](connectionId: string, connectionGeneration: number, connectorId: string): void {
+    const current = this.#advertisements.get(connectorId);
+    if (current?.connectionId === connectionId && current.connectionGeneration === connectionGeneration) {
+      this.#advertisements.delete(connectorId);
+    }
+  }
+
+  #assertSnapshotBounds(snapshot: FabricAdvertisementSnapshot, maximum: number): void {
+    const categories = [snapshot.devices, snapshot.workspaces, snapshot.endpoints, snapshot.capabilities] as const;
+    for (const [index, items] of categories.entries()) {
+      if (items.length > maximum) {
+        throw new FabricContractError("resource_exhausted", "Advertisement category exceeds negotiated item limit", `advertisement[${index}]`);
+      }
+    }
+    if (categories.reduce((sum, items) => sum + items.length, 0) > maximum) {
+      throw new FabricContractError("resource_exhausted", "Advertisement exceeds negotiated total item limit", "advertisement");
+    }
+  }
+
+  #assertSnapshotRecords(connectorId: string, snapshot: FabricAdvertisementSnapshot): void {
     for (const device of snapshot.devices) assertValidDeviceRecord(device);
     for (const workspace of snapshot.workspaces) assertValidWorkspaceRecord(workspace);
     for (const endpoint of snapshot.endpoints) assertValidEndpointRecord(endpoint);
     for (const capability of snapshot.capabilities) assertValidCapabilityBinding(capability);
-
     const devices = uniqueBy(snapshot.devices, (device) => device.deviceId, "devices");
-    const authorityDevices = [...this.#devices.values()].filter((device) => device.connectorId === context.connectorId);
-    if (devices.size !== authorityDevices.length) {
-      conflict("Advertisement devices must exactly match durable connector authority", "devices");
-    }
+    const authorityDevices = [...this.#devices.values()].filter((device) => device.connectorId === connectorId);
+    if (devices.size !== authorityDevices.length) conflict("Advertisement devices must exactly match durable connector authority", "devices");
     for (const device of authorityDevices) {
       const advertised = devices.get(device.deviceId);
-      if (advertised === undefined || !sameRecord(device, advertised)) {
-        conflict("Advertised device authority differs from the durable registry", "devices");
-      }
+      if (advertised === undefined || !sameRecord(device, advertised)) conflict("Advertised device authority differs from the durable registry", "devices");
     }
-
     const workspaces = uniqueBy(snapshot.workspaces, (workspace) => workspace.workspaceId, "workspaces");
     const endpoints = uniqueBy(snapshot.endpoints, (endpoint) => endpoint.endpointId, "endpoints");
     uniqueBy(snapshot.capabilities, (capability) => capability.capabilityId, "capabilities");
@@ -375,18 +617,13 @@ export class FabricDirectory {
       localWorkspaceIds.add(localKey);
       for (const endpointId of workspace.endpointIds) {
         const endpoint = endpoints.get(endpointId);
-        if (
-          endpoint === undefined || endpoint.deviceId !== workspace.deviceId ||
-          endpoint.scope.kind !== "workspace" || endpoint.scope.workspaceId !== workspace.workspaceId
-        ) {
+        if (endpoint === undefined || endpoint.deviceId !== workspace.deviceId || endpoint.scope.kind !== "workspace" || endpoint.scope.workspaceId !== workspace.workspaceId) {
           conflict("Workspace endpointIds must reference scoped endpoints on the same device", "workspaces.endpointIds");
         }
       }
     }
     for (const endpoint of snapshot.endpoints) {
-      if (!devices.has(endpoint.deviceId) || endpoint.connectorId !== context.connectorId) {
-        conflict("Advertised endpoint ownership does not match this connector", "endpoints");
-      }
+      if (!devices.has(endpoint.deviceId) || endpoint.connectorId !== connectorId) conflict("Advertised endpoint ownership does not match this connector", "endpoints");
       if (endpoint.scope.kind === "workspace") {
         const workspace = workspaces.get(endpoint.scope.workspaceId);
         if (workspace === undefined || workspace.deviceId !== endpoint.deviceId || !workspace.endpointIds.includes(endpoint.endpointId)) {
@@ -397,46 +634,12 @@ export class FabricDirectory {
     for (const capability of snapshot.capabilities) {
       const endpoint = endpoints.get(capability.endpointId);
       if (endpoint === undefined) conflict("Capability references an endpoint outside this snapshot", "capabilities.endpointId");
-      if (capability.contractHash !== endpoint.contractHash) {
-        conflict("Capability contractHash must match its Endpoint contractHash", "capabilities.contractHash");
-      }
+      if (capability.contractHash !== endpoint.contractHash) conflict("Capability contractHash must match its Endpoint contractHash", "capabilities.contractHash");
     }
-
-    this.#assertGenerationFences(
-      snapshot.workspaces,
-      new Set(previous?.workspaces.map((record) => record.workspaceId) ?? []),
-      context.connectorId,
-      this.#workspaceFences,
-      (record) => record.workspaceId,
-      workspaceFingerprint,
-    );
-    this.#assertGenerationFences(
-      snapshot.endpoints,
-      new Set(previous?.endpoints.map((record) => record.endpointId) ?? []),
-      context.connectorId,
-      this.#endpointFences,
-      (record) => record.endpointId,
-      endpointFingerprint,
-    );
-    const candidate = new Map(this.#advertisements);
-    candidate.set(context.connectorId, cloneOwnedSnapshot(snapshot, context.connectorId));
-    this.#assertGloballyUnique(candidate);
-
-    this.#commitGenerationFences(snapshot.workspaces, context.connectorId, this.#workspaceFences, (record) => record.workspaceId, workspaceFingerprint);
-    this.#commitGenerationFences(snapshot.endpoints, context.connectorId, this.#endpointFences, (record) => record.endpointId, endpointFingerprint);
-    this.#advertisements.set(context.connectorId, cloneOwnedSnapshot(snapshot, context.connectorId));
-    return {
-      connectorId: context.connectorId,
-      connectionId: snapshot.connectionId,
-      connectionGeneration: snapshot.connectionGeneration,
-      capabilityDigest: snapshot.capabilityDigest,
-      advertisementRevision: snapshot.advertisementRevision,
-    };
   }
 
-  #assertGenerationFences<T extends { generation: number }>(
+  #assertGenerationFences<T extends WorkspaceRecord | EndpointRecord>(
     records: readonly T[],
-    previousIds: ReadonlySet<string>,
     connectorId: string,
     fences: ReadonlyMap<string, GenerationFence>,
     identity: (record: T) => string,
@@ -450,17 +653,21 @@ export class FabricDirectory {
         throw new FabricContractError("stale_generation", "Registry generation cannot roll back or change ownership", id);
       }
       if (record.generation === prior.generation) {
+        if (!prior.present) throw new FabricContractError("stale_generation", "A tombstoned identity requires a newer generation", id);
         if (fingerprint(record) !== prior.fingerprint) {
           throw new FabricContractError("stale_generation", "Contract or policy change requires a newer generation", id);
         }
-        if (!prior.present || !previousIds.has(id)) {
-          throw new FabricContractError("stale_generation", "A tombstoned identity requires a newer generation", id);
+        if (record.revision < prior.revision) {
+          throw new FabricContractError("stale_generation", "Record revision cannot roll back within a generation", id);
+        }
+        if (record.revision === prior.revision && generationRecordFingerprint(record) !== prior.recordFingerprint) {
+          throw new FabricContractError("stale_generation", "A record change must advance its revision", id);
         }
       }
     }
   }
 
-  #commitGenerationFences<T extends { generation: number }>(
+  #commitGenerationFences<T extends WorkspaceRecord | EndpointRecord>(
     records: readonly T[],
     connectorId: string,
     fences: Map<string, GenerationFence>,
@@ -474,9 +681,52 @@ export class FabricDirectory {
     for (const record of records) {
       fences.set(identity(record), {
         generation: record.generation,
+        revision: record.revision,
         fingerprint: fingerprint(record),
+        recordFingerprint: generationRecordFingerprint(record),
         present: true,
         connectorId,
+      });
+    }
+  }
+
+  #assertCapabilityFences(
+    records: readonly CapabilityBinding[],
+    endpoints: readonly EndpointRecord[],
+    connectorId: string,
+  ): void {
+    const endpointById = new Map(endpoints.map((record) => [record.endpointId, record]));
+    for (const record of records) {
+      const prior = this.#capabilityFences.get(record.capabilityId);
+      if (prior === undefined) continue;
+      if (prior.connectorId !== connectorId) conflict("Capability identity is already owned", "capabilities.capabilityId");
+      const endpointGeneration = endpointById.get(record.endpointId)?.generation;
+      if (endpointGeneration === undefined) conflict("Capability endpoint is missing", "capabilities.endpointId");
+      if (endpointGeneration < prior.endpointGeneration) {
+        throw new FabricContractError("stale_generation", "Capability endpoint generation cannot roll back", record.capabilityId);
+      }
+      if ((!prior.present || prior.fingerprint !== capabilityFingerprint(record)) && endpointGeneration <= prior.endpointGeneration) {
+        throw new FabricContractError("stale_generation", "Capability resurrection or change requires a newer Endpoint generation", record.capabilityId);
+      }
+    }
+  }
+
+  #commitCapabilityFences(
+    records: readonly CapabilityBinding[],
+    endpoints: readonly EndpointRecord[],
+    connectorId: string,
+  ): void {
+    const nextIds = new Set(records.map((record) => record.capabilityId));
+    const endpointById = new Map(endpoints.map((record) => [record.endpointId, record]));
+    for (const [id, fence] of this.#capabilityFences) {
+      if (fence.connectorId === connectorId && !nextIds.has(id)) this.#capabilityFences.set(id, { ...fence, present: false });
+    }
+    for (const record of records) {
+      this.#capabilityFences.set(record.capabilityId, {
+        connectorId,
+        fingerprint: capabilityFingerprint(record),
+        present: true,
+        endpointGeneration: endpointById.get(record.endpointId)!.generation,
       });
     }
   }
@@ -503,6 +753,210 @@ export class FabricDirectory {
         capabilityIds.add(capability.capabilityId);
       }
     }
+  }
+
+  #requireStagedCandidate(candidate: FabricStagedAdvertisementCandidate): InternalStagedAdvertisement {
+    const staged = candidate as InternalStagedAdvertisement;
+    if (staged[STAGED_OWNER] !== this) {
+      throw new FabricContractError("permission_denied", "Staged advertisement was not prepared by this Directory", "candidate");
+    }
+    return staged;
+  }
+
+  #ownedFromCandidate(candidate: FabricStagedAdvertisementCandidate): OwnedSnapshot {
+    return cloneOwnedSnapshot({
+      connectionId: candidate.connectionId,
+      connectionGeneration: candidate.connectionGeneration,
+      capabilityDigest: candidate.capabilityDigest,
+      advertisementRevision: candidate.advertisementRevision,
+      devices: candidate.devices,
+      workspaces: candidate.workspaces,
+      endpoints: candidate.endpoints,
+      capabilities: candidate.capabilities,
+    }, candidate.connectorId, candidate.credentialGeneration, candidate.preparedAt);
+  }
+
+  #assertCandidateGloballyUnique(connectorId: string, candidate: OwnedSnapshot): void {
+    const snapshots = new Map<string, OwnedSnapshot>(this.#offlineInventories);
+    for (const [id, snapshot] of this.#advertisements) snapshots.set(id, snapshot);
+    snapshots.set(connectorId, candidate);
+    this.#assertGloballyUnique(snapshots);
+  }
+
+  #commitCandidateFences(candidate: FabricStagedAdvertisementCandidate): void {
+    this.#commitGenerationFences(candidate.workspaces, candidate.connectorId, this.#workspaceFences, (record) => record.workspaceId, workspaceFingerprint);
+    this.#commitGenerationFences(candidate.endpoints, candidate.connectorId, this.#endpointFences, (record) => record.endpointId, endpointFingerprint);
+    this.#commitCapabilityFences(candidate.capabilities, candidate.endpoints, candidate.connectorId);
+  }
+
+  #offlineFromCandidate(candidate: FabricStagedAdvertisementCandidate): StoredOfflineInventory {
+    const previous = this.#offlineInventories.get(candidate.connectorId);
+    const workspaces = new Map((previous?.tombstones.workspaces ?? []).map((entry) => [entry.subjectId, entry]));
+    const endpoints = new Map((previous?.tombstones.endpoints ?? []).map((entry) => [entry.subjectId, entry]));
+    const capabilities = new Map((previous?.tombstones.capabilities ?? []).map((entry) => [entry.capabilityId, entry]));
+    for (const record of candidate.workspaces) workspaces.delete(record.workspaceId);
+    for (const record of candidate.endpoints) endpoints.delete(record.endpointId);
+    for (const record of candidate.capabilities) capabilities.delete(record.capabilityId);
+    for (const entry of candidate.removals.workspaces) workspaces.set(entry.subjectId, { ...entry });
+    for (const entry of candidate.removals.endpoints) endpoints.set(entry.subjectId, { ...entry });
+    for (const entry of candidate.removals.capabilities) capabilities.set(entry.capabilityId, { ...entry });
+    const owned = this.#ownedFromCandidate(candidate);
+    const tombstones: FabricAdvertisementRemovalSet = {
+      workspaces: [...workspaces.values()].sort((a, b) => compareText(a.subjectId, b.subjectId)),
+      endpoints: [...endpoints.values()].sort((a, b) => compareText(a.subjectId, b.subjectId)),
+      capabilities: [...capabilities.values()].sort((a, b) => compareText(a.capabilityId, b.capabilityId)),
+    };
+    this.#assertTombstones(candidate.connectorId, owned, tombstones);
+    return { ...owned, tombstones };
+  }
+
+  /** Atomically hydrates durable advertisement rows as offline-only inventory. */
+  hydrateOfflineInventory(seed: FabricOfflineInventorySeed): void {
+    assertFabricIdentifier(seed.connectorId, "connectorId");
+    assertFabricIdentifier(seed.connectionId, "connectionId");
+    assertGeneration(seed.connectionGeneration, "connectionGeneration");
+    assertGeneration(seed.credentialGeneration, "credentialGeneration");
+    assertRevision(seed.advertisementRevision, "advertisementRevision");
+    assertEpochMilliseconds(seed.acceptedAt, "acceptedAt");
+    assertBoundedString(seed.capabilityDigest, "capabilityDigest", 256);
+    if (this.#advertisements.has(seed.connectorId)) {
+      throw new FabricContractError("invalid_state", "Offline inventory cannot replace a live executable advertisement", "connectorId");
+    }
+    const connector = this.#connectors.get(seed.connectorId);
+    if (connector === undefined) throw new FabricContractError("not_found", "Offline inventory Connector is not registered", "connectorId");
+    if (seed.credentialGeneration > connector.credentialGeneration) {
+      throw new FabricContractError("stale_generation", "Offline inventory credential generation exceeds current authority", "credentialGeneration");
+    }
+    const snapshot: FabricAdvertisementSnapshot = {
+      connectionId: seed.connectionId,
+      connectionGeneration: seed.connectionGeneration,
+      capabilityDigest: seed.capabilityDigest,
+      advertisementRevision: seed.advertisementRevision,
+      devices: seed.devices,
+      workspaces: seed.workspaces,
+      endpoints: seed.endpoints,
+      capabilities: seed.capabilities,
+    };
+    this.#assertSnapshotBounds(snapshot, OFFLINE_INVENTORY_MAX_ITEMS);
+    this.#assertSnapshotRecords(seed.connectorId, snapshot);
+    const owned = cloneOwnedSnapshot(snapshot, seed.connectorId, seed.credentialGeneration, seed.acceptedAt);
+    this.#assertGenerationFences(owned.workspaces, seed.connectorId, this.#workspaceFences, (record) => record.workspaceId, workspaceFingerprint);
+    this.#assertGenerationFences(owned.endpoints, seed.connectorId, this.#endpointFences, (record) => record.endpointId, endpointFingerprint);
+    this.#assertCapabilityFences(owned.capabilities, owned.endpoints, seed.connectorId);
+    this.#assertCandidateGloballyUnique(seed.connectorId, owned);
+    const tombstones: FabricAdvertisementRemovalSet = {
+      workspaces: (seed.tombstones?.workspaces ?? []).map((entry) => ({ ...entry })),
+      endpoints: (seed.tombstones?.endpoints ?? []).map((entry) => ({ ...entry })),
+      capabilities: (seed.tombstones?.capabilities ?? []).map((entry) => ({ ...entry })),
+    };
+    this.#assertTombstones(seed.connectorId, owned, tombstones);
+    this.#commitGenerationFences(owned.workspaces, seed.connectorId, this.#workspaceFences, (record) => record.workspaceId, workspaceFingerprint);
+    this.#commitGenerationFences(owned.endpoints, seed.connectorId, this.#endpointFences, (record) => record.endpointId, endpointFingerprint);
+    this.#commitCapabilityFences(owned.capabilities, owned.endpoints, seed.connectorId);
+    this.#commitTombstones(seed.connectorId, tombstones);
+    this.#offlineInventories.set(seed.connectorId, { ...owned, tombstones });
+  }
+
+  #assertTombstones(connectorId: string, owned: OwnedSnapshot, tombstones: FabricAdvertisementRemovalSet): void {
+    const tombstoneTotal = tombstones.workspaces.length + tombstones.endpoints.length + tombstones.capabilities.length;
+    if (tombstoneTotal > OFFLINE_INVENTORY_MAX_ITEMS || [tombstones.workspaces, tombstones.endpoints, tombstones.capabilities].some((items) => items.length > OFFLINE_INVENTORY_MAX_ITEMS)) {
+      throw new FabricContractError("resource_exhausted", "Offline inventory tombstones exceed the durable inventory limit", "tombstones");
+    }
+    const workspaceIds = new Set(owned.workspaces.map((record) => record.workspaceId));
+    const endpointIds = new Set(owned.endpoints.map((record) => record.endpointId));
+    const capabilityIds = new Set(owned.capabilities.map((record) => record.capabilityId));
+    const workspaceTombstoneIds = new Set<string>();
+    const endpointTombstoneIds = new Set<string>();
+    const capabilityTombstoneIds = new Set<string>();
+    for (const [index, entry] of tombstones.workspaces.entries()) {
+      assertFabricIdentifier(entry.subjectId, `tombstones.workspaces[${index}].subjectId`);
+      assertGeneration(entry.generation, `tombstones.workspaces[${index}].generation`);
+      assertRevision(entry.revision, `tombstones.workspaces[${index}].revision`);
+      if (workspaceIds.has(entry.subjectId)) conflict("Workspace cannot be both present and tombstoned", `tombstones.workspaces[${index}]`);
+      if (workspaceTombstoneIds.has(entry.subjectId)) conflict("Workspace tombstone identity is duplicated", `tombstones.workspaces[${index}]`);
+      workspaceTombstoneIds.add(entry.subjectId);
+      this.#assertTombstoneFence(connectorId, entry, this.#workspaceFences);
+    }
+    for (const [index, entry] of tombstones.endpoints.entries()) {
+      assertFabricIdentifier(entry.subjectId, `tombstones.endpoints[${index}].subjectId`);
+      assertGeneration(entry.generation, `tombstones.endpoints[${index}].generation`);
+      assertRevision(entry.revision, `tombstones.endpoints[${index}].revision`);
+      if (endpointIds.has(entry.subjectId)) conflict("Endpoint cannot be both present and tombstoned", `tombstones.endpoints[${index}]`);
+      if (endpointTombstoneIds.has(entry.subjectId)) conflict("Endpoint tombstone identity is duplicated", `tombstones.endpoints[${index}]`);
+      endpointTombstoneIds.add(entry.subjectId);
+      this.#assertTombstoneFence(connectorId, entry, this.#endpointFences);
+    }
+    for (const [index, entry] of tombstones.capabilities.entries()) {
+      assertFabricIdentifier(entry.capabilityId, `tombstones.capabilities[${index}].capabilityId`);
+      assertGeneration(entry.endpointGeneration, `tombstones.capabilities[${index}].endpointGeneration`);
+      if (capabilityIds.has(entry.capabilityId)) conflict("Capability cannot be both present and tombstoned", `tombstones.capabilities[${index}]`);
+      if (capabilityTombstoneIds.has(entry.capabilityId)) conflict("Capability tombstone identity is duplicated", `tombstones.capabilities[${index}]`);
+      capabilityTombstoneIds.add(entry.capabilityId);
+      const prior = this.#capabilityFences.get(entry.capabilityId);
+      if (prior !== undefined && (prior.connectorId !== connectorId || entry.endpointGeneration < prior.endpointGeneration)) {
+        throw new FabricContractError("stale_generation", "Capability tombstone high-water cannot roll back or change ownership", `tombstones.capabilities[${index}]`);
+      }
+    }
+  }
+
+  #assertTombstoneFence(connectorId: string, entry: FabricAdvertisementRemovalTombstone, fences: ReadonlyMap<string, GenerationFence>): void {
+    const prior = fences.get(entry.subjectId);
+    if (prior === undefined) return;
+    if (prior.connectorId !== connectorId || entry.generation < prior.generation || (entry.generation === prior.generation && entry.revision < prior.revision)) {
+      throw new FabricContractError("stale_generation", "Tombstone high-water cannot roll back or change ownership", entry.subjectId);
+    }
+  }
+
+  #commitTombstones(connectorId: string, tombstones: FabricAdvertisementRemovalSet): void {
+    for (const entry of tombstones.workspaces) {
+      const prior = this.#workspaceFences.get(entry.subjectId);
+      this.#workspaceFences.set(entry.subjectId, {
+        connectorId, generation: entry.generation, revision: entry.revision, present: false,
+        fingerprint: prior?.fingerprint ?? "", recordFingerprint: prior?.recordFingerprint ?? "",
+      });
+    }
+    for (const entry of tombstones.endpoints) {
+      const prior = this.#endpointFences.get(entry.subjectId);
+      this.#endpointFences.set(entry.subjectId, {
+        connectorId, generation: entry.generation, revision: entry.revision, present: false,
+        fingerprint: prior?.fingerprint ?? "", recordFingerprint: prior?.recordFingerprint ?? "",
+      });
+    }
+    for (const entry of tombstones.capabilities) {
+      const prior = this.#capabilityFences.get(entry.capabilityId);
+      this.#capabilityFences.set(entry.capabilityId, {
+        connectorId,
+        present: false,
+        fingerprint: prior?.fingerprint ?? "",
+        endpointGeneration: entry.endpointGeneration,
+      });
+    }
+  }
+
+  getOfflineInventory(connectorId: string): FabricOfflineInventoryView | undefined {
+    const entry = this.#offlineInventories.get(connectorId);
+    if (entry === undefined) return undefined;
+    return {
+      connectorId,
+      connectionId: entry.connectionId,
+      connectionGeneration: entry.connectionGeneration,
+      credentialGeneration: entry.credentialGeneration,
+      capabilityDigest: entry.capabilityDigest,
+      advertisementRevision: entry.advertisementRevision,
+      acceptedAt: entry.acceptedAt,
+      devices: entry.devices.map(projectDevice).sort((a, b) => compareText(a.deviceId, b.deviceId)),
+      workspaces: entry.workspaces.map(projectWorkspace).sort((a, b) => compareText(a.workspaceId, b.workspaceId)),
+      endpoints: entry.endpoints.map(projectEndpoint).sort((a, b) => compareText(a.endpointId, b.endpointId)),
+      capabilities: entry.capabilities.map(projectCapability).sort((a, b) => compareText(a.capabilityId, b.capabilityId)),
+      tombstones: structuredClone(entry.tombstones),
+    };
+  }
+
+  listOfflineInventories(): readonly FabricOfflineInventoryView[] {
+    return [...this.#offlineInventories.keys()].sort(compareText).flatMap((connectorId) => {
+      const view = this.getOfflineInventory(connectorId);
+      return view === undefined ? [] : [view];
+    });
   }
 
   getAdvertisementRevision(connectorId: string): number | undefined {

@@ -14,5 +14,6 @@ export * from "./route.ts";
 export * from "./invocation.ts";
 export * from "./protocol.ts";
 export * from "./transport.ts";
+export * from "./hub-relay.ts";
 export * from "./validation.ts";
 export * from "./projection.ts";

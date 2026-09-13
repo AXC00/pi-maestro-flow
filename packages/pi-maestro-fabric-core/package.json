@@ -30,6 +30,7 @@
     "./v1/invocation": "./src/public/v1/invocation.ts",
     "./v1/protocol": "./src/public/v1/protocol.ts",
     "./v1/transport": "./src/public/v1/transport.ts",
+    "./v1/hub-relay": "./src/public/v1/hub-relay.ts",
     "./v1/validation": "./src/public/v1/validation.ts",
     "./v1/projection": "./src/public/v1/projection.ts"
   },

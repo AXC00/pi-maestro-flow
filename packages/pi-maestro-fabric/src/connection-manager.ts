@@ -36,10 +36,16 @@ import {
   type FabricAcceptedExecutionView,
   type FabricAdvertisementDelta,
   type FabricAdvertisementSnapshot,
+  type FabricStagedAdvertisementCandidate,
 } from "./directory.ts";
 import {
   FABRIC_DIRECTORY_ADVERTISEMENT_AUTHORITY,
+  FABRIC_DIRECTORY_PUBLISH_ADVERTISEMENT,
+  FABRIC_DIRECTORY_RECORD_PERSISTED_ADVERTISEMENT,
   FABRIC_DIRECTORY_REGISTRY_AUTHORITY,
+  FABRIC_DIRECTORY_STAGE_ADVERTISEMENT,
+  FABRIC_DIRECTORY_WITHDRAW_ADVERTISEMENT,
+  type DirectoryAdvertisementAuthorityContext,
 } from "./directory-authority.ts";
 import { FabricStoreCoordinator } from "./store-coordinator.ts";
 import { TransportRegistry } from "./transport-registry.ts";
@@ -86,11 +92,27 @@ export interface FabricDeadlineScheduler {
   cancel(handle: unknown): void;
 }
 
+export interface FabricInMemoryAdvertisementAdmission {
+  readonly kind: "in-memory";
+}
+
+export interface FabricDurableAdvertisementAdmission {
+  readonly kind: "durable";
+  /** Commit the complete immutable candidate atomically; rejection is never hidden. */
+  persist(candidate: FabricStagedAdvertisementCandidate): Promise<void>;
+}
+
+export type FabricAdvertisementAdmission = FabricInMemoryAdvertisementAdmission | FabricDurableAdvertisementAdmission;
+
+/** Explicit compatibility adapter for synchronous host embeddings and tests. */
+export const IN_MEMORY_FABRIC_ADVERTISEMENT_ADMISSION: FabricInMemoryAdvertisementAdmission = Object.freeze({ kind: "in-memory" });
+
 export interface FabricConnectionManagerOptions {
   now?: () => number;
   scheduler?: FabricDeadlineScheduler;
   terminalCapacity?: number;
   coordinator?: FabricStoreCoordinator;
+  advertisementAdmission?: FabricAdvertisementAdmission;
 }
 
 /** Authenticated inbound Connector data supplied by the Hub handshake. */
@@ -210,6 +232,9 @@ export class FabricConnectionManager {
   readonly #scheduler: FabricDeadlineScheduler;
   readonly #terminalCapacity: number;
   readonly #coordinator?: FabricStoreCoordinator;
+  readonly #advertisementAdmission: FabricAdvertisementAdmission;
+  #advertisementAdmissionEpoch = 0;
+  #advertisementAdmissionOpen = true;
 
   constructor(
     readonly directory: FabricDirectory,
@@ -220,6 +245,7 @@ export class FabricConnectionManager {
     this.#scheduler = options.scheduler ?? defaultScheduler(this.#now);
     this.#terminalCapacity = options.terminalCapacity ?? 256;
     this.#coordinator = options.coordinator;
+    this.#advertisementAdmission = options.advertisementAdmission ?? IN_MEMORY_FABRIC_ADVERTISEMENT_ADMISSION;
     if (!Number.isSafeInteger(this.#terminalCapacity) || this.#terminalCapacity < 0) {
       throw new FabricContractError("invalid_argument", "terminalCapacity must be a non-negative safe integer", "terminalCapacity");
     }
@@ -376,6 +402,8 @@ export class FabricConnectionManager {
     request: FabricInboundConnectionRequest,
     owner: FabricManagedConnectionOwner,
   ): Promise<PublicConnectionLease> {
+    const admissionEpoch = this.#advertisementAdmissionEpoch;
+    this.#assertAdvertisementAdmission(admissionEpoch);
     assertFabricIdentifier(request.requestId, "requestId");
     assertFabricIdentifier(request.connectorId, "connectorId");
     assertGeneration(request.expectedCredentialGeneration, "expectedCredentialGeneration");
@@ -410,6 +438,7 @@ export class FabricConnectionManager {
     let committed = false;
     try {
       reservation = await this.#reserveInboundConnection(request, device.deviceId);
+      this.#assertAdvertisementAdmission(admissionEpoch);
       // The reservation is the durable generation fence. Mirror that fence in
       // memory before any later await so the overwritten predecessor can no
       // longer authorize work even when admission subsequently fails.
@@ -444,6 +473,7 @@ export class FabricConnectionManager {
       const durableRevision = reservation === undefined
         ? undefined
         : await this.#commitDurableConnection(reservation, lease, checkedAt);
+      this.#assertAdvertisementAdmission(admissionEpoch);
       checkedAt = this.#now();
       this.#assertInboundAuthority(request, connector, device, checkedAt);
       const managed: ManagedConnection = {
@@ -784,51 +814,155 @@ export class FabricConnectionManager {
     return false;
   }
 
+  /**
+   * Synchronous compatibility path. Durable production embeddings must use
+   * admitAdvertisement() so persistence and post-await fencing are observable.
+   */
   acceptAdvertisement(snapshot: FabricAdvertisementSnapshot): PublicConnectionLease {
-    const now = this.#now();
-    assertFabricIdentifier(snapshot.connectionId, "connectionId");
-    assertGeneration(snapshot.connectionGeneration, "connectionGeneration");
-    if (!this.#activeById.has(snapshot.connectionId)) {
-      throw new FabricContractError("stale_generation", "Advertisement connection is not current", "connectionId");
-    }
-    const managed = this.#requireCurrent(snapshot.connectionId, snapshot.connectionGeneration);
-    this.#revalidateAuthority(managed, now);
-    if (!["connected", "ready"].includes(managed.state.phase) || managed.state.connection?.state !== "connected") {
-      throw new FabricContractError("invalid_state", "Only a connected, non-draining connection may advertise", "state");
-    }
-    const lease = managed.state.connection;
-    const accepted = this.directory[FABRIC_DIRECTORY_ADVERTISEMENT_AUTHORITY]({
-      connectionId: lease.connectionId,
-      connectionGeneration: lease.generation,
-      connectorId: lease.connectorId,
-      capabilityDigest: lease.capabilityDigest,
-      limits: managed.negotiatedLimits,
-    }, snapshot);
+    this.#requireSynchronousAdvertisementAdapter();
+    const managed = this.#requireAdvertisable(snapshot.connectionId, snapshot.connectionGeneration, false);
+    const lease = managed.state.connection!;
+    const accepted = this.directory[FABRIC_DIRECTORY_ADVERTISEMENT_AUTHORITY](this.#advertisementContext(managed), snapshot);
     managed.advertisement = accepted;
     managed.state = markConnectionReady(managed.state);
     managed.ready = true;
     return projectConnection(lease);
   }
 
+  /** Synchronous compatibility path for in-memory embeddings only. */
   acceptAdvertisementDelta(delta: FabricAdvertisementDelta): PublicConnectionLease {
-    const now = this.#now();
+    this.#requireSynchronousAdvertisementAdapter();
+    const managed = this.#requireAdvertisable(delta.connectionId, delta.connectionGeneration, true);
+    const lease = managed.state.connection!;
+    const accepted = this.directory[FABRIC_DIRECTORY_ADVERTISEMENT_AUTHORITY](this.#advertisementContext(managed), delta);
+    managed.advertisement = accepted;
+    return projectConnection(lease);
+  }
+
+  /**
+   * Permanently revokes advertisement publication for this manager instance and
+   * synchronously withdraws every executable connection before transport drain.
+   */
+  fenceAdvertisementAdmission(reason = "Fabric advertisement admission was fenced"): void {
+    if (!this.#advertisementAdmissionOpen) return;
+    this.#advertisementAdmissionOpen = false;
+    this.#advertisementAdmissionEpoch += 1;
+    for (const managed of [...this.#activeById.values()]) this.#fenceAndClose(managed, reason);
+  }
+
+  /** Validate → persist → record offline evidence → owner revalidate → publish ready. */
+  async admitAdvertisement(snapshot: FabricAdvertisementSnapshot): Promise<PublicConnectionLease> {
+    assertFabricIdentifier(snapshot.connectionId, "connectionId");
+    assertGeneration(snapshot.connectionGeneration, "connectionGeneration");
+    const admissionEpoch = this.#advertisementAdmissionEpoch;
+    this.#assertAdvertisementAdmission(admissionEpoch);
+    const managed = this.#requireCurrent(snapshot.connectionId, snapshot.connectionGeneration);
+    return this.#enqueueAdvertisement(managed, snapshot, false, admissionEpoch);
+  }
+
+  /** Durable atomic delta admission on the exact accepted connection revision. */
+  async admitAdvertisementDelta(delta: FabricAdvertisementDelta): Promise<PublicConnectionLease> {
     assertFabricIdentifier(delta.connectionId, "connectionId");
     assertGeneration(delta.connectionGeneration, "connectionGeneration");
+    const admissionEpoch = this.#advertisementAdmissionEpoch;
+    this.#assertAdvertisementAdmission(admissionEpoch);
     const managed = this.#requireCurrent(delta.connectionId, delta.connectionGeneration);
-    this.#revalidateAuthority(managed, now);
-    if (!managed.ready || managed.state.phase !== "ready" || managed.state.connection?.state !== "connected") {
-      throw new FabricContractError("invalid_state", "Advertisement deltas require a ready connection", "state");
+    return this.#enqueueAdvertisement(managed, delta, true, admissionEpoch);
+  }
+
+  async #enqueueAdvertisement(
+    managed: ManagedConnection,
+    input: FabricAdvertisementSnapshot | FabricAdvertisementDelta,
+    delta: boolean,
+    admissionEpoch: number,
+  ): Promise<PublicConnectionLease> {
+    let persistenceEntered = false;
+    try {
+      return await this.#enqueueLifecycle(managed, async () => {
+        const connectionId = input.connectionId;
+        const connectionGeneration = input.connectionGeneration;
+        this.#assertAdvertisementAdmission(admissionEpoch);
+        this.#assertManagedIdentity(managed, connectionId, connectionGeneration);
+        this.#requireAdvertisable(connectionId, connectionGeneration, delta, managed);
+        const candidate = this.directory[FABRIC_DIRECTORY_STAGE_ADVERTISEMENT](this.#advertisementContext(managed), input);
+        if (this.#advertisementAdmission.kind === "durable") {
+          persistenceEntered = true;
+          await this.#advertisementAdmission.persist(candidate);
+          this.#assertAdvertisementAdmission(admissionEpoch);
+          // Durable success remains restart-visible even if the exact owner is
+          // fenced after commit; only a still-current admission may mirror it
+          // into memory or proceed to executable publication.
+          this.directory[FABRIC_DIRECTORY_RECORD_PERSISTED_ADVERTISEMENT](candidate);
+        }
+        this.#assertAdvertisementAdmission(admissionEpoch);
+        this.#assertManagedIdentity(managed, connectionId, connectionGeneration);
+        this.#requireAdvertisable(connectionId, connectionGeneration, delta, managed);
+        this.#assertAdvertisementAdmission(admissionEpoch);
+        const accepted = this.directory[FABRIC_DIRECTORY_PUBLISH_ADVERTISEMENT](candidate);
+        const lease = managed.state.connection!;
+        managed.advertisement = accepted;
+        if (!delta) {
+          managed.state = markConnectionReady(managed.state);
+          managed.ready = true;
+        }
+        return projectConnection(lease);
+      });
+    } catch (error) {
+      if (persistenceEntered) this.#fenceAndClose(managed, "advertisement persistence or owner revalidation failed");
+      throw error;
     }
-    const lease = managed.state.connection;
-    const accepted = this.directory[FABRIC_DIRECTORY_ADVERTISEMENT_AUTHORITY]({
+  }
+
+  #assertAdvertisementAdmission(expectedEpoch: number): void {
+    if (!this.#advertisementAdmissionOpen || expectedEpoch !== this.#advertisementAdmissionEpoch) {
+      throw new FabricContractError("unavailable", "Fabric advertisement admission is fenced", "advertisementAdmission");
+    }
+  }
+
+  #requireSynchronousAdvertisementAdapter(): void {
+    this.#assertAdvertisementAdmission(this.#advertisementAdmissionEpoch);
+    if (this.#advertisementAdmission.kind !== "in-memory") {
+      throw new FabricContractError("invalid_state", "Durable advertisement admission must be awaited through admitAdvertisement", "advertisementAdmission");
+    }
+  }
+
+  #advertisementContext(managed: ManagedConnection): DirectoryAdvertisementAuthorityContext {
+    const lease = managed.state.connection!;
+    return {
       connectionId: lease.connectionId,
       connectionGeneration: lease.generation,
       connectorId: lease.connectorId,
+      credentialGeneration: managed.authorityConnector.credentialGeneration,
       capabilityDigest: lease.capabilityDigest,
       limits: managed.negotiatedLimits,
-    }, delta);
-    managed.advertisement = accepted;
-    return projectConnection(lease);
+      preparedAt: this.#now(),
+    };
+  }
+
+  #requireAdvertisable(
+    connectionId: string,
+    connectionGeneration: number,
+    delta: boolean,
+    expected?: ManagedConnection,
+  ): ManagedConnection {
+    assertFabricIdentifier(connectionId, "connectionId");
+    assertGeneration(connectionGeneration, "connectionGeneration");
+    if (!this.#activeById.has(connectionId)) {
+      throw new FabricContractError("stale_generation", "Advertisement connection is not current", "connectionId");
+    }
+    const managed = this.#requireCurrent(connectionId, connectionGeneration);
+    if (expected !== undefined && managed !== expected) {
+      throw new FabricContractError("stale_generation", "Connection owner changed during advertisement admission", "connectionId");
+    }
+    this.#revalidateAuthority(managed, this.#now());
+    if (delta) {
+      if (!managed.ready || managed.state.phase !== "ready" || managed.state.connection?.state !== "connected") {
+        throw new FabricContractError("invalid_state", "Advertisement deltas require a ready connection", "state");
+      }
+    } else if (!["connected", "ready"].includes(managed.state.phase) || managed.state.connection?.state !== "connected") {
+      throw new FabricContractError("invalid_state", "Only a connected, non-draining connection may advertise", "state");
+    }
+    return managed;
   }
 
   get(connectionId: string): PublicConnectionLease | undefined {
@@ -1078,6 +1212,14 @@ export class FabricConnectionManager {
 
   #fenceMemory(managed: ManagedConnection): void {
     managed.closureStarted = true;
+    const advertisedLease = managed.state.connection;
+    if (advertisedLease !== undefined) {
+      this.directory[FABRIC_DIRECTORY_WITHDRAW_ADVERTISEMENT](
+        advertisedLease.connectionId,
+        advertisedLease.generation,
+        advertisedLease.connectorId,
+      );
+    }
     if (managed.state.phase !== "closed") {
       const closed = closeConnection(managed.state);
       if (closed.connection === undefined) throw new FabricContractError("invalid_state", "Close lost its connection state");

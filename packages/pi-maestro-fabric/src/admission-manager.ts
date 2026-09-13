@@ -1,6 +1,8 @@
 import {
   FabricContractError,
   assertEpochMilliseconds,
+  assertFabricIdentifier,
+  assertGeneration,
   assertRevision,
   assertValidEndpointRouteHandle,
   assertValidWorkspaceBinding,
@@ -11,11 +13,27 @@ import {
 } from "pi-maestro-fabric-core/v1";
 import { FabricConnectionManager } from "./connection-manager.ts";
 import { FabricDirectory } from "./directory.ts";
-import { FabricStoreCoordinator, type FabricStoredRecord } from "./store-coordinator.ts";
+import {
+  FabricStoreCoordinator,
+  type FabricStoreCommitPlan,
+  type FabricStoredRecord,
+} from "./store-coordinator.ts";
 
 export interface FabricAdmissionManagerOptions {
   now?: () => number;
   coordinator?: FabricStoreCoordinator;
+}
+
+/** Host-private local authority attached atomically to a durable public binding. */
+export interface FabricWorkspaceBindingAuthorization {
+  readonly localWorkspaceId: string;
+  readonly localWorkspaceGeneration: number;
+}
+
+/** Host-private cascade result; control-plane callers must expose only `binding`. */
+export interface FabricAdmissionUnbindResult {
+  readonly binding: WorkspaceBinding;
+  readonly closedRoutes: readonly EndpointRouteHandle[];
 }
 
 function storedRecord(value: Record<string, unknown>): FabricStoredRecord {
@@ -32,9 +50,21 @@ function recordRevision(record: FabricStoredRecord, path: string): number {
   return record.revision;
 }
 
+function compareBindingAuthorizationOrder(
+  left: { readonly bindingId?: unknown; readonly issuedAt?: unknown },
+  right: { readonly bindingId?: unknown; readonly issuedAt?: unknown },
+): number {
+  const issuedAtOrder = Number(right.issuedAt ?? 0) - Number(left.issuedAt ?? 0);
+  if (issuedAtOrder !== 0) return issuedAtOrder;
+  const leftId = String(left.bindingId ?? "");
+  const rightId = String(right.bindingId ?? "");
+  return leftId === rightId ? 0 : leftId < rightId ? -1 : 1;
+}
+
 /** Workspace binding and Endpoint route admission, with optional durable CAS authority. */
 export class FabricAdmissionManager {
   readonly #bindings = new Map<string, WorkspaceBinding>();
+  readonly #bindingAuthorizations = new Map<string, FabricWorkspaceBindingAuthorization>();
   readonly #routes = new Map<string, EndpointRouteHandle>();
   readonly #now: () => number;
   readonly #coordinator?: FabricStoreCoordinator;
@@ -61,8 +91,16 @@ export class FabricAdmissionManager {
     return { ...stored };
   }
 
-  async bindDurable(binding: WorkspaceBinding): Promise<WorkspaceBinding> {
-    if (this.#coordinator === undefined) return this.bind(binding);
+  async bindDurable(
+    binding: WorkspaceBinding,
+    authorization?: FabricWorkspaceBindingAuthorization,
+  ): Promise<WorkspaceBinding> {
+    if (authorization !== undefined) this.#assertBindingAuthorization(authorization);
+    if (this.#coordinator === undefined) {
+      const stored = this.bind(binding);
+      if (authorization !== undefined) this.#bindingAuthorizations.set(stored.bindingId, { ...authorization });
+      return stored;
+    }
     if (binding.revision !== 0) throw new FabricContractError("conflict", "New workspace binding revision must be zero", "revision");
     const connectorId = this.#assertBinding(binding);
     const now = this.#now();
@@ -76,7 +114,7 @@ export class FabricAdmissionManager {
         mutations: [{
           kind: "upsert",
           subjectId: binding.bindingId,
-          value: storedRecord({ ...stored, kind: "binding" }),
+          value: storedRecord({ ...stored, kind: "binding", ...authorization }),
           eventKind: "binding.issued",
           payload: {
             bindingId: stored.bindingId,
@@ -98,7 +136,85 @@ export class FabricAdmissionManager {
       throw error;
     }
     this.#bindings.set(stored.bindingId, stored);
+    if (authorization !== undefined) this.#bindingAuthorizations.set(stored.bindingId, { ...authorization });
     return { ...stored };
+  }
+
+  /**
+   * Resolve host-private local authority only while its public binding still
+   * matches live and durable remote authority. Durable records are consulted
+   * on every call so restart never depends on process-local mapping state.
+   */
+  async resolveLocalWorkspaceAuthorization(
+    fabricWorkspaceId: string,
+  ): Promise<FabricWorkspaceBindingAuthorization | undefined> {
+    assertFabricIdentifier(fabricWorkspaceId, "workspaceId");
+    if (this.#coordinator === undefined) {
+      const candidates = [...this.#bindings.values()]
+        .filter((binding) => binding.workspaceId === fabricWorkspaceId)
+        .sort(compareBindingAuthorizationOrder);
+      for (const binding of candidates) {
+        const authorization = this.#bindingAuthorizations.get(binding.bindingId);
+        if (authorization === undefined) continue;
+        try {
+          this.#assertBinding(binding);
+          return { ...authorization };
+        } catch (error) {
+          if (error instanceof FabricContractError) continue;
+          throw error;
+        }
+      }
+      return undefined;
+    }
+
+    const snapshot = await this.#coordinator.readStore("lease");
+    const candidates = Object.values(snapshot.records)
+      .filter((record) => record.kind === "binding" && record.workspaceId === fabricWorkspaceId && record.revokedAt === undefined)
+      .sort(compareBindingAuthorizationOrder);
+    for (const record of candidates) {
+      const binding = this.#bindingFromRecord(record);
+      const authorization = this.#authorizationFromRecord(record);
+      if (authorization === undefined) continue;
+      try {
+        const connectorId = this.#assertBinding(binding);
+        this.#assertDurableConnection(snapshot.records, connectorId, binding.connectionId, binding.connectionGeneration, this.#now());
+        return authorization;
+      } catch (error) {
+        if (error instanceof FabricContractError) continue;
+        throw error;
+      }
+    }
+    return undefined;
+  }
+
+  /** Resolve the private local authority persisted for one exact current binding. */
+  async resolveLocalWorkspaceBindingAuthorization(
+    bindingId: string,
+  ): Promise<FabricWorkspaceBindingAuthorization | undefined> {
+    assertFabricIdentifier(bindingId, "bindingId");
+    if (this.#coordinator === undefined) {
+      const binding = this.#bindings.get(bindingId);
+      const authorization = this.#bindingAuthorizations.get(bindingId);
+      if (binding === undefined || authorization === undefined) return undefined;
+      this.#assertBinding(binding);
+      return { ...authorization };
+    }
+
+    const snapshot = await this.#coordinator.readStore("lease");
+    const record = snapshot.records[bindingId];
+    if (record?.kind !== "binding" || record.revokedAt !== undefined) return undefined;
+    const binding = this.#bindingFromRecord(record);
+    const authorization = this.#authorizationFromRecord(record);
+    if (authorization === undefined) return undefined;
+    const connectorId = this.#assertBinding(binding);
+    this.#assertDurableConnection(
+      snapshot.records,
+      connectorId,
+      binding.connectionId,
+      binding.connectionGeneration,
+      this.#now(),
+    );
+    return authorization;
   }
 
   async renewBinding(bindingId: string, expectedRevision: number, expiresAt: number): Promise<WorkspaceBinding> {
@@ -128,7 +244,110 @@ export class FabricAdmissionManager {
     const next = { ...current, revision: current.revision + 1 };
     await this.#revokeDurableBinding(next, this.#now(), current.revision);
     this.#bindings.delete(bindingId);
+    this.#bindingAuthorizations.delete(bindingId);
     return { ...next };
+  }
+
+  /**
+   * Revoke one binding and close every open Route owned by it in one lease-store
+   * CAS. Closed handles are host-private cleanup authority, not protocol output.
+   */
+  async unbindWithRoutes(bindingId: string, expectedRevision: number): Promise<FabricAdmissionUnbindResult> {
+    assertFabricIdentifier(bindingId, "bindingId");
+    assertRevision(expectedRevision, "expectedRevision");
+    const at = this.#now();
+
+    if (this.#coordinator === undefined) {
+      const current = await this.#loadBinding(bindingId);
+      if (current.revision !== expectedRevision) {
+        throw new FabricContractError("conflict", "Workspace binding revision is stale", "expectedRevision");
+      }
+      const binding = { ...current, revision: current.revision + 1 };
+      const closedRoutes = [...this.#routes.values()]
+        .filter((route) => route.workspaceBindingId === bindingId && route.state === "open")
+        .sort((left, right) => left.routeId.localeCompare(right.routeId))
+        .map((route) => {
+          const closed = { ...route, state: "closed" as const, revision: route.revision + 1 };
+          assertValidEndpointRouteHandle(closed);
+          return closed;
+        });
+      this.#bindings.delete(bindingId);
+      this.#bindingAuthorizations.delete(bindingId);
+      for (const route of closedRoutes) this.#routes.set(route.routeId, route);
+      return { binding: { ...binding }, closedRoutes: closedRoutes.map((route) => ({ ...route })) };
+    }
+
+    const result = await this.#coordinator.commit("lease", at, (store): FabricStoreCommitPlan<FabricAdmissionUnbindResult> => {
+      const bindingRecord = store.records[bindingId];
+      if (
+        bindingRecord?.kind !== "binding" || bindingRecord.revision !== expectedRevision ||
+        bindingRecord.revokedAt !== undefined
+      ) {
+        throw new FabricContractError("conflict", "Workspace binding revision is stale", "expectedRevision");
+      }
+      const durableBinding = this.#bindingFromRecord(bindingRecord);
+      const binding = { ...durableBinding, revision: expectedRevision + 1 };
+      const routes = Object.values(store.records)
+        .filter((record) => record.kind === "route" && record.workspaceBindingId === bindingId && record.state === "open")
+        .map((record) => ({ record, route: this.#routeFromRecord(record) }))
+        .sort((left, right) => left.route.routeId.localeCompare(right.route.routeId));
+      const closedRoutes = routes.map(({ route }) => {
+        const closed = { ...route, state: "closed" as const, revision: route.revision + 1 };
+        assertValidEndpointRouteHandle(closed);
+        return closed;
+      });
+      return {
+        mutations: [{
+          kind: "upsert",
+          subjectId: bindingId,
+          expectedRevision,
+          value: storedRecord({ ...bindingRecord, ...binding, kind: "binding", revokedAt: at }),
+          eventKind: "binding.revoked",
+          payload: {
+            bindingId: binding.bindingId,
+            connectionId: binding.connectionId,
+            deviceId: binding.deviceId,
+            workspaceId: binding.workspaceId,
+            revokedAt: at,
+          },
+        }, ...routes.map(({ record, route }, index) => {
+          const closed = closedRoutes[index]!;
+          return {
+            kind: "upsert" as const,
+            subjectId: route.routeId,
+            expectedRevision: route.revision,
+            value: storedRecord({ ...record, ...closed, kind: "route" }),
+            eventKind: "route.closed",
+            payload: {
+              routeId: closed.routeId,
+              connectionId: closed.connectionId,
+              endpointId: closed.endpointId,
+              connectionGeneration: closed.connectionGeneration,
+              endpointGeneration: closed.endpointGeneration,
+              routeRevision: closed.revision,
+              state: "closed",
+            },
+          };
+        })],
+        value: { binding, closedRoutes },
+      };
+    });
+
+    this.#bindings.delete(bindingId);
+    this.#bindingAuthorizations.delete(bindingId);
+    for (const route of result.closedRoutes) {
+      this.#routes.set(route.routeId, {
+        ...route,
+        pathCandidates: route.pathCandidates === undefined ? undefined : [...route.pathCandidates],
+      });
+    }
+    return {
+      binding: { ...result.binding },
+      closedRoutes: result.closedRoutes.map((route) => ({
+        ...route,
+        pathCandidates: route.pathCandidates === undefined ? undefined : [...route.pathCandidates],
+      })),
+    };
   }
 
   openRoute(route: EndpointRouteHandle): EndpointRouteHandle {
@@ -276,6 +495,14 @@ export class FabricAdmissionManager {
 
   #assertBinding(binding: WorkspaceBinding): string {
     assertValidWorkspaceBinding(binding, this.#now());
+    // Fence the exact live owner before consulting Directory projections. A
+    // disconnect or authority rotation withdraws those projections, but must
+    // remain distinguishable from a never-registered workspace.
+    const connectorId = this.connections.requireReadyForDevice(
+      binding.connectionId,
+      binding.connectionGeneration,
+      binding.deviceId,
+    ).connectorId;
     const workspace = this.directory.getWorkspace(binding.workspaceId);
     if (workspace === undefined) throw new FabricContractError("not_found", "Workspace is not registered", "workspaceId");
     if (
@@ -285,7 +512,7 @@ export class FabricAdmissionManager {
       throw new FabricContractError("stale_generation", "Workspace binding does not match current workspace authority", "workspaceId");
     }
     this.connections.admitWorkspaceBinding(binding);
-    return this.connections.requireReadyForDevice(binding.connectionId, binding.connectionGeneration, binding.deviceId).connectorId;
+    return connectorId;
   }
 
   #assertRoute(route: EndpointRouteHandle): string {
@@ -324,6 +551,21 @@ export class FabricAdmissionManager {
     const route = this.#routeFromRecord(record);
     this.#routes.set(routeId, route);
     return { ...route };
+  }
+
+  #assertBindingAuthorization(authorization: FabricWorkspaceBindingAuthorization): void {
+    assertFabricIdentifier(authorization.localWorkspaceId, "localWorkspaceId");
+    assertGeneration(authorization.localWorkspaceGeneration, "localWorkspaceGeneration");
+  }
+
+  #authorizationFromRecord(record: FabricStoredRecord): FabricWorkspaceBindingAuthorization | undefined {
+    if (record.localWorkspaceId === undefined && record.localWorkspaceGeneration === undefined) return undefined;
+    const authorization = {
+      localWorkspaceId: record.localWorkspaceId,
+      localWorkspaceGeneration: record.localWorkspaceGeneration,
+    } as FabricWorkspaceBindingAuthorization;
+    this.#assertBindingAuthorization(authorization);
+    return authorization;
   }
 
   #bindingFromRecord(record: FabricStoredRecord): WorkspaceBinding {
@@ -412,7 +654,7 @@ export class FabricAdmissionManager {
           kind: "upsert",
           subjectId: binding.bindingId,
           expectedRevision,
-          value: storedRecord({ ...binding, kind: "binding" }),
+          value: storedRecord({ ...current, ...binding, kind: "binding" }),
           eventKind,
           payload: { bindingId: binding.bindingId, connectionId: binding.connectionId, deviceId: binding.deviceId, workspaceId: binding.workspaceId, connectionGeneration: binding.connectionGeneration, workspaceGeneration: binding.workspaceGeneration, expiresAt: binding.expiresAt },
         }],
@@ -433,7 +675,7 @@ export class FabricAdmissionManager {
           kind: "upsert",
           subjectId: binding.bindingId,
           expectedRevision,
-          value: storedRecord({ ...binding, kind: "binding", revokedAt, revision: expectedRevision + 1 }),
+          value: storedRecord({ ...current, ...binding, kind: "binding", revokedAt, revision: expectedRevision + 1 }),
           eventKind: "binding.revoked",
           payload: { bindingId: binding.bindingId, connectionId: binding.connectionId, deviceId: binding.deviceId, workspaceId: binding.workspaceId, revokedAt },
         }],

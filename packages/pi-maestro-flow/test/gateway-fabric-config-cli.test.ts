@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { generateKeyPairSync } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -109,6 +109,9 @@ async function writeConnectorConfig(root: string, overrides: Record<string, unkn
     audience: "fabric",
     credentialGeneration: 1,
     privateKeyPath,
+    devices: [{ deviceId: "device-laptop", connectorId: "connector-laptop", label: "Laptop", connectionMode: "https", enabled: true, revision: 1 }],
+    localDeviceId: "device-laptop",
+    workspaceIds: [],
     revision: 1,
     ...overrides,
   }));
@@ -138,7 +141,7 @@ test("connector status reports configuration without dialling the Hub", async (t
   assert.match(disabled.out.join(""), /configured but disabled/);
 });
 
-test("connector start refuses an unconfigured, disabled, or already-running Connector", async (t) => {
+test("connector start refuses an unconfigured, disabled, or legacy foreground Connector", async (t) => {
   const root = await connectorWorkspace(t);
   const unconfigured = capture();
   assert.equal(await fabricConnectorStart({ ...unconfigured.io, root }), 1);
@@ -153,39 +156,51 @@ test("connector start refuses an unconfigured, disabled, or already-running Conn
   await writeFile(fabricConnectorPidPath(root), String(process.pid));
   const running = capture();
   assert.equal(await fabricConnectorStart({ ...running.io, root }), 1);
-  assert.match(running.err.join(""), /already running/);
+  assert.match(running.err.join(""), /legacy foreground Connector PID marker.*not signalled/s);
 });
 
-test("connector start refuses a key that is missing or not Ed25519", async (t) => {
+test("legacy v1 status remains readable but start requires enrollment metadata", async (t) => {
+  const root = await connectorWorkspace(t);
+  await writeConnectorConfig(root, { devices: undefined, localDeviceId: undefined, workspaceIds: undefined });
+  const status = capture();
+  assert.equal(await fabricConnectorStatus({ ...status.io, root }), 0);
+  assert.match(status.out.join(""), /connector-laptop/);
+  const start = capture();
+  assert.equal(await fabricConnectorStart({ ...start.io, root }), 1);
+  assert.match(start.err.join(""), /predates Device enrollment metadata.*connector enroll\/upgrade/);
+});
+
+test("connector start forwards only daemon control outcomes", async (t) => {
   const root = await connectorWorkspace(t);
   await writeConnectorConfig(root);
-  await rm(join(root, ".pi", "connector-key.pem"));
-  const missing = capture();
-  assert.equal(await fabricConnectorStart({ ...missing.io, root }), 1);
-  assert.match(missing.err.join(""), /private key at .* could not be read/);
-
-  await writeConnectorConfig(root, { privateKeyPath: join(root, ".pi", "rsa-key.pem") });
-  const { privateKey } = generateKeyPairSync("rsa", { modulusLength: 2048 });
-  await writeFile(join(root, ".pi", "rsa-key.pem"), privateKey.export({ format: "pem", type: "pkcs8" }));
-  const wrongType = capture();
-  assert.equal(await fabricConnectorStart({ ...wrongType.io, root }), 1);
-  assert.match(wrongType.err.join(""), /is not an Ed25519 key/);
+  const attempted = capture();
+  assert.equal(await fabricConnectorStart({
+    ...attempted.io,
+    root,
+    control: {
+      fabricConnectorStatus: async () => ({ configured: false, state: "stopped", running: false }),
+      fabricConnectorStart: async () => { throw new Error("Connector credentials could not be loaded"); },
+      fabricConnectorStop: async () => { throw new Error("not used"); },
+    },
+  }), 1);
+  assert.match(attempted.err.join(""), /credentials could not be loaded/);
+  assert.doesNotMatch(attempted.err.join(""), /connector-key\.pem/u);
 });
 
-test("connector stop cleans up a stale pid file instead of reporting a live Connector", async (t) => {
+test("connector stop never signals or removes a legacy PID marker", async (t) => {
   const root = await connectorWorkspace(t);
   const none = capture();
   assert.equal(await fabricConnectorStop({ ...none.io, root }), 1);
-  assert.match(none.err.join(""), /No Fabric Connector is running/);
+  assert.match(none.err.join(""), /Gateway IPC control action is invalid|Gateway is offline|Gateway daemon is offline|Pi Maestro Gateway is offline/u);
 
-  // A pid that no longer exists must not be reported as a running Connector.
   await writeFile(fabricConnectorPidPath(root), "2147483646");
-  const stale = capture();
-  assert.equal(await fabricConnectorStop({ ...stale.io, root }), 1);
-  assert.match(stale.err.join(""), /no longer running; removed its stale pid file/);
+  const legacy = capture();
+  assert.equal(await fabricConnectorStop({ ...legacy.io, root }), 1);
+  assert.match(legacy.err.join(""), /legacy foreground Connector PID marker.*not signalled/s);
+  assert.equal(await readFile(fabricConnectorPidPath(root), "utf8"), "2147483646");
   const after = capture();
   assert.equal(await fabricConnectorStatus({ ...after.io, root }), 0);
-  assert.match(after.out.join(""), /not configured/);
+  assert.match(after.out.join(""), /legacy foreground Connector PID marker/u);
 });
 
 test("the connector command is reachable from the Gateway CLI", async (t) => {
@@ -211,5 +226,9 @@ test("the connector command is reachable from the Gateway CLI", async (t) => {
   usageErr.length = 0;
   assert.equal(await usage(["connector", "status", "--verbose"]), 1);
   assert.match(usageErr.join(""), /connector status does not accept --verbose/);
+  usageErr.length = 0;
+  assert.equal(await usage(["connector", "enroll", "raw_secret_must_not_echo"]), 1);
+  assert.doesNotMatch(usageErr.join(""), /raw_secret_must_not_echo/);
+  assert.match(usageErr.join(""), /tokens are never accepted in argv/);
   void root;
 });

@@ -22,7 +22,7 @@ import {
   type FabricAgentChannelTransport,
 } from "../src/gateway/fabric/agent-channel.ts";
 import { getFabricRouteResolverProvider } from "pi-maestro-teammate/v1/fabric-runtime";
-import type { FabricHttpsDispatchInput, FabricHttpsEventsResultV1 } from "../src/gateway/fabric/https-transport.ts";
+import type { FabricHttpsDispatchInput } from "../src/gateway/fabric/https-transport.ts";
 
 const NOW = Date.now();
 const PLACEMENT: TeammatePlacementV1 = {
@@ -69,7 +69,7 @@ function result(): SingleResult {
 
 /** A transport that answers exactly the Agent Endpoint operations this host sends. */
 class FakeTransport implements FabricAgentChannelTransport {
-  readonly dispatched: Array<{ operation: string; input: Record<string, JsonValue> }> = [];
+  readonly dispatched: Array<{ operation: string; deadlineAt: number; input: Record<string, JsonValue> }> = [];
   readonly queue: FabricPlacementEventV1[] = [];
   eventsFailure?: Error;
   sequence = 0;
@@ -80,7 +80,11 @@ class FakeTransport implements FabricAgentChannelTransport {
   }
 
   async dispatch(input: FabricHttpsDispatchInput): Promise<JsonValue> {
-    this.dispatched.push({ operation: input.operation, input: structuredClone(input.input) as Record<string, JsonValue> });
+    this.dispatched.push({
+      operation: input.operation,
+      deadlineAt: input.deadlineAt,
+      input: structuredClone(input.input) as Record<string, JsonValue>,
+    });
     switch (input.operation) {
       case "agent.start":
         return {
@@ -90,6 +94,17 @@ class FakeTransport implements FabricAgentChannelTransport {
           acceptedModel: "model-a", acceptedCapabilities: CAPABILITIES as unknown as JsonValue,
           receiptRef: "placement-1:start:1",
         } as unknown as JsonValue;
+      case "agent.events": {
+        if (this.eventsFailure !== undefined) throw this.eventsFailure;
+        const request = input.input as { afterSequence: number; limit?: number };
+        const events = this.queue
+          .filter((event) => event.sequence > request.afterSequence)
+          .slice(0, request.limit ?? 32);
+        return {
+          nextSequence: events.at(-1)?.sequence ?? request.afterSequence,
+          events,
+        } as unknown as JsonValue;
+      }
       case "agent.send":
         return {
           version: FABRIC_AGENT_ATTEMPT_VERSION, attemptId: "attempt-1", placementId: "placement-1",
@@ -120,16 +135,6 @@ class FakeTransport implements FabricAgentChannelTransport {
     }
   }
 
-  async events(input: { afterSequence: number; limit?: number }): Promise<FabricHttpsEventsResultV1> {
-    if (this.eventsFailure !== undefined) throw this.eventsFailure;
-    const events = this.queue.filter((event) => event.sequence > input.afterSequence).slice(0, input.limit ?? 32);
-    return {
-      version: "fabric.https.events.v1", kind: "events", requestId: "events-1", routeId: ROUTE.routeId,
-      endpointId: ENDPOINT.endpointId, endpointKind: "agent", endpointGeneration: 1,
-      deadlineAt: PLACEMENT.deadlineAt, nextSequence: events.at(-1)?.sequence ?? input.afterSequence,
-      events: events as unknown as FabricHttpsEventsResultV1["events"],
-    };
-  }
 }
 
 const authority: FabricAgentChannelAuthority = {
@@ -154,8 +159,8 @@ test("the origin resolver drives the Fabric backend over the paired transport", 
   const run = await backend.start(SPEC, { ...options(), onTurnComplete: (settled) => completions.push(settled.correlationId) });
   assert.deepEqual(
     transport.dispatched.map((entry) => entry.operation),
-    ["agent.start"],
-    "start must be the only dispatch before any source event arrives",
+    ["agent.start", "agent.events"],
+    "the first authoritative Agent event read starts only after start settles",
   );
 
   transport.push("output", { event: { type: "text", text: "working" } as JsonValue });
@@ -178,12 +183,19 @@ test("the origin resolver drives the Fabric backend over the paired transport", 
   assert.equal(outcome.result.messages[0]?.content, "source done");
   assert.deepEqual(completions, ["attempt-1"]);
   assert.deepEqual(await outcome.reclamation, { status: "reclaimed" });
+  assert.equal(
+    transport.dispatched.every((entry) => entry.deadlineAt === transport.dispatched[0]!.deadlineAt),
+    true,
+    "every post-start control must remain pinned to the start operation deadline",
+  );
 
   assert.equal(run.send("must be refused after settlement", "follow_up"), false);
   await new Promise((resolve) => setImmediate(resolve));
   // The origin asks the source for recovery facts and release evidence at
   // settlement, and never for a second attempt.
-  assert.deepEqual(transport.dispatched.map((entry) => entry.operation), [
+  assert.deepEqual(transport.dispatched
+    .map((entry) => entry.operation)
+    .filter((operation) => operation !== "agent.events"), [
     "agent.start", "agent.send", "agent.recover", "agent.reclaim",
   ]);
 });

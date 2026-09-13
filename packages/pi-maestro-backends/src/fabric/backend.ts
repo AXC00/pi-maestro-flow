@@ -28,6 +28,8 @@ import {
   type FabricAgentRunSpecV1,
   type FabricBackendChannelWaitResult,
   type FabricBackendRouteResolver,
+  type FabricBackendRouteResolverLease,
+  type FabricBackendRouteResolverSource,
   type PreparedFabricBackendChannel,
 } from "./channel.ts";
 import { fabricTurnResult, foldFabricOutcome } from "./outcome.ts";
@@ -152,9 +154,30 @@ async function closeChannel(channel: PreparedFabricBackendChannel, timeoutMs: nu
   }
 }
 
+function isResolverAcquirer(
+  source: FabricBackendRouteResolverSource,
+): source is Exclude<FabricBackendRouteResolverSource, FabricBackendRouteResolver> {
+  return "acquire" in source && typeof source.acquire === "function";
+}
+
+function validResolverLease(lease: FabricBackendRouteResolverLease): void {
+  if (!Number.isSafeInteger(lease.generation) || lease.generation < 1) {
+    throw new TypeError("Fabric route resolver lease generation must be a positive safe integer");
+  }
+  if (typeof lease.ownerId !== "string" || lease.ownerId.length === 0) {
+    throw new TypeError("Fabric route resolver lease ownerId must be non-empty");
+  }
+  if (!lease.resolver || typeof lease.resolver.prepare !== "function") {
+    throw new TypeError("Fabric route resolver lease must carry a resolver");
+  }
+  if (typeof lease.release !== "function") {
+    throw new TypeError("Fabric route resolver lease must implement release");
+  }
+}
+
 /** Create the route-pinned Fabric teammate backend. */
 export function createFabricBackend(
-  resolver: FabricBackendRouteResolver,
+  resolverSource: FabricBackendRouteResolverSource,
   backendOptions: FabricBackendOptions = {},
 ): TeammateBackend {
   const now = backendOptions.now ?? Date.now;
@@ -174,13 +197,47 @@ export function createFabricBackend(
       assertValidTeammatePlacement(placement, now());
       const startedAt = now();
       const lifetime = linkedSignal(placement.deadlineAt, options.signal, now);
-      let channel: PreparedFabricBackendChannel;
+      let resolver: FabricBackendRouteResolver;
+      let resolverLease: FabricBackendRouteResolverLease | undefined;
+      try {
+        if (isResolverAcquirer(resolverSource)) {
+          resolverLease = await resolverSource.acquire({
+            correlationId: options.correlationId,
+            placement,
+          }, lifetime.signal);
+          if (resolverLease === undefined) {
+            throw new FabricContractError(
+              "unavailable",
+              "Fabric route resolver provider is unavailable for this placed dispatch",
+              "placement",
+            );
+          }
+          validResolverLease(resolverLease);
+          resolver = resolverLease.resolver;
+        } else {
+          resolver = resolverSource;
+        }
+      } catch (error) {
+        lifetime.dispose();
+        if (resolverLease !== undefined) await resolverLease.release();
+        throw error;
+      }
+
+      let released = false;
+      const releaseResolver = async (): Promise<void> => {
+        if (released) return;
+        released = true;
+        await resolverLease?.release();
+      };
+      let channel: PreparedFabricBackendChannel | undefined;
       try {
         channel = await resolver.prepare({ placement, attemptId: options.correlationId }, lifetime.signal);
         assertPreparedFabricChannel(channel, placement, now());
         assertSelection(spec, channel);
       } catch (error) {
         lifetime.dispose();
+        if (channel !== undefined) await closeChannel(channel, controlTimeoutMs);
+        await releaseResolver();
         throw error;
       }
 
@@ -199,7 +256,11 @@ export function createFabricBackend(
           try { options.onTurnComplete?.(result, result.terminalStatus); } catch { /* advisory */ }
         }
       };
-      const unsubscribe = channel.subscribe((event) => {
+      let unsubscribe = (): void => undefined;
+      let request: ReturnType<typeof fabricStartRequest>;
+      try {
+        request = fabricStartRequest(options.correlationId, placement, sourceSpec(spec), now());
+        unsubscribe = channel.subscribe((event) => {
         if (streamFailure !== undefined) return;
         try {
           assertFabricAgentEvent(event, placement.placementId);
@@ -224,9 +285,14 @@ export function createFabricBackend(
             now,
           ).catch(() => undefined);
         }
-      });
+        });
+      } catch (error) {
+        lifetime.dispose();
+        await closeChannel(channel, controlTimeoutMs);
+        await releaseResolver();
+        throw error;
+      }
 
-      const request = fabricStartRequest(options.correlationId, placement, sourceSpec(spec), now());
       let startAck: Awaited<ReturnType<typeof channel.start>> | undefined;
       let startFailure: string | undefined;
       try {
@@ -269,77 +335,83 @@ export function createFabricBackend(
       }
 
       const outcome = (async (): Promise<AttemptOutcome> => {
-        let wait: FabricBackendChannelWaitResult;
         try {
-          wait = await channel.wait(lifetime.signal);
-        } catch (error) {
-          wait = {
-            status: "transport-lost",
-            reason: streamFailure ?? startFailure ?? (error instanceof Error ? error.message : String(error)),
-          };
-        }
-        if (streamFailure !== undefined) wait = { status: "transport-lost", reason: streamFailure };
+          let wait: FabricBackendChannelWaitResult;
+          try {
+            wait = await channel.wait(lifetime.signal);
+          } catch (error) {
+            wait = {
+              status: "transport-lost",
+              reason: streamFailure ?? startFailure ?? (error instanceof Error ? error.message : String(error)),
+            };
+          }
+          if (streamFailure !== undefined) wait = { status: "transport-lost", reason: streamFailure };
 
-        let recoveryReceipt: Awaited<ReturnType<typeof channel.recover>> | undefined;
-        try {
-          recoveryReceipt = await boundedControl(
-            (signal) => channel.recover(options.correlationId, placement.placementId, signal),
-            placement.deadlineAt,
-            controlTimeoutMs,
-            now,
-          );
-          assertFabricAgentRecoveryReceipt(recoveryReceipt, options.correlationId, placement.placementId);
-        } catch {
-          // Missing recovery authority is represented explicitly by the fold.
-        }
-        const outcomeAdmitted = admitted && streamFailure === undefined;
-        if (outcomeAdmitted && !turnReported && recoveryReceipt?.result !== undefined) {
-          const recovered = recoveryReceipt.result;
-          if (
-            recovered.agent === spec.agent && recovered.task === spec.task &&
-            recovered.correlationId === options.correlationId
-          ) {
-            turnReported = true;
-            try { options.onTurnComplete?.(recovered, recovered.terminalStatus); } catch { /* advisory */ }
+          let recoveryReceipt: Awaited<ReturnType<typeof channel.recover>> | undefined;
+          try {
+            recoveryReceipt = await boundedControl(
+              (signal) => channel.recover(options.correlationId, placement.placementId, signal),
+              placement.deadlineAt,
+              controlTimeoutMs,
+              now,
+            );
+            assertFabricAgentRecoveryReceipt(recoveryReceipt, options.correlationId, placement.placementId);
+          } catch {
+            // Missing recovery authority is represented explicitly by the fold.
+          }
+          const outcomeAdmitted = admitted && streamFailure === undefined;
+          if (outcomeAdmitted && !turnReported && recoveryReceipt?.result !== undefined) {
+            const recovered = recoveryReceipt.result;
+            if (
+              recovered.agent === spec.agent && recovered.task === spec.task &&
+              recovered.correlationId === options.correlationId
+            ) {
+              turnReported = true;
+              try { options.onTurnComplete?.(recovered, recovered.terminalStatus); } catch { /* advisory */ }
+            }
+          }
+
+          let reclamationReceipt: Awaited<ReturnType<typeof channel.reclaim>> | undefined;
+          try {
+            reclamationReceipt = await boundedControl(
+              (signal) => channel.reclaim(options.correlationId, placement.placementId, signal),
+              placement.deadlineAt,
+              controlTimeoutMs,
+              now,
+            );
+            assertFabricAgentReclamationReceipt(reclamationReceipt, options.correlationId, placement.placementId);
+          } catch {
+            // Unknown release must remain unreaped; provider cleanup is separate.
+          }
+
+          const foldRecovery = outcomeAdmitted || recoveryReceipt === undefined
+            ? recoveryReceipt
+            : { ...recoveryReceipt, result: undefined };
+          return foldFabricOutcome({
+            spec,
+            correlationId: options.correlationId,
+            placementId: placement.placementId,
+            events: outcomeAdmitted ? events : [],
+            startAck: outcomeAdmitted ? startAck : undefined,
+            recoveryReceipt: foldRecovery,
+            reclamationReceipt,
+            wait: startFailure === undefined ? wait : {
+              status: "transport-lost",
+              reason: `start acknowledgement was not established: ${startFailure}`,
+            },
+            startedAt,
+            settledAt: now(),
+          });
+        } finally {
+          settled = true;
+          try { unsubscribe(); } catch { /* channel cleanup remains mandatory */ }
+          lifetime.dispose();
+          try {
+            await closeChannel(channel, controlTimeoutMs);
+          } finally {
+            await releaseResolver();
           }
         }
-
-        let reclamationReceipt: Awaited<ReturnType<typeof channel.reclaim>> | undefined;
-        try {
-          reclamationReceipt = await boundedControl(
-            (signal) => channel.reclaim(options.correlationId, placement.placementId, signal),
-            placement.deadlineAt,
-            controlTimeoutMs,
-            now,
-          );
-          assertFabricAgentReclamationReceipt(reclamationReceipt, options.correlationId, placement.placementId);
-        } catch {
-          // Unknown release must remain unreaped.
-        }
-
-        const foldRecovery = outcomeAdmitted || recoveryReceipt === undefined
-          ? recoveryReceipt
-          : { ...recoveryReceipt, result: undefined };
-        const folded = foldFabricOutcome({
-          spec,
-          correlationId: options.correlationId,
-          placementId: placement.placementId,
-          events: outcomeAdmitted ? events : [],
-          startAck: outcomeAdmitted ? startAck : undefined,
-          recoveryReceipt: foldRecovery,
-          reclamationReceipt,
-          wait: startFailure === undefined ? wait : {
-            status: "transport-lost",
-            reason: `start acknowledgement was not established: ${startFailure}`,
-          },
-          startedAt,
-          settledAt: now(),
-        });
-        settled = true;
-        unsubscribe();
-        lifetime.dispose();
-        await closeChannel(channel, controlTimeoutMs);
-        return folded;
       })();
 
       return {

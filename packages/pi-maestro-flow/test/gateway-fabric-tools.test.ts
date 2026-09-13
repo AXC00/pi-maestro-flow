@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -120,7 +120,7 @@ async function setupRuntime(root: string) {
     },
   });
   await runtime.registry.register(root, { id: localWorkspaceId, mode: "permanent" });
-  return { runtime, directory, connections, connector, device, localWorkspaceId, opens: () => opens, closes };
+  return { runtime, directory, connections, admissions, connector, device, localWorkspaceId, opens: () => opens, closes };
 }
 
 function advertisement(connectionId: string, generation: number, localWorkspaceId: string): FabricAdvertisementSnapshot {
@@ -206,13 +206,83 @@ test("Gateway Fabric controls are explicit, manager-backed, authorized, audited,
   const renewed = resultData(await runtime.call("route", control("renew", {
     routeId: route.routeId, expectedRevision: route.revision, requestedTtlMs: 4_000,
   }), owner)).route as { revision: number };
+  const remoteCloses: string[] = [];
+  const disposeStaleCloser = runtime.installFabricRemoteRouteCloser(async () => {
+    remoteCloses.push("stale");
+  });
+  const disposeCurrentCloser = runtime.installFabricRemoteRouteCloser(async (routeId, reason) => {
+    assert.throws(() => fixture.admissions.validateRoute(routeId), /open|closed/i,
+      "remote cleanup ran before durable Route closure fenced admission");
+    remoteCloses.push(`${routeId}:${reason}`);
+  });
+  disposeStaleCloser();
   const closed = resultData(await runtime.call("route", control("close", {
     routeId: route.routeId, expectedRevision: renewed.revision,
   }), owner)).route as { state: string };
   assert.equal(closed.state, "closed");
-  assert.equal((resultData(await runtime.call("workspace", control("unbind", {
+  assert.deepEqual(remoteCloses, [`${route.routeId}:Fabric route closed`]);
+  disposeCurrentCloser();
+
+  const cleanupFailureRoute = resultData(await runtime.call("route", control("open", {
+    connectionId: connected.connectionId, workspaceBindingId: binding.bindingId, endpointId: "endpoint-1",
+    expectedConnectionGeneration: connected.generation, expectedWorkspaceGeneration: 1, expectedEndpointGeneration: 1,
+    requestedTtlMs: 2_000, operationClass: "mcp-read", pathCandidates: ["hub"],
+  }), owner)).route as { routeId: string; revision: number };
+  const disposeFailingCloser = runtime.installFabricRemoteRouteCloser(async () => {
+    throw new Error("remote abort receipt unavailable");
+  });
+  const cleanupFailure = await runtime.call("route", control("close", {
+    routeId: cleanupFailureRoute.routeId, expectedRevision: cleanupFailureRoute.revision,
+  }), owner);
+  assert.equal(cleanupFailure.ok, false);
+  assert.match(cleanupFailure.error?.message ?? "", /remote abort receipt unavailable/);
+  assert.equal((await fixture.admissions.getRouteDurable(cleanupFailureRoute.routeId))?.state, "closed",
+    "remote cleanup failure rolled back the durable Route fence");
+  disposeFailingCloser();
+
+  const unbindRoute = resultData(await runtime.call("route", control("open", {
+    connectionId: connected.connectionId, workspaceBindingId: binding.bindingId, endpointId: "endpoint-1",
+    expectedConnectionGeneration: connected.generation, expectedWorkspaceGeneration: 1, expectedEndpointGeneration: 1,
+    requestedTtlMs: 2_000, operationClass: "mcp-read", pathCandidates: ["hub"],
+  }), owner)).route as { routeId: string; revision: number };
+  const unbindCloses: string[] = [];
+  const disposeUnbindCloser = runtime.installFabricRemoteRouteCloser(async (routeId, reason) => {
+    assert.throws(() => fixture.admissions.validateRoute(routeId), /open|closed/i,
+      "workspace cleanup ran before the atomic durable fence");
+    unbindCloses.push(`${routeId}:${reason}`);
+  });
+  const unbindResult = resultData(await runtime.call("workspace", control("unbind", {
     workspaceBindingId: binding.bindingId, expectedRevision: binding.revision,
-  }), owner)).binding as { bindingId: string }).bindingId, binding.bindingId);
+  }), owner));
+  assert.deepEqual(Object.keys(unbindResult), ["binding"], "closed Route cleanup handles escaped the public response");
+  assert.equal((unbindResult.binding as { bindingId: string }).bindingId, binding.bindingId);
+  assert.deepEqual(unbindCloses, [`${unbindRoute.routeId}:Fabric workspace unbound`]);
+  assert.equal((await fixture.admissions.getRouteDurable(unbindRoute.routeId))?.state, "closed");
+  disposeUnbindCloser();
+
+  const rebound = resultData(await runtime.call("workspace", control("bind", {
+    deviceId: "device-1", connectionId: connected.connectionId, workspaceId: "fabric-workspace-1",
+    expectedConnectionGeneration: connected.generation, expectedWorkspaceGeneration: 1, requestedTtlMs: 5_000,
+  }), owner)).binding as { bindingId: string; revision: number };
+  const failedCleanupRoute = resultData(await runtime.call("route", control("open", {
+    connectionId: connected.connectionId, workspaceBindingId: rebound.bindingId, endpointId: "endpoint-1",
+    expectedConnectionGeneration: connected.generation, expectedWorkspaceGeneration: 1, expectedEndpointGeneration: 1,
+    requestedTtlMs: 2_000, operationClass: "mcp-read", pathCandidates: ["hub"],
+  }), owner)).route as { routeId: string; revision: number };
+  const disposeFailingUnbindCloser = runtime.installFabricRemoteRouteCloser(async () => {
+    throw new Error("workspace remote abort receipt unavailable");
+  });
+  const unbindCleanupFailure = await runtime.call("workspace", control("unbind", {
+    workspaceBindingId: rebound.bindingId, expectedRevision: rebound.revision,
+  }), owner);
+  assert.equal(unbindCleanupFailure.ok, false);
+  assert.match(unbindCleanupFailure.error?.message ?? "", /workspace remote abort receipt unavailable/);
+  assert.equal(await fixture.admissions.getBindingDurable(rebound.bindingId), undefined,
+    "cleanup failure rolled back the durable binding fence");
+  assert.equal((await fixture.admissions.getRouteDurable(failedCleanupRoute.routeId))?.state, "closed",
+    "cleanup failure rolled back the durable Route fence");
+  disposeFailingUnbindCloser();
+
   assert.equal((resultData(await runtime.call("device", control("disconnect", {
     deviceId: "device-1", connectionId: connected.connectionId, expectedConnectionGeneration: connected.generation,
   }), owner)).connection as { state: string }).state, "closed");
@@ -235,6 +305,138 @@ function configuredAudit(runtime: GatewayRuntime): string {
   return runtime.config.logging.auditFile;
 }
 
+test("default composition binds an explicit generation-fenced local workspace without public leakage", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "gateway-fabric-default-bind-"));
+  const config = createTestGatewayConfig(root, { mode: "bearer", token: "default-bind-token" });
+  config.fabric = { enabled: true };
+  const runtime = await GatewayRuntime.create({ config, cwd: root });
+  t.after(async () => {
+    await runtime.close();
+    await rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
+  });
+  const composition = runtime.fabricComposition;
+  assert(composition);
+  const local = await runtime.registry.register(root, { id: "local-workspace-1", mode: "permanent" });
+  const otherRoot = join(root, "other-workspace");
+  await mkdir(otherRoot);
+  const otherLocal = await runtime.registry.register(otherRoot, { id: "local-workspace-2", mode: "permanent" });
+  const connector = {
+    connectorId: "connector-default", label: "Default Connector", transport: "direct-https" as const,
+    credentialGeneration: 1, instanceNonce: "default-nonce", enabled: true, revision: 1,
+  };
+  const device = {
+    deviceId: "device-default", label: "Default Device", connectorId: connector.connectorId,
+    connectionMode: "https" as const, enabled: true, revision: 1,
+  };
+  composition.directory.seedAuthority({ connector, devices: [device] });
+  composition.transports.register({
+    kind: "direct-https",
+    async connect(request: FabricConnectRequest): Promise<FabricLiveConnection> {
+      const allocated = request as FabricAllocatedConnectRequest;
+      return {
+        descriptor: {
+          protocolVersion: "fabric.v1",
+          limits,
+          lease: {
+            connectionId: allocated.allocatedConnectionId,
+            deviceId: request.deviceId,
+            connectorId: request.connectorId,
+            connectorInstanceNonce: connector.instanceNonce,
+            generation: allocated.allocatedConnectionGeneration,
+            state: "connected",
+            capabilityDigest: "default-digest",
+            establishedAt: Date.now(),
+            expiresAt: Date.now() + 60_000,
+            revision: 0,
+          },
+        },
+        exchange: async (envelope) => envelope,
+        close: async () => undefined,
+      };
+    },
+  });
+  const owner = createGatewayPrincipal("stdio", "owner", { authenticated: true, workspaceId: local.id });
+  const otherOwner = createGatewayPrincipal("stdio", "other-owner", { authenticated: true, workspaceId: otherLocal.id });
+  const connected = resultData(await runtime.call("device", control("connect", {
+    deviceId: device.deviceId, connectorId: connector.connectorId, expectedCredentialGeneration: 1,
+  }), owner)).connection as { connectionId: string; generation: number };
+  await composition.connections.admitAdvertisement({
+    ...advertisement(connected.connectionId, connected.generation, local.id),
+    capabilityDigest: "default-digest",
+    devices: [{ ...device }],
+    workspaces: [{
+      workspaceId: "fabric-workspace-1", deviceId: device.deviceId, localWorkspaceId: "remote-private-id",
+      label: "Remote Workspace", mode: "permanent", generation: 3, policyDigest: "remote-policy",
+      endpointIds: [], revision: 1,
+    }],
+    endpoints: [],
+    capabilities: [],
+  });
+  const common = {
+    deviceId: device.deviceId,
+    connectionId: connected.connectionId,
+    workspaceId: "fabric-workspace-1",
+    expectedConnectionGeneration: connected.generation,
+    expectedWorkspaceGeneration: 3,
+    requestedTtlMs: 5_000,
+  };
+  assert.equal((await runtime.call("workspace", control("bind", common), owner)).error?.code, "invalid_argument");
+  assert.equal((await runtime.call("workspace", control("bind", {
+    ...common, localWorkspaceId: local.id, expectedLocalWorkspaceGeneration: local.generation + 1,
+  }), owner)).error?.code, "stale_generation");
+
+  const binding = resultData(await runtime.call("workspace", control("bind", {
+    ...common, localWorkspaceId: local.id, expectedLocalWorkspaceGeneration: local.generation,
+  }), owner)).binding as {
+    bindingId: string;
+    revision: number;
+    localWorkspaceId?: unknown;
+    localWorkspaceGeneration?: unknown;
+  };
+  assert.equal(binding.localWorkspaceId, undefined);
+  assert.equal(binding.localWorkspaceGeneration, undefined);
+  const lease = await runtime.fabricStore.readStore("lease");
+  const durable = lease.records[binding.bindingId];
+  assert.equal(durable?.localWorkspaceId, local.id);
+  assert.equal(durable?.localWorkspaceGeneration, local.generation);
+  const issued = lease.events.find((event) => event.eventKind === "binding.issued" && event.subjectId === binding.bindingId);
+  assert(issued);
+  assert.equal(JSON.stringify(issued.payload).includes("localWorkspace"), false);
+
+  const otherBinding = resultData(await runtime.call("workspace", control("bind", {
+    ...common, localWorkspaceId: otherLocal.id, expectedLocalWorkspaceGeneration: otherLocal.generation,
+  }), otherOwner)).binding as { bindingId: string; revision: number };
+  const selected = await composition.resolveLocalWorkspaceAuthorization("fabric-workspace-1");
+  assert(selected);
+  const attackingPrincipal = selected.localWorkspaceId === local.id ? owner : otherOwner;
+  const targetBinding = selected.localWorkspaceId === local.id ? otherBinding : binding;
+  const targetLocal = selected.localWorkspaceId === local.id ? otherLocal : local;
+  assert.deepEqual(await composition.resolveLocalWorkspaceBindingAuthorization(targetBinding.bindingId), {
+    localWorkspaceId: targetLocal.id,
+    localWorkspaceGeneration: targetLocal.generation,
+  });
+  assert.equal((await runtime.call("workspace", control("renew", {
+    workspaceBindingId: targetBinding.bindingId,
+    expectedRevision: targetBinding.revision,
+    requestedTtlMs: 6_000,
+  }), attackingPrincipal)).error?.code, "permission_denied");
+  assert.equal((await runtime.call("workspace", control("unbind", {
+    workspaceBindingId: targetBinding.bindingId,
+    expectedRevision: targetBinding.revision,
+  }), attackingPrincipal)).error?.code, "permission_denied");
+
+  await runtime.registry.register(root, {
+    id: local.id,
+    mode: "permanent",
+    expectedGeneration: local.generation,
+  });
+  assert.equal((await runtime.call("workspace", control("renew", {
+    workspaceBindingId: binding.bindingId,
+    expectedRevision: binding.revision,
+    requestedTtlMs: 6_000,
+  }), owner)).error?.code, "stale_generation");
+});
+
 test("disabled Fabric and strict Pi/SSH schemas fail closed while Pi tools inject the v1 control envelope", async (t) => {
   const root = await mkdtemp(join(tmpdir(), "gateway-fabric-disabled-"));
   const runtime = await GatewayRuntime.create({ config: createTestGatewayConfig(root), cwd: root });
@@ -243,6 +445,11 @@ test("disabled Fabric and strict Pi/SSH schemas fail closed while Pi tools injec
   assert.equal((await runtime.call("device", control("list"), owner)).error?.code, "fabric_disabled");
 
   assert.equal(Value.Check(FabricWorkspaceParams, { action: "bind", path: root, requestedTtlMs: 1000 }), false);
+  assert.equal(Value.Check(FabricWorkspaceParams, {
+    action: "bind", deviceId: "device-1", connectionId: "connection-1", workspaceId: "remote-workspace-1",
+    localWorkspaceId: "local-workspace-1", expectedConnectionGeneration: 1, expectedWorkspaceGeneration: 1,
+    expectedLocalWorkspaceGeneration: 2, requestedTtlMs: 1000,
+  }), true);
   assert.equal(Value.Check(FabricDeviceParams, { action: "connect", deviceId: "device-1", connectorId: "connector-1", expectedCredentialGeneration: 1 }), true);
   assert.equal(Value.Check(FabricEndpointParams, { action: "select", endpointId: "endpoint-1", unknown: true }), false);
   assert.equal(Value.Check(FabricRouteParams, { action: "open", connectionId: "connection-1", endpointId: "endpoint-1" }), false);

@@ -199,7 +199,7 @@ import {
   registerWorkspaceProjectionDirtyListener,
 } from "../public/v1/workspace-projections.ts";
 import {
-  getFabricRouteResolverProvider,
+  getFabricRouteResolverProviderBinding,
 } from "../public/v1/fabric-runtime.ts";
 import {
   workspaceSessionObservationSnapshot,
@@ -5059,6 +5059,7 @@ export default function registerTeammateExtension(
 
       const makeOptions = (): RunTeammateOptions => {
         const turnFence = captureRootSessionFence();
+        const fabricRouteResolverBinding = getFabricRouteResolverProviderBinding();
         const turnTarget = state.activeRuns.get(correlationId) ?? activeAgent;
         const initialTurnContext: AgentTurnTriggerContextV1 | undefined = isSingle
           ? {
@@ -5082,17 +5083,9 @@ export default function registerTeammateExtension(
           // Lazy for the same reason: only loading a Fabric registration reaches
           // this, and a dispatch with no Fabric wiring must refuse a placed task
           // by name rather than run it here.
-          ...(getFabricRouteResolverProvider() === undefined
+          ...(fabricRouteResolverBinding === undefined
             ? {}
-            : {
-              fabricRouteResolverOf: () => {
-                const resolver = getFabricRouteResolverProvider()?.();
-                if (resolver === undefined) {
-                  throw new Error("Fabric route resolver provider returned no resolver for this dispatch");
-                }
-                return resolver;
-              },
-            }),
+            : { fabricRouteResolverOf: fabricRouteResolverBinding }),
           modelCapabilities: dispatchModelCatalog.models,
           ...(dispatchModelRegistryAuthority === undefined
             ? {}

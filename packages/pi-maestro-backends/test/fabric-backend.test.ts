@@ -13,6 +13,7 @@ import {
   type FabricAgentStartAckV1,
   type FabricAgentStartRequestV1,
   type FabricBackendRouteResolver,
+  type FabricBackendRouteResolverAcquirer,
   type PreparedFabricBackendChannel,
 } from "../src/fabric/channel.ts";
 
@@ -98,7 +99,9 @@ class FakeChannel implements PreparedFabricBackendChannel {
   readonly order: string[] = [];
   readonly sends: Array<{ message: string; mode: string }> = [];
   aborts = 0;
+  closed = false;
   startFailure?: Error;
+  waitGate?: Promise<void>;
   ackCapabilities: BackendCapabilities = CAPABILITIES;
   listener?: (event: FabricPlacementEventV1) => void;
 
@@ -128,6 +131,7 @@ class FakeChannel implements PreparedFabricBackendChannel {
   }
 
   async wait(): Promise<{ status: "completed" }> {
+    await this.waitGate;
     if (!this.startFailure) {
       this.listener?.(fabricPlacementEvent("placement-1", 1, "start-ack", NOW + 1, { receiptRef: "placement-1:start:1" }));
       this.listener?.(fabricPlacementEvent("placement-1", 2, "turn-complete", NOW + 2, { result: result() as never }));
@@ -171,7 +175,7 @@ class FakeChannel implements PreparedFabricBackendChannel {
     };
   }
 
-  async close(): Promise<void> {}
+  async close(): Promise<void> { this.closed = true; }
 }
 
 function options(overrides: Partial<BackendRunOptions> = {}): BackendRunOptions {
@@ -183,6 +187,29 @@ function resolver(channel: FakeChannel, count: { value: number }): FabricBackend
     async prepare(): Promise<PreparedFabricBackendChannel> {
       count.value += 1;
       return channel;
+    },
+  };
+}
+
+function acquirer(
+  channel: FakeChannel,
+  acquired: { value: number },
+  released: { value: number },
+): FabricBackendRouteResolverAcquirer {
+  return {
+    acquire(request) {
+      acquired.value += 1;
+      assert.equal(request.correlationId, "attempt-1");
+      assert.equal(request.placement.placementId, "placement-1");
+      return {
+        resolver: resolver(channel, { value: 0 }),
+        generation: 7,
+        ownerId: "origin-owner-1",
+        release() {
+          assert.equal(channel.closed, true, "resolver released before channel cleanup");
+          released.value += 1;
+        },
+      };
     },
   };
 }
@@ -267,4 +294,90 @@ test("route capability conflicts fail before source start", async () => {
 
   await assert.rejects(() => backend.start(SPEC, options()), /does not advertise the requested model/);
   assert.deepEqual(channel.order, [], "a rejected Endpoint selection still subscribed or started");
+});
+
+test("dispatch-scoped resolver acquisition and release are exactly once on success", async () => {
+  const channel = new FakeChannel();
+  const acquired = { value: 0 };
+  const released = { value: 0 };
+  const backend = createFabricBackend(acquirer(channel, acquired, released), { now: () => NOW });
+
+  const run = await backend.start(SPEC, options());
+  const [first, second] = await Promise.all([run.outcome, run.outcome]);
+
+  assert.equal(first, second);
+  assert.equal(acquired.value, 1);
+  assert.equal(released.value, 1);
+});
+
+test("missing dispatch-scoped resolver fails closed without preparing a route", async () => {
+  let acquired = 0;
+  const backend = createFabricBackend({
+    acquire(request) {
+      acquired += 1;
+      assert.equal(request.correlationId, "attempt-1");
+      assert.equal(request.placement.placementId, "placement-1");
+      return undefined;
+    },
+  }, { now: () => NOW });
+
+  await assert.rejects(
+    () => backend.start(SPEC, options()),
+    /resolver provider is unavailable.*placed dispatch/,
+  );
+  assert.equal(acquired, 1);
+});
+
+test("resolver lease releases exactly once when route preparation fails", async () => {
+  let acquired = 0;
+  let released = 0;
+  const backend = createFabricBackend({
+    acquire() {
+      acquired += 1;
+      return {
+        generation: 9,
+        ownerId: "origin-owner-prepare-failure",
+        resolver: { async prepare() { throw new Error("route prepare failed"); } },
+        release() { released += 1; },
+      };
+    },
+  }, { now: () => NOW });
+
+  await assert.rejects(() => backend.start(SPEC, options()), /route prepare failed/);
+  assert.equal(acquired, 1);
+  assert.equal(released, 1);
+});
+
+test("ACK loss remains unreaped while its provider lease is released exactly once", async () => {
+  const channel = new FakeChannel();
+  channel.startFailure = new Error("ACK response lost");
+  const acquired = { value: 0 };
+  const released = { value: 0 };
+  const backend = createFabricBackend(acquirer(channel, acquired, released), { now: () => NOW });
+
+  const outcome = await (await backend.start(SPEC, options())).outcome;
+
+  assert.equal(acquired.value, 1);
+  assert.equal(released.value, 1);
+  assert.equal((await outcome.reclamation).status, "unreaped");
+});
+
+test("abort does not release the provider before wait, recovery, reclamation, and close", async () => {
+  const channel = new FakeChannel();
+  let finishWait!: () => void;
+  channel.waitGate = new Promise<void>((resolve) => { finishWait = resolve; });
+  const acquired = { value: 0 };
+  const released = { value: 0 };
+  const backend = createFabricBackend(acquirer(channel, acquired, released), { now: () => NOW });
+  const run = await backend.start(SPEC, options());
+
+  run.abort();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(channel.aborts, 1);
+  assert.equal(released.value, 0, "abort released dispatch wiring before settlement cleanup");
+  finishWait();
+  await run.outcome;
+
+  assert.equal(acquired.value, 1);
+  assert.equal(released.value, 1);
 });

@@ -28,7 +28,9 @@ export const FabricWorkspaceParams = Type.Union([
   Type.Object({ action: Type.Literal("list"), deviceId: Type.Optional(id), ...base }, { additionalProperties: false }),
   Type.Object({
     action: Type.Literal("bind"), deviceId: id, connectionId: id, workspaceId: id,
+    localWorkspaceId: Type.Optional(id),
     expectedConnectionGeneration: Type.Integer({ minimum: 1 }), expectedWorkspaceGeneration: Type.Integer({ minimum: 1 }),
+    expectedLocalWorkspaceGeneration: Type.Optional(Type.Integer({ minimum: 1 })),
     requestedTtlMs: ttl, ...base,
   }, { additionalProperties: false }),
   Type.Object({ action: Type.Literal("renew"), workspaceBindingId: id, expectedRevision: Type.Integer({ minimum: 0 }), requestedTtlMs: ttl, ...base }, { additionalProperties: false }),

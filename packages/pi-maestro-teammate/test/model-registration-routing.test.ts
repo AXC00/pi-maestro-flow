@@ -608,7 +608,7 @@ test("registry dispatch preflights every candidate and uses canonical telemetry 
   assert.equal(snapshot.routes.some((entry) => entry.model.startsWith("adapter/")), false);
 });
 
-test("placed model-registry dispatch keeps adapter translation while forcing the Fabric backend", async () => {
+test("placed model-registry dispatch keeps canonical model identity while forcing the Fabric backend", async () => {
   const projection = authority();
   const events: ProbeEvent[] = [];
   const fabric = probeBackend("fabric", events, (spec, options) =>
@@ -632,13 +632,13 @@ test("placed model-registry dispatch keeps adapter translation while forcing the
     {
       kind: "resolve",
       deployment: "fabric",
-      model: "adapter/primary",
+      model: "registry/primary",
       task: "translate the placed model",
     },
     {
       kind: "start",
       deployment: "fabric",
-      model: "adapter/primary",
+      model: "registry/primary",
       task: "translate the placed model",
     },
   ]);

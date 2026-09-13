@@ -48,11 +48,12 @@ Update semantics distinguish omitted, empty, and invalid values. An omitted lega
 Durable fields:
 
 ```text
-connectorId, label, enabled, transport, credentialHash,
+connectorId, label, enabled, transport, keyId,
+publicKeySpki (canonical), publicKeyFingerprint,
 credentialGeneration, scopes, audience, createdAt, updatedAt, revision
 ```
 
-Ephemeral fields such as socket handles and current process nonce are not part of the registry record. Credential rotation atomically commits the new hash and increments `credentialGeneration`; old generations fail admission.
+Ephemeral fields such as socket handles and current process nonce are not part of the registry record. For the Ed25519 Gateway adapter, SPKI is verification-key material rather than a credential secret, but remains private registry data and never enters public projections or events. Credential rotation atomically commits the replacement SPKI/fingerprint and increments `credentialGeneration`; old generations fail admission. Pairing consumption tombstones and immutable request-digest receipts remain durable independently of the store's bounded transaction ledger.
 
 ### 3.2 Device registry
 
@@ -64,6 +65,10 @@ platform projection, enabled, createdAt, updatedAt, revision
 ```
 
 A Device ID is globally unique within one Fabric authority. Moving a Device to another Connector is an explicit revision-fenced mutation and invalidates its current connection, bindings, Endpoint routes, and presence.
+
+The strict `fabric.connector-config.v1` Device-side document may carry registered `devices`, one `localDeviceId`, and explicit `workspaceIds`. New enrollment output always carries all three; an empty workspace list exports none. Legacy v1 files without these fields remain status-readable, but cannot start a Connector until the operator enrolls or upgrades the identity metadata.
+
+Device-side enrollment uses a private atomic pending journal containing only request identity/digest, public request data, and local file references. It never stores the purpose token. The active config is published only after an active durable receipt; rotation therefore keeps the predecessor config active across uncertain responses. Temporary files are fsynced before rename and the containing directory is synchronized where the platform supports directory handles.
 
 ### 3.3 Workspace directory
 

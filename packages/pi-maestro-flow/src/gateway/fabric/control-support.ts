@@ -16,6 +16,7 @@ import type {
   FabricConnectionManager,
   FabricDirectory,
   FabricPresenceManager,
+  FabricWorkspaceBindingAuthorization,
 } from "pi-maestro-fabric";
 import type { GatewayPrincipal, GatewayResult } from "../contracts.ts";
 import type { GatewayPolicy } from "../policy.ts";
@@ -37,10 +38,23 @@ export interface GatewayFabricControlRuntime {
   readonly connections: FabricConnectionManager;
   readonly admissions: FabricAdmissionManager;
   readonly presence?: FabricPresenceManager;
+  /** Explicit composition seam used by enabled injected runtimes before any hydration or listener starts. */
+  readonly assertAuthorityGraph?: (runtime: GatewayFabricControlRuntime, expected: {
+    readonly store: unknown;
+    readonly audience: string;
+  }) => void;
   readonly limits?: FabricProtocolLimits;
   readonly now?: () => number;
   readonly createId?: (kind: "binding" | "route") => string;
-  /** Host-private mapping. Fabric public workspace records deliberately omit this identity. */
+  /** Durable host-private workspace mapping used by the default Gateway composition. */
+  readonly resolveLocalWorkspaceAuthorization?: (
+    fabricWorkspaceId: string,
+  ) => FabricWorkspaceBindingAuthorization | undefined | Promise<FabricWorkspaceBindingAuthorization | undefined>;
+  /** Exact durable host-private mapping for lifecycle authorization of one named binding. */
+  readonly resolveLocalWorkspaceBindingAuthorization?: (
+    bindingId: string,
+  ) => FabricWorkspaceBindingAuthorization | undefined | Promise<FabricWorkspaceBindingAuthorization | undefined>;
+  /** Compatibility mapping for injected runtimes that predate durable local authorization. */
   readonly resolveLocalWorkspaceId?: (fabricWorkspaceId: string) => string | undefined | Promise<string | undefined>;
 }
 
@@ -54,6 +68,7 @@ export interface GatewayFabricControlInput extends Record<string, unknown> {
 export interface GatewayFabricAuthorizedWorkspace {
   readonly fabric: PublicWorkspaceRecord;
   readonly localWorkspaceId: string;
+  readonly localWorkspaceGeneration: number;
 }
 
 class GatewayFabricDisabledError extends Error {
@@ -155,18 +170,96 @@ export class GatewayFabricControlSupport {
 
   async authorizeWorkspace(principal: GatewayPrincipal, fabricWorkspaceId: string): Promise<GatewayFabricAuthorizedWorkspace> {
     const runtime = this.requireRuntime();
-    assertFabricIdentifier(fabricWorkspaceId, "workspaceId");
-    const fabric = runtime.directory.getWorkspace(fabricWorkspaceId);
-    if (fabric === undefined) throw new FabricContractError("not_found", "Fabric workspace is not registered", "workspaceId");
+    const fabric = this.fabricWorkspace(runtime, fabricWorkspaceId);
+    if (runtime.resolveLocalWorkspaceAuthorization !== undefined) {
+      const authorization = await runtime.resolveLocalWorkspaceAuthorization(fabricWorkspaceId);
+      if (authorization === undefined) {
+        throw new FabricContractError("permission_denied", "Fabric workspace has no current durable local authorization", "workspaceId");
+      }
+      const local = await this.authorizeLocalWorkspace(
+        principal,
+        authorization.localWorkspaceId,
+        authorization.localWorkspaceGeneration,
+      );
+      return { fabric, localWorkspaceId: local.id, localWorkspaceGeneration: local.generation };
+    }
+
     const localWorkspaceId = await runtime.resolveLocalWorkspaceId?.(fabricWorkspaceId);
     if (localWorkspaceId === undefined) {
       throw new FabricContractError("permission_denied", "Fabric workspace has no authorized local mapping", "workspaceId");
     }
+    const local = await this.authorizeLocalWorkspace(principal, localWorkspaceId);
+    return { fabric, localWorkspaceId: local.id, localWorkspaceGeneration: local.generation };
+  }
+
+  async authorizeWorkspaceBinding(
+    principal: GatewayPrincipal,
+    fabricWorkspaceId: string,
+    localWorkspaceId: string | undefined,
+    expectedLocalWorkspaceGeneration: number | undefined,
+  ): Promise<GatewayFabricAuthorizedWorkspace> {
+    const runtime = this.requireRuntime();
+    if (runtime.resolveLocalWorkspaceAuthorization === undefined) {
+      return this.authorizeWorkspace(principal, fabricWorkspaceId);
+    }
+    if (localWorkspaceId === undefined || expectedLocalWorkspaceGeneration === undefined) {
+      throw new FabricContractError(
+        "invalid_argument",
+        "Default Fabric workspace binding requires localWorkspaceId and expectedLocalWorkspaceGeneration",
+        localWorkspaceId === undefined ? "localWorkspaceId" : "expectedLocalWorkspaceGeneration",
+      );
+    }
+    const fabric = this.fabricWorkspace(runtime, fabricWorkspaceId);
+    const local = await this.authorizeLocalWorkspace(principal, localWorkspaceId, expectedLocalWorkspaceGeneration);
+    return { fabric, localWorkspaceId: local.id, localWorkspaceGeneration: local.generation };
+  }
+
+  async authorizeWorkspaceBindingLifecycle(
+    principal: GatewayPrincipal,
+    bindingId: string,
+    fabricWorkspaceId: string,
+  ): Promise<GatewayFabricAuthorizedWorkspace> {
+    const runtime = this.requireRuntime();
+    if (runtime.resolveLocalWorkspaceBindingAuthorization === undefined) {
+      return this.authorizeWorkspace(principal, fabricWorkspaceId);
+    }
+    const fabric = this.fabricWorkspace(runtime, fabricWorkspaceId);
+    const authorization = await runtime.resolveLocalWorkspaceBindingAuthorization(bindingId);
+    if (authorization === undefined) {
+      throw new FabricContractError(
+        "permission_denied",
+        "Fabric Workspace Binding has no current durable local authorization",
+        "workspaceBindingId",
+      );
+    }
+    const local = await this.authorizeLocalWorkspace(
+      principal,
+      authorization.localWorkspaceId,
+      authorization.localWorkspaceGeneration,
+    );
+    return { fabric, localWorkspaceId: local.id, localWorkspaceGeneration: local.generation };
+  }
+
+  private fabricWorkspace(runtime: GatewayFabricControlRuntime, fabricWorkspaceId: string): PublicWorkspaceRecord {
+    assertFabricIdentifier(fabricWorkspaceId, "workspaceId");
+    const fabric = runtime.directory.getWorkspace(fabricWorkspaceId);
+    if (fabric === undefined) throw new FabricContractError("not_found", "Fabric workspace is not registered", "workspaceId");
+    return fabric;
+  }
+
+  private async authorizeLocalWorkspace(principal: GatewayPrincipal, localWorkspaceId: string, expectedGeneration?: number) {
     const local = await this.registry.get(localWorkspaceId);
-    if (local === undefined) throw new FabricContractError("permission_denied", "Mapped local workspace is not registered", "workspaceId");
+    if (local === undefined) throw new FabricContractError("permission_denied", "Mapped local workspace is not registered", "localWorkspaceId");
+    if (expectedGeneration !== undefined && local.generation !== expectedGeneration) {
+      throw new FabricContractError("stale_generation", "Local workspace generation is stale", "expectedLocalWorkspaceGeneration");
+    }
     const decision = await this.policy.authorizeWorkspace(principal, local.id);
-    if (!decision.allowed) throw new FabricContractError("permission_denied", `Local workspace authorization failed: ${decision.reason}`, "workspaceId");
-    return { fabric, localWorkspaceId: local.id };
+    if (!decision.allowed) throw new FabricContractError("permission_denied", `Local workspace authorization failed: ${decision.reason}`, "localWorkspaceId");
+    const current = await this.registry.get(local.id);
+    if (current === undefined || current.generation !== local.generation) {
+      throw new FabricContractError("stale_generation", "Local workspace authority changed during authorization", "expectedLocalWorkspaceGeneration");
+    }
+    return current;
   }
 
   async visibleWorkspace(principal: GatewayPrincipal, workspace: PublicWorkspaceRecord): Promise<boolean> {

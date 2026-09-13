@@ -3,7 +3,10 @@ import type {
   BackendRegistration,
   TeammateExecutionMode,
 } from "pi-maestro-backend-core/v1/registry";
-import type { ConfigValue } from "pi-maestro-backend-core/v1/backend";
+import type {
+  BackendCapabilities,
+  ConfigValue,
+} from "pi-maestro-backend-core/v1/backend";
 import type { CliToolsConfig } from "../cli-tools/cli-tools-config.ts";
 import type { TeammateThinkingLevel } from "../shared/thinking.ts";
 import {
@@ -557,6 +560,44 @@ export function deriveModelRuntimeDescriptor(
         `deployment "${deploymentId}" requires backend module resolution before it is dispatchable`,
       );
   }
+}
+
+/**
+ * Whether a registry transport is eligible for one Fabric source-local attempt.
+ *
+ * Known local-process descriptors are already proven by the registry compiler.
+ * Adapter-owned registrations remain eligible so the source runtime can load
+ * their exact configured module and validate its capabilities before either
+ * advertising or starting it. All transports that cross a machine boundary
+ * fail closed here.
+ */
+export function isFabricSourceLocalTransport(runtime: ModelRuntimeDescriptor): boolean {
+  return (runtime.transport.kind === "local-process" && runtime.resolvable)
+    || runtime.transport.kind === "adapter-owned";
+}
+
+const BACKEND_CAPABILITY_KEYS = [
+  "outputSchema", "forkContext", "modelSelection", "thinkingLevel", "todoBinding",
+  "toolFilter", "steer", "followUp", "abort",
+] as const satisfies readonly (keyof BackendCapabilities)[];
+const BACKEND_CAPABILITY_KEY_SET: ReadonlySet<string> = new Set(BACKEND_CAPABILITY_KEYS);
+
+/** Return a normalized capability table only when all and exactly nine keys are valid. */
+export function exactBackendCapabilities(value: unknown): BackendCapabilities | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const source = value as Record<string, unknown>;
+  const keys = Object.keys(source);
+  if (keys.length !== BACKEND_CAPABILITY_KEYS.length
+    || keys.some((key) => !BACKEND_CAPABILITY_KEY_SET.has(key))) {
+    return undefined;
+  }
+  const result = {} as Record<keyof BackendCapabilities, BackendCapabilities[keyof BackendCapabilities]>;
+  for (const key of BACKEND_CAPABILITY_KEYS) {
+    const support = source[key];
+    if (support !== "native" && support !== "emulated" && support !== "unsupported") return undefined;
+    result[key] = support;
+  }
+  return result;
 }
 
 function freezeDescriptor(

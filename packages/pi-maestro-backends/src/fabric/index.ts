@@ -23,6 +23,10 @@ export {
   type FabricBackendChannelWaitResult,
   type FabricBackendPrepareRequest,
   type FabricBackendRouteResolver,
+  type FabricBackendRouteResolverAcquireRequest,
+  type FabricBackendRouteResolverAcquirer,
+  type FabricBackendRouteResolverLease,
+  type FabricBackendRouteResolverSource,
   type PreparedFabricBackendChannel,
 } from "./channel.ts";
 export { fabricTurnResult, foldFabricOutcome, type FabricOutcomeInput } from "./outcome.ts";

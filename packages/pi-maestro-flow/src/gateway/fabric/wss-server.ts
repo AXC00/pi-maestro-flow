@@ -3,12 +3,14 @@ import type { IncomingMessage, Server as HttpServer } from "node:http";
 import type { Server as HttpsServer } from "node:https";
 import { WebSocketServer, type RawData, type WebSocket } from "ws";
 import {
+  FABRIC_HUB_RELAY_VERSION,
   FABRIC_PROTOCOL_VERSION,
   FabricContractError,
   assertBoundedString,
   assertFabricIdentifier,
   assertGeneration,
   assertValidFabricEnvelope,
+  assertValidFabricHubRelayVersions,
   assertValidFabricProtocolLimits,
   type FabricEnvelopeV1,
   type FabricMessageKind,
@@ -17,6 +19,7 @@ import {
   type PublicConnectionLease,
 } from "pi-maestro-fabric-core/v1";
 import type { FabricManagedConnectionOwner } from "pi-maestro-fabric";
+import type { FabricHubRelayWssPort } from "./hub-relay.ts";
 import {
   FABRIC_CHALLENGE_PROOF_VERSION,
   type FabricChallengeProofV1,
@@ -42,13 +45,14 @@ const ACCEPTED_KINDS: Readonly<Record<FabricConnectorState, readonly FabricMessa
   connecting: ["client_hello"],
   challenged: ["client_proof"],
   connected: ["advertise_snapshot", "advertise_delta", "drain", "close"],
-  ready: ["advertise_delta", "heartbeat", "drain", "close"],
+  ready: ["advertise_delta", "heartbeat", "stream", "receipt", "drain", "close"],
   draining: ["close"],
   closed: [],
 });
 
 export interface FabricConnectorSession {
   readonly connectorId: string;
+  readonly deviceId: string;
   readonly connectionId: string;
   readonly connectionGeneration: number;
   readonly instanceNonce: string;
@@ -56,6 +60,8 @@ export interface FabricConnectorSession {
   readonly advertisementRevision: number;
   readonly lastHeartbeatAt: number;
   readonly current: boolean;
+  readonly relayVersion?: typeof FABRIC_HUB_RELAY_VERSION;
+  readonly negotiatedLimits: Readonly<FabricProtocolLimits>;
 }
 
 export interface FabricWssAdmissionInput {
@@ -91,6 +97,7 @@ export interface FabricWssServerOptions {
   readonly now?: () => number;
   readonly drainTimeoutMs?: number;
   readonly authority?: FabricWssAuthority;
+  readonly relay?: FabricHubRelayWssPort;
   readonly onReady?: (session: FabricConnectorSession) => void | Promise<void>;
   readonly onSessionClosed?: (session: FabricConnectorSession, reason: string) => void | Promise<void>;
   readonly onAdvertisement?: (
@@ -133,6 +140,9 @@ interface LiveSession {
   lastHeartbeatAt: number;
   heartbeatSequence: number;
   phaseDeadlineAt: number;
+  relayVersion?: typeof FABRIC_HUB_RELAY_VERSION;
+  pendingOperationWrites: number;
+  pendingControlWrites: number;
   queueDepth: number;
   tail: Promise<void>;
   readonly queuedActions: Set<QueuedAction>;
@@ -150,6 +160,8 @@ interface LiveSession {
   socketCleanupTimer?: NodeJS.Timeout;
   socketCleanupPromise?: Promise<void>;
   resolveSocketCleanup?: () => void;
+  retirementCleanupPromise?: Promise<void>;
+  resolveRetirementCleanup?: () => void;
 }
 
 interface SessionContinuation {
@@ -309,6 +321,28 @@ export class FabricWssServer {
     return session === undefined || session.retirementState !== "active" ? undefined : this.#view(session);
   }
 
+  /** Abort retained remote Agent attempts after their durable Route has closed. */
+  async closeRoute(routeId: string, reason: string): Promise<void> {
+    assertFabricIdentifier(routeId, "routeId");
+    await this.#options.relay?.closeRoute(routeId, reason);
+  }
+
+  /** Retire only sessions that proved or declared the named Connector identity. */
+  async retireConnector(connectorId: string, reason = "the Connector registration changed"): Promise<boolean> {
+    assertFabricIdentifier(connectorId, "connectorId");
+    const owned = [...this.#sessions.values()].filter((session) =>
+      session.retirementState !== "retired" &&
+      (session.credential?.connectorId === connectorId || session.helloConnectorId === connectorId),
+    );
+    return this.#withinDeadline(
+      Promise.all(owned.map(async (session) => {
+        await this.#retire(session, reason);
+        await this.#retirementCleanupPromise(session);
+      })).then(() => undefined),
+      this.#drainTimeoutMs,
+    );
+  }
+
   async close(reason = "the Hub is shutting down"): Promise<void> {
     if (this.#closed) return;
     this.#closed = true;
@@ -317,6 +351,9 @@ export class FabricWssServer {
     const deadlineAt = Date.now() + this.#drainTimeoutMs;
     const sessions = [...this.#sessions.values()];
     for (const session of sessions) {
+      // Fence executable registrations and active relay owners synchronously,
+      // before any peer-controlled drain or close wait begins.
+      try { this.#options.relay?.retire(this.#view(session), reason); } catch { /* relay retirement is fail-closed */ }
       try {
         this.#sendDrain(session, reason);
       } catch (error) {
@@ -352,6 +389,7 @@ export class FabricWssServer {
       instanceNonce: "", state: "connecting", connectionId: "", connectionGeneration: 0,
       credentialGeneration: 0, helloConnectorId: "", capabilityDigest: "", negotiatedLimits: { ...this.#limits }, advertisementRevision: 0,
       lastHeartbeatAt: now, heartbeatSequence: 0, phaseDeadlineAt: now + this.#limits.heartbeatTimeoutMs,
+      pendingOperationWrites: 0, pendingControlWrites: 0,
       queueDepth: 0, tail: Promise.resolve(), queuedActions: new Set(), authorityCleanupSuppressed: false,
       authorityCleanupState: "not_required", authorityCleanupAttempt: 0,
       callbackCleanupState: this.#options.onSessionClosed === undefined ? "not_required" : "pending", callbackCleanupAttempt: 0,
@@ -359,9 +397,37 @@ export class FabricWssServer {
     };
     this.#sessions.set(session.key, session);
     this.#scheduleSweep();
-    socket.on("message", (data, isBinary) => this.#enqueue(session, () => this.#onMessage(session, data, isBinary)));
+    socket.on("message", (data, isBinary) => this.#ingest(session, data, isBinary));
     socket.on("close", () => this.#onSocketClosed(session));
     socket.on("error", () => { void this.#retire(session, "the Connector channel errored"); });
+  }
+
+  #ingest(session: LiveSession, data: RawData, isBinary: boolean): void {
+    if (session.retirementState !== "active" || isBinary || frameBytes(data) > session.negotiatedLimits.maxFrameBytes) {
+      this.#enqueue(session, () => this.#onMessage(session, data, isBinary));
+      return;
+    }
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(textOf(data));
+      assertValidFabricEnvelope(parsed);
+    } catch {
+      this.#enqueue(session, () => this.#onMessage(session, data, isBinary));
+      return;
+    }
+    if (parsed.kind !== "stream" && parsed.kind !== "receipt") {
+      this.#enqueue(session, () => this.#onMessage(session, data, isBinary));
+      return;
+    }
+    if (session.state !== "ready" || session.relayVersion !== FABRIC_HUB_RELAY_VERSION || this.#options.relay === undefined) {
+      this.#failSessionOperation(session, new FabricContractError("invalid_state", "Hub relay message arrived before negotiated readiness"));
+      return;
+    }
+    try {
+      this.#options.relay.accept(this.#view(session), parsed);
+    } catch (error) {
+      this.#failSessionOperation(session, error);
+    }
   }
 
   #enqueue(session: LiveSession, action: () => Promise<void>): void {
@@ -457,6 +523,13 @@ export class FabricWssServer {
       case "advertise_snapshot": return this.#onSnapshot(session, envelope);
       case "advertise_delta": return this.#onDelta(session, envelope);
       case "heartbeat": return this.#onHeartbeat(session, envelope);
+      case "stream":
+      case "receipt":
+        if (session.relayVersion !== FABRIC_HUB_RELAY_VERSION || this.#options.relay === undefined) {
+          throw new FabricContractError("invalid_state", "Hub relay support was not negotiated", "kind");
+        }
+        this.#options.relay.accept(this.#view(session), envelope);
+        return;
       case "drain": return this.#onDrain(session, envelope);
       case "close": return this.#retire(session, "the Connector closed the channel");
       default: throw new FabricContractError("invalid_state", "Unsupported Fabric frame", "kind");
@@ -469,6 +542,7 @@ export class FabricWssServer {
     const credentialGeneration = envelope.payload.credentialGeneration;
     const supportedVersions = envelope.payload.supportedVersions;
     const capabilityDigest = envelope.payload.capabilityDigest;
+    const relayVersions = envelope.payload.relayVersions;
     assertFabricIdentifier(connectorId, "connectorId");
     assertBoundedString(instanceNonce, "instanceNonce", 128);
     assertGeneration(credentialGeneration, "credentialGeneration");
@@ -481,6 +555,7 @@ export class FabricWssServer {
       !supportedVersions.includes(FABRIC_PROTOCOL_VERSION)) {
       throw new FabricContractError("unsupported_version", "client_hello must support fabric.v1", "supportedVersions");
     }
+    if (relayVersions !== undefined) assertValidFabricHubRelayVersions(relayVersions, "relayVersions");
     const negotiatedLimits = protocolLimits(envelope.payload.limits, this.#limits);
     const challenge = this.#security.issueChallenge(connectorId);
     session.state = "challenged";
@@ -494,6 +569,9 @@ export class FabricWssServer {
     session.credential = undefined;
     session.capabilityDigest = capabilityDigest;
     session.negotiatedLimits = negotiatedLimits;
+    session.relayVersion = this.#options.relay !== undefined && Array.isArray(relayVersions) && relayVersions.includes(FABRIC_HUB_RELAY_VERSION)
+      ? FABRIC_HUB_RELAY_VERSION
+      : undefined;
     session.phaseDeadlineAt = Math.min(challenge.expiresAt, this.#now() + negotiatedLimits.heartbeatTimeoutMs);
     this.#scheduleSweep();
     this.#send(session, envelopeOf("server_challenge", {
@@ -561,6 +639,7 @@ export class FabricWssServer {
       // has an idempotently retryable close path without becoming live locally.
       session.authorityView = {
         connectorId: credential.connectorId,
+        deviceId: lease.deviceId,
         connectionId: lease.connectionId,
         connectionGeneration: lease.generation,
         instanceNonce: session.instanceNonce,
@@ -568,6 +647,7 @@ export class FabricWssServer {
         advertisementRevision: 0,
         lastHeartbeatAt: admittedAt,
         current: false,
+        negotiatedLimits: { ...session.negotiatedLimits },
       };
       this.#assertContinuation(session, continuation);
     } else {
@@ -605,10 +685,18 @@ export class FabricWssServer {
     this.#liveByConnector.set(credential.connectorId, session.key);
     session.authorityView = this.#view(session);
     this.#scheduleSweep();
+    this.#options.relay?.accepted(this.#view(session), {
+      send: (outgoing, priority) => this.#send(session, outgoing, priority),
+      get bufferedAmount(): number { return session.socket.bufferedAmount; },
+    });
     this.#send(session, envelopeOf("connection_accepted", {
       connectionId: session.connectionId, connectionGeneration: session.connectionGeneration,
       connectorId: credential.connectorId, lease: lease as unknown as JsonValue,
       limits: session.negotiatedLimits as unknown as JsonValue,
+      ...(session.relayVersion === undefined ? {} : {
+        relayVersion: session.relayVersion,
+        hubRuntimeEpoch: this.#options.relay!.hubRuntimeEpoch,
+      }),
     }, this.#now, {
       connectionId: session.connectionId,
       connectionGeneration: session.connectionGeneration,
@@ -635,11 +723,13 @@ export class FabricWssServer {
     if (this.#now() >= session.phaseDeadlineAt) {
       throw new FabricContractError("expired", "Fabric connection expired before readiness was published", "leaseExpiresAt");
     }
+    if (session.relayVersion === FABRIC_HUB_RELAY_VERSION) this.#options.relay?.ready(this.#view(session), envelope.payload);
     const leaseExpiresAt = session.lease?.expiresAt ?? session.phaseDeadlineAt;
     this.#scheduleSweep();
     this.#send(session, envelopeOf("ready", {
       connectionId: session.connectionId, connectionGeneration: session.connectionGeneration,
       advertisementRevision: session.advertisementRevision, leaseExpiresAt,
+      ...(session.relayVersion === undefined ? {} : { relayVersion: session.relayVersion }),
     }, this.#now, {
       connectionId: session.connectionId,
       connectionGeneration: session.connectionGeneration,
@@ -671,6 +761,7 @@ export class FabricWssServer {
     continuation = this.#continuation(session);
     await this.#options.onAdvertisement?.(this.#view(session), session.advertisementRevision, envelope.payload);
     this.#assertContinuation(session, continuation);
+    if (session.relayVersion === FABRIC_HUB_RELAY_VERSION) this.#options.relay?.advertisement(this.#view(session), envelope.payload);
   }
 
   async #onHeartbeat(session: LiveSession, envelope: FabricEnvelopeV1): Promise<void> {
@@ -708,6 +799,9 @@ export class FabricWssServer {
     const now = this.#now();
     const deadlineAt = Math.min(now + this.#drainTimeoutMs, session.lease?.expiresAt ?? Number.MAX_SAFE_INTEGER);
     if (deadlineAt <= now) throw new FabricContractError("expired", "Fabric lease expired before drain admission", "deadlineAt");
+    // Relay admission is fenced synchronously even though durable drain
+    // authority remains awaited before the public WSS state advances.
+    try { this.#options.relay?.retire(this.#view(session), reason); } catch { /* fail closed */ }
     const continuation = this.#continuation(session);
     await this.#options.authority?.drain(this.#view(session), deadlineAt, reason);
     this.#assertContinuation(session, continuation);
@@ -755,14 +849,14 @@ export class FabricWssServer {
     this.#sweep.unref?.();
   }
 
-  async #withinDeadline(promise: Promise<void>, ms: number): Promise<void> {
-    if (ms <= 0) return;
+  async #withinDeadline(promise: Promise<void>, ms: number): Promise<boolean> {
+    if (ms <= 0) return false;
     let timer: NodeJS.Timeout | undefined;
     try {
-      await Promise.race([
-        promise,
-        new Promise<void>((resolve) => {
-          timer = setTimeout(resolve, ms);
+      return await Promise.race([
+        promise.then(() => true),
+        new Promise<boolean>((resolve) => {
+          timer = setTimeout(() => resolve(false), ms);
           timer.unref?.();
         }),
       ]);
@@ -813,6 +907,9 @@ export class FabricWssServer {
       session.authorityRetryTimer = undefined;
     }
     if (session.retirementState === "active") {
+      // Synchronously remove executable registrations before any authority,
+      // callback, or socket cleanup is awaited or scheduled.
+      try { this.#options.relay?.retire(this.#view(session), reason); } catch { /* relay retirement is fail-closed */ }
       session.retirementState = "retiring";
       session.retirementReason = reason;
       session.state = "closed";
@@ -852,6 +949,14 @@ export class FabricWssServer {
       session.socketCleanupPromise = new Promise<void>((resolve) => { session.resolveSocketCleanup = resolve; });
     }
     return session.socketCleanupPromise;
+  }
+
+  #retirementCleanupPromise(session: LiveSession): Promise<void> {
+    if (session.retirementState === "retired") return Promise.resolve();
+    if (session.retirementCleanupPromise === undefined) {
+      session.retirementCleanupPromise = new Promise<void>((resolve) => { session.resolveRetirementCleanup = resolve; });
+    }
+    return session.retirementCleanupPromise;
   }
 
   #startSocketCleanup(session: LiveSession, closeCode: number): void {
@@ -972,6 +1077,7 @@ export class FabricWssServer {
         if (session.callbackRetryTimer !== undefined) clearTimeout(session.callbackRetryTimer);
         session.callbackWatchdog = undefined;
         session.callbackRetryTimer = undefined;
+        this.#tryCompleteRetirement(session);
       }, () => {
         if (session.callbackCleanupState !== "running" || session.callbackCleanupAttempt !== attempt) return;
         if (session.callbackWatchdog !== undefined) clearTimeout(session.callbackWatchdog);
@@ -996,17 +1102,22 @@ export class FabricWssServer {
 
   #tryCompleteRetirement(session: LiveSession): void {
     if (session.retirementState !== "retiring" || session.socketCleanupState !== "succeeded" ||
-      (session.authorityCleanupState !== "succeeded" && session.authorityCleanupState !== "not_required")) return;
+      (session.authorityCleanupState !== "succeeded" && session.authorityCleanupState !== "not_required") ||
+      (session.callbackCleanupState !== "succeeded" && session.callbackCleanupState !== "not_required")) return;
     session.retirementState = "retired";
+    session.resolveRetirementCleanup?.();
+    session.resolveRetirementCleanup = undefined;
     if (this.#sessions.get(session.key) === session) this.#sessions.delete(session.key);
   }
 
   #view(session: LiveSession): FabricConnectorSession {
     return {
-      connectorId: session.credential?.connectorId ?? "", connectionId: session.connectionId,
+      connectorId: session.credential?.connectorId ?? "", deviceId: session.lease?.deviceId ?? "", connectionId: session.connectionId,
       connectionGeneration: session.connectionGeneration, instanceNonce: session.instanceNonce, state: session.state,
       advertisementRevision: session.advertisementRevision, lastHeartbeatAt: session.lastHeartbeatAt,
       current: session.credential !== undefined && this.#liveByConnector.get(session.credential.connectorId) === session.key,
+      negotiatedLimits: { ...session.negotiatedLimits },
+      ...(session.relayVersion === undefined ? {} : { relayVersion: session.relayVersion }),
     };
   }
 
@@ -1034,12 +1145,40 @@ export class FabricWssServer {
     }
   }
 
-  #send(session: LiveSession, envelope: FabricEnvelopeV1): void {
-    if (session.socket.readyState !== session.socket.OPEN) return;
+  #send(session: LiveSession, envelope: FabricEnvelopeV1, priority: "operation" | "control" = "control"): void {
+    if (session.socket.readyState !== session.socket.OPEN || session.retirementState !== "active") {
+      if (priority === "operation") throw new FabricContractError("unavailable", "Fabric Connector socket is not open");
+      return;
+    }
     const text = JSON.stringify(envelope);
-    if (Buffer.byteLength(text, "utf8") > session.negotiatedLimits.maxFrameBytes) {
+    const textBytes = Buffer.byteLength(text, "utf8");
+    if (textBytes > session.negotiatedLimits.maxFrameBytes) {
       throw new FabricContractError("resource_exhausted", "Fabric frame exceeds maxFrameBytes", "maxFrameBytes");
     }
-    session.socket.send(text);
+    const operationCapacity = session.negotiatedLimits.maxInFlightOperations;
+    const controlCapacity = 3;
+    const operationBufferedLimit = session.negotiatedLimits.maxFrameBytes * operationCapacity;
+    const controlBufferedLimit = session.negotiatedLimits.maxFrameBytes * (operationCapacity + controlCapacity);
+    if ((priority === "operation" && (session.pendingOperationWrites >= operationCapacity || session.socket.bufferedAmount > operationBufferedLimit)) ||
+      (priority === "control" && (session.pendingControlWrites >= controlCapacity || session.socket.bufferedAmount > controlBufferedLimit))) {
+      throw new FabricContractError("resource_exhausted", "Fabric Connector send backpressure limit is exceeded", "bufferedAmount");
+    }
+    if (priority === "operation") session.pendingOperationWrites += 1;
+    else session.pendingControlWrites += 1;
+    const releaseWrite = (): void => {
+      if (priority === "operation") session.pendingOperationWrites = Math.max(0, session.pendingOperationWrites - 1);
+      else session.pendingControlWrites = Math.max(0, session.pendingControlWrites - 1);
+    };
+    try {
+      session.socket.send(text, (error) => {
+        releaseWrite();
+        if (error && session.retirementState === "active") {
+          this.#failSessionOperation(session, new FabricContractError("unavailable", "Fabric Connector send failed"));
+        }
+      });
+    } catch (error) {
+      releaseWrite();
+      throw error;
+    }
   }
 }

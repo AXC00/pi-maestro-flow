@@ -1,123 +1,306 @@
-import {
-  FabricContractError,
-  assertFabricIdentifier,
-} from "pi-maestro-fabric-core/v1";
+import { randomUUID } from "node:crypto";
+import { FabricContractError, assertFabricIdentifier, type DeviceRecord } from "pi-maestro-fabric-core/v1";
 import type { GatewayPairingPublicRecord, GatewayPairingStore } from "../pairing-store.ts";
-import { FabricConnectorSecurity, type FabricConnectorCredentialV1 } from "./security.ts";
+import {
+  FABRIC_ENROLL_SCOPE,
+  FABRIC_PAIRING_PROVIDER,
+  FABRIC_ROTATE_SCOPE,
+  GatewayFabricRegistrationAuthority,
+  type GatewayFabricRegistrationReceiptV1,
+} from "./registration.ts";
+import type { FabricConnectorSecurity } from "./security.ts";
 
-/** Audience a Fabric Connector pairing must carry; a legacy token never matches. */
+/** Audience a Fabric Connector purpose token must carry; a legacy token never matches. */
 export const FABRIC_PAIRING_AUDIENCE = "fabric" as const;
 
 export interface FabricPairingEnrollmentRequest {
-  /** Existing Gateway pairing id that authorizes this enrollment. */
-  pairingId: string;
+  /** Raw bearer token. A pairing id alone is never authorization. */
+  token: string;
+  requestId: string;
   connectorId: string;
+  keyId: string;
+  publicKey: string;
+  label?: string;
+  transport?: "outbound-wss" | "ssh" | "direct-https" | "edge-relay";
+  devices?: readonly Omit<DeviceRecord, "connectorId" | "revision">[];
+}
+
+export interface FabricPairingRotationRequest {
+  token: string;
+  requestId: string;
+  connectorId: string;
+  expectedRevision: number;
+  expectedCredentialGeneration: number;
   keyId: string;
   publicKey: string;
 }
 
-export interface FabricPairingAdapterOptions {
-  readonly pairings: GatewayPairingStore;
-  readonly security: FabricConnectorSecurity;
-  readonly now?: () => number;
+export interface FabricConnectorRevocationRequest {
+  requestId: string;
+  connectorId: string;
+  expectedRevision: number;
+  pairingId?: string;
+}
+
+export type FabricRegistrationOperation = "enroll" | "rotate" | "revoke";
+
+export interface FabricPostCommitResult {
+  readonly cleanupComplete: boolean;
+}
+
+export interface FabricConnectorRevocationResult extends GatewayFabricRegistrationReceiptV1 {
+  /** Durable registry state; kept distinct from retryable physical cleanup. */
+  readonly durableStatus: "revoked";
+  readonly cleanupStatus: "complete" | "pending";
+  readonly lifecycleStatus: "revoked" | "revoked-cleanup-pending";
 }
 
 /**
- * Bridge an existing Gateway pairing to a Fabric Connector enrollment.
- *
- * The bridge is one-way and narrow on purpose: a pairing authorizes *an
- * enrollment*, and the Fabric credential it produces is a separate identity
- * with its own generation. A legacy `gateway`-audience token is never upgraded
- * into Fabric authority, and only the pairing's Fabric-dedicated scopes are
- * carried over.
+ * Daemon-owned ordering boundary for purpose-token issuance/revocation and the
+ * complete authenticate-to-registration-commit interval.
+ */
+export class FabricRegistrationLifecycleGate {
+  #tail: Promise<void> = Promise.resolve();
+  readonly #revokedPairings = new Set<string>();
+
+  fencePairingRevocation(pairingId: string): void {
+    assertFabricIdentifier(pairingId, "pairingId");
+    this.#revokedPairings.add(pairingId);
+  }
+
+  pairingRevocationPending(pairingId: string): boolean {
+    return this.#revokedPairings.has(pairingId);
+  }
+
+  clearPairingRevocationFence(pairingId: string): void {
+    this.#revokedPairings.delete(pairingId);
+  }
+
+  async run<T>(operation: () => Promise<T>): Promise<T> {
+    let release!: () => void;
+    const previous = this.#tail;
+    this.#tail = new Promise<void>((resolve) => { release = resolve; });
+    await previous;
+    try { return await operation(); }
+    finally { release(); }
+  }
+}
+
+export interface FabricPairingAdapterOptions {
+  readonly pairings: GatewayPairingStore;
+  readonly authority: GatewayFabricRegistrationAuthority;
+  /** Optional live challenge owner; invalidated only after durable commits. */
+  readonly security?: FabricConnectorSecurity;
+  readonly gate?: FabricRegistrationLifecycleGate;
+  /** Post-commit projection/session fence. A failure must leave admission blocked. */
+  readonly afterCommit?: (connectorId: string, operation: FabricRegistrationOperation) => FabricPostCommitResult | Promise<FabricPostCommitResult>;
+}
+
+/**
+ * Authenticates narrow Fabric-purpose tokens, then consumes them atomically with
+ * the durable registration mutation. Pairing-store cleanup happens only after
+ * the registry commit and is never the authority for single-use enforcement.
  */
 export class FabricPairingAdapter {
   readonly #pairings: GatewayPairingStore;
-  readonly #security: FabricConnectorSecurity;
-  readonly #now: () => number;
-  readonly #byPairing = new Map<string, string>();
+  readonly #authority: GatewayFabricRegistrationAuthority;
+  readonly #security?: FabricConnectorSecurity;
+  readonly #gate: FabricRegistrationLifecycleGate;
+  readonly #afterCommit?: FabricPairingAdapterOptions["afterCommit"];
 
   constructor(options: FabricPairingAdapterOptions) {
     this.#pairings = options.pairings;
+    this.#authority = options.authority;
     this.#security = options.security;
-    this.#now = options.now ?? Date.now;
+    this.#gate = options.gate ?? new FabricRegistrationLifecycleGate();
+    this.#afterCommit = options.afterCommit;
   }
 
-  /** Enroll the Connector named by an active Fabric-audience pairing. */
-  async enrollFromPairing(request: FabricPairingEnrollmentRequest): Promise<FabricConnectorCredentialV1> {
-    assertFabricIdentifier(request.pairingId, "pairingId");
-    assertFabricIdentifier(request.connectorId, "connectorId");
-    const record = await this.#pairingRecord(request.pairingId);
-    const scopes = this.#fabricScopes(record);
-    const credential = this.#security.enroll({
-      connectorId: request.connectorId,
-      keyId: request.keyId,
-      publicKey: request.publicKey,
-      scopes,
+  async enrollFromPairing(request: FabricPairingEnrollmentRequest): Promise<GatewayFabricRegistrationReceiptV1> {
+    return this.#gate.run(async () => {
+      assertFabricIdentifier(request.connectorId, "connectorId");
+      const pairing = await this.#authenticatePurpose(request.token, request.connectorId, FABRIC_ENROLL_SCOPE);
+      if (this.#gate.pairingRevocationPending(pairing.id)) {
+        throw new FabricContractError("permission_denied", "Fabric purpose token revocation is pending", "authorization");
+      }
+      const revalidated = await this.#authenticatePurpose(request.token, request.connectorId, FABRIC_ENROLL_SCOPE);
+      if (revalidated.id !== pairing.id || this.#gate.pairingRevocationPending(pairing.id)) {
+        throw new FabricContractError("permission_denied", "Fabric purpose token revocation is pending", "authorization");
+      }
+      const receipt = await this.#authority.enroll({
+        requestId: request.requestId,
+        pairingId: pairing.id,
+        rawToken: request.token,
+        authorizationExpiresAt: revalidated.expiresAt,
+        connector: {
+          connectorId: request.connectorId,
+          label: request.label ?? request.connectorId,
+          transport: request.transport ?? "outbound-wss",
+        },
+        devices: request.devices ?? [],
+        keyId: request.keyId,
+        publicKeySpki: request.publicKey,
+      });
+      await this.#postCommit(request.connectorId, "enroll");
+      // Best-effort bootstrap cleanup. The durable consumption tombstone already
+      // makes reuse impossible if this independent write fails. Deliberately do
+      // not call the coupled public revoke path here: that would revoke the new
+      // Connector whose bootstrap token was just consumed.
+      await this.#pairings.revoke(pairing.id, { revokedBy: "fabric-registration-consumed" }).catch(() => false);
+      return receipt;
     });
-    this.#byPairing.set(request.pairingId, request.connectorId);
-    return credential;
+  }
+
+  async rotateFromPairing(request: FabricPairingRotationRequest): Promise<GatewayFabricRegistrationReceiptV1> {
+    return this.#gate.run(async () => {
+      assertFabricIdentifier(request.connectorId, "connectorId");
+      const pairing = await this.#authenticatePurpose(
+        request.token,
+        request.connectorId,
+        FABRIC_ROTATE_SCOPE,
+        request.expectedCredentialGeneration,
+      );
+      if (this.#gate.pairingRevocationPending(pairing.id)) {
+        throw new FabricContractError("permission_denied", "Fabric purpose token revocation is pending", "authorization");
+      }
+      const revalidated = await this.#authenticatePurpose(
+        request.token,
+        request.connectorId,
+        FABRIC_ROTATE_SCOPE,
+        request.expectedCredentialGeneration,
+      );
+      if (revalidated.id !== pairing.id || this.#gate.pairingRevocationPending(pairing.id)) {
+        throw new FabricContractError("permission_denied", "Fabric purpose token revocation is pending", "authorization");
+      }
+      const receipt = await this.#authority.rotate({
+        requestId: request.requestId,
+        pairingId: pairing.id,
+        rawToken: request.token,
+        authorizationExpiresAt: revalidated.expiresAt,
+        connectorId: request.connectorId,
+        expectedRevision: request.expectedRevision,
+        expectedCredentialGeneration: request.expectedCredentialGeneration,
+        keyId: request.keyId,
+        publicKeySpki: request.publicKey,
+      });
+      await this.#postCommit(request.connectorId, "rotate");
+      await this.#pairings.revoke(pairing.id, { revokedBy: "fabric-registration-consumed" }).catch(() => false);
+      return receipt;
+    });
+  }
+
+  /** Owner-authenticated Connector revoke, ordered against purpose enrollment. */
+  async revokeConnector(request: FabricConnectorRevocationRequest): Promise<FabricConnectorRevocationResult> {
+    return this.#gate.run(async () => {
+      const receipt = await this.#authority.revoke(request);
+      const projected = await this.#postCommit(request.connectorId, "revoke");
+      const pairingsCleaned = await this.#cleanupConnectorPairings(request.connectorId, "fabric-connector-revoke");
+      const cleanupComplete = projected.cleanupComplete && pairingsCleaned;
+      return {
+        ...receipt,
+        durableStatus: "revoked",
+        cleanupStatus: cleanupComplete ? "complete" : "pending",
+        lifecycleStatus: cleanupComplete ? "revoked" : "revoked-cleanup-pending",
+      };
+    });
   }
 
   /**
-   * Revoke both halves together.
-   *
-   * Revoking the pairing alone would leave a live Fabric credential behind, and
-   * revoking the credential alone would leave the pairing able to enroll
-   * another one, so neither half is optional.
+   * Operator-side coupled revoke. Durable Connector revocation commits first;
+   * pairing cleanup may fail without resurrecting the Connector.
    */
-  async revokeForPairing(pairingId: string): Promise<FabricConnectorCredentialV1 | undefined> {
+  async revokeForPairing(
+    pairingId: string,
+    options: { requestId?: string; expectedRevision?: number } = {},
+  ): Promise<GatewayFabricRegistrationReceiptV1 | undefined> {
+    this.#gate.fencePairingRevocation(pairingId);
+    try {
+      return await this.#gate.run(async () => (await this.#revokePairingUnlocked(pairingId, options)).receipt);
+    } finally {
+      this.#gate.clearPairingRevocationFence(pairingId);
+    }
+  }
+
+  /** Generic control-compatible revoke result, still ordered with enrollment. */
+  async revokePairing(
+    pairingId: string,
+    options: { requestId?: string; expectedRevision?: number; revokedBy?: string; replacementId?: string } = {},
+  ): Promise<{ revoked: boolean; receipt?: GatewayFabricRegistrationReceiptV1; cleanupStatus?: "complete" | "pending" }> {
+    this.#gate.fencePairingRevocation(pairingId);
+    try {
+      return await this.#gate.run(() => this.#revokePairingUnlocked(pairingId, options));
+    } finally {
+      this.#gate.clearPairingRevocationFence(pairingId);
+    }
+  }
+
+  async connectorOfPairing(pairingId: string): Promise<string | undefined> {
+    return this.#authority.connectorOfPairing(pairingId);
+  }
+
+  async #revokePairingUnlocked(
+    pairingId: string,
+    options: { requestId?: string; expectedRevision?: number; revokedBy?: string; replacementId?: string },
+  ): Promise<{ revoked: boolean; receipt?: GatewayFabricRegistrationReceiptV1; cleanupStatus?: "complete" | "pending" }> {
     assertFabricIdentifier(pairingId, "pairingId");
-    const connectorId = this.#byPairing.get(pairingId);
-    let revoked: FabricConnectorCredentialV1 | undefined;
-    if (connectorId !== undefined) {
-      const credential = this.#security.credentialOf(connectorId);
-      if (credential !== undefined && !credential.revoked) {
-        revoked = this.#security.revoke(connectorId, credential.revision);
-      }
-      this.#byPairing.delete(pairingId);
+    const connectorId = await this.#authority.connectorOfPairing(pairingId);
+    if (connectorId === undefined) {
+      const revoked = await this.#pairings.revoke(pairingId, {
+        ...(options.revokedBy === undefined ? {} : { revokedBy: options.revokedBy }),
+        ...(options.replacementId === undefined ? {} : { replacementId: options.replacementId }),
+      });
+      return { revoked };
     }
-    await this.#pairings.revoke(pairingId, { revokedBy: "fabric-pairing-adapter" });
-    return revoked;
+    const registration = await this.#authority.read(connectorId);
+    if (registration === undefined) throw new FabricContractError("protocol_violation", "Consumed pairing references a missing Connector", "pairingId");
+    const receipt = await this.#authority.revoke({
+      requestId: options.requestId ?? `revoke:${randomUUID()}`,
+      connectorId,
+      expectedRevision: options.expectedRevision ?? registration.connector.revision,
+      pairingId,
+    });
+    const projected = await this.#postCommit(connectorId, "revoke");
+    const pairingsCleaned = await this.#cleanupConnectorPairings(connectorId, options.revokedBy ?? "fabric-pairing-adapter");
+    return { revoked: true, receipt, cleanupStatus: projected.cleanupComplete && pairingsCleaned ? "complete" : "pending" };
   }
 
-  /** Connector this pairing enrolled, when one is bound. */
-  connectorOfPairing(pairingId: string): string | undefined {
-    return this.#byPairing.get(pairingId);
+  async #cleanupConnectorPairings(connectorId: string, revokedBy: string): Promise<boolean> {
+    try {
+      const durableIds = await this.#authority.pairingIdsOfConnector(connectorId);
+      const issuedIds = (await this.#pairings.list({ includeInactive: true }))
+        .filter((pairing) => pairing.audience === FABRIC_PAIRING_AUDIENCE && pairing.provider === FABRIC_PAIRING_PROVIDER && pairing.instance === connectorId)
+        .map((pairing) => pairing.id);
+      const pairingIds = [...new Set([...durableIds, ...issuedIds])];
+      const results = await Promise.all(pairingIds.map((pairingId) => this.#pairings.revoke(pairingId, { revokedBy }).then(() => true, () => false)));
+      return results.every(Boolean);
+    } catch {
+      return false;
+    }
   }
 
-  async #pairingRecord(pairingId: string): Promise<GatewayPairingPublicRecord> {
-    const record = (await this.#pairings.list({ includeInactive: true })).find((entry) => entry.id === pairingId);
+  async #postCommit(connectorId: string, operation: FabricRegistrationOperation): Promise<FabricPostCommitResult> {
+    if (operation !== "enroll") this.#security?.invalidateChallenges(connectorId);
+    return await this.#afterCommit?.(connectorId, operation) ?? { cleanupComplete: true };
+  }
+
+  async #authenticatePurpose(
+    token: string,
+    connectorId: string,
+    scope: typeof FABRIC_ENROLL_SCOPE | typeof FABRIC_ROTATE_SCOPE,
+    generation?: number,
+  ): Promise<GatewayPairingPublicRecord> {
+    const record = await this.#pairings.authenticate(token, {
+      audience: FABRIC_PAIRING_AUDIENCE,
+      provider: FABRIC_PAIRING_PROVIDER,
+      instance: connectorId,
+      ...(generation === undefined ? {} : { generation }),
+    });
     if (record === undefined) {
-      throw new FabricContractError("not_found", "Gateway pairing is not known", "pairingId");
+      throw new FabricContractError("unauthenticated", "Fabric purpose token is invalid or unavailable", "authorization");
     }
-    if (record.audience !== FABRIC_PAIRING_AUDIENCE) {
-      // The legacy audience is the migration boundary: a `gateway` token is not
-      // a Fabric credential and must not become one by being presented here.
-      throw new FabricContractError(
-        "permission_denied",
-        "Gateway pairing audience is not a Fabric audience; a legacy Gateway token never grants Fabric authority",
-        "pairingId",
-      );
-    }
-    if (record.revokedAt !== undefined) {
-      throw new FabricContractError("permission_denied", "Gateway pairing is revoked", "pairingId");
-    }
-    if (record.expiresAt <= this.#now()) {
-      throw new FabricContractError("expired", "Gateway pairing has expired", "pairingId");
+    if (record.scopes.length !== 1 || record.scopes[0] !== scope) {
+      throw new FabricContractError("permission_denied", `Fabric purpose token must grant exactly ${scope}`, "authorization");
     }
     return record;
-  }
-
-  #fabricScopes(record: GatewayPairingPublicRecord): string[] {
-    const scopes = record.scopes.filter((scope) => scope.startsWith("fabric."));
-    if (scopes.length === 0) {
-      throw new FabricContractError(
-        "permission_denied",
-        "Gateway pairing carries no Fabric-dedicated scope, so it authorizes no Connector enrollment",
-        "pairingId",
-      );
-    }
-    return scopes;
   }
 }

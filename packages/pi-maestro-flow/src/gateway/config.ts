@@ -301,7 +301,7 @@ export interface GatewayFabricConfig {
    * operator setting on the next load.
    */
   audience?: string;
-  /** Absolute path of the Connector enrollment document, when one is persisted. */
+  /** Complete five-store Gateway Fabric authority document override. */
   enrollmentPath?: string;
   limits?: {
     maxFrameBytes: number;

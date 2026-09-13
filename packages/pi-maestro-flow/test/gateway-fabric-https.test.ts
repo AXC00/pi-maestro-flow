@@ -23,6 +23,7 @@ import { FABRIC_ENDPOINT_REQUEST_VERSION, FabricEndpointDispatcher } from "../sr
 import { createGatewayPrincipal } from "../src/gateway/principal.ts";
 import { workspaceIdForPath } from "../src/gateway/state-paths.ts";
 import { createTestGatewayConfig } from "./gateway-test-helpers.ts";
+import { FabricOriginDataPlaneGrantAuthority } from "../src/gateway/fabric/origin-runtime.ts";
 
 const certificatePath = join(import.meta.dirname, "fixtures", "fabric-test-cert.pem");
 const keyPath = join(import.meta.dirname, "fixtures", "fabric-test-key.pem");
@@ -347,6 +348,89 @@ test("real TLS exchange carries exact cancel frames and rejects duplicate or uns
   assert.equal(handlerAborted, true);
   assert.equal(runtime.fabricHttpChannelServer?.activeExchangeCount, 0);
   assert.equal(runtime.fabricEndpointDispatcher?.pendingRequestCount, 0);
+});
+
+test("origin grant deadline is enforced server-side and release aborts an admitted dispatch", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "gateway-fabric-grant-abort-"));
+  const cert = await readFile(certificatePath);
+  const endpoint: EndpointRecord = {
+    endpointId: "agent-grant-abort", deviceId: "device-grant", connectorId: "connector-grant", scope: { kind: "device" },
+    generation: 1, contractHash: "d".repeat(64), status: "online", revision: 1, kind: "agent", agentName: "grant-test",
+    roles: ["general"], taskTypes: ["development"], models: ["provider/model"], maxConcurrency: 1,
+  };
+  const route: EndpointRouteHandle = {
+    routeId: "route-grant-abort", connectionId: "connection-grant", endpointId: endpoint.endpointId,
+    connectionGeneration: 1, endpointGeneration: 1, issuedAt: Date.now() - 1_000,
+    expiresAt: Date.now() + 60_000, state: "open", revision: 1,
+  };
+  const routes = { validateRoute(id: string): EndpointRouteHandle { if (id !== route.routeId) throw new Error("wrong route"); return { ...route }; } };
+  const endpoints = { getEndpoint(id: string): EndpointRecord | undefined { return id === endpoint.endpointId ? { ...endpoint } : undefined; } };
+  const grants = new FabricOriginDataPlaneGrantAuthority({
+    hubRuntimeEpoch: "hub-grant-abort",
+    daemonGeneration: "daemon-grant-abort",
+    authority: { routeOf: routes.validateRoute, endpointOf: endpoints.getEndpoint },
+    maxTtlMs: 5_000,
+  });
+  let entered!: () => void;
+  const started = new Promise<void>((resolve) => { entered = resolve; });
+  let handlerAborted = false;
+  const config = createTestGatewayConfig(root, { mode: "bearer", token: "legacy" });
+  config.transport.http = { enabled: true, host: "localhost", port: 0, path: "/mcp", tls: { enabled: true, certFile: certificatePath, keyFile: keyPath } };
+  const runtime = await GatewayRuntime.create({
+    config,
+    cwd: root,
+    fabricOriginDataPlaneGrants: grants,
+    fabricRouteAuthority: routes,
+    fabricEndpointDirectory: endpoints,
+    fabricHttpChannelEnabled: true,
+    fabricEndpointRegistrations: [{ endpointId: endpoint.endpointId, kind: "agent", handler: {
+      async handle({ signal }): Promise<JsonValue> {
+        entered();
+        return new Promise((_resolve, reject) => signal.addEventListener("abort", () => {
+          handlerAborted = true;
+          reject(new FabricContractError("cancelled", "grant release reached relay"));
+        }, { once: true }));
+      },
+    } }],
+  });
+  const server = await startGatewayHttpServer(runtime, { host: "localhost", port: 0 });
+  const origin = new URL(server.url); origin.pathname = "/";
+  grants.configureHttps({ baseUrl: origin.href, ca: cert.toString("utf8") });
+  t.after(async () => { await server.close(); await runtime.close(); await rm(root, { recursive: true, force: true }); });
+  const placement = {
+    version: "fabric.placement.v1" as const,
+    placementId: "placement-grant-abort",
+    routeId: route.routeId,
+    endpointId: endpoint.endpointId,
+    connectionGeneration: 1,
+    endpointGeneration: 1,
+    deadlineAt: route.expiresAt,
+  };
+  const acquired = grants.acquire({
+    providerGeneration: 1, providerOwnerId: "provider-owner", correlationId: "grant-abort-attempt", placement,
+  });
+  const transport = new FabricHttpsTransport({ baseUrl: origin, token: acquired.token, ca: cert });
+  await assert.rejects(() => transport.dispatch({
+    routeId: route.routeId, endpointId: endpoint.endpointId, endpointKind: "agent", endpointGeneration: 1,
+    deadlineAt: placement.deadlineAt, operation: "agent.wait", input: {}, requestId: "grant-too-long",
+  }, new AbortController().signal), /exceeds its grant/u);
+
+  const pending = transport.dispatch({
+    routeId: route.routeId, endpointId: endpoint.endpointId, endpointKind: "agent", endpointGeneration: 1,
+    deadlineAt: acquired.expiresAt, operation: "agent.wait", input: {}, requestId: "grant-live",
+  }, new AbortController().signal);
+  await started;
+  grants.release({
+    grantId: acquired.grantId,
+    hubRuntimeEpoch: acquired.hubRuntimeEpoch,
+    daemonGeneration: acquired.daemonGeneration,
+    providerGeneration: acquired.providerGeneration,
+    providerOwnerId: acquired.providerOwnerId,
+    correlationId: acquired.correlationId,
+    placementId: acquired.placementId,
+  });
+  await assert.rejects(() => pending, /cancelled|grant/u);
+  assert.equal(handlerAborted, true);
 });
 
 test("dispatcher enforces an absolute deadline and releases capacity for a never-settling handler", async () => {

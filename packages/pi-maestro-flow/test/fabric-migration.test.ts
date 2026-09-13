@@ -30,6 +30,7 @@ import {
 import { GatewayFabricControlSupport } from "../src/gateway/fabric/control-support.ts";
 import { FabricConnectorSecurity, fabricChallengeProofPayload } from "../src/gateway/fabric/security.ts";
 import { FABRIC_PAIRING_AUDIENCE, FabricPairingAdapter } from "../src/gateway/fabric/pairing-adapter.ts";
+import { FABRIC_ENROLL_SCOPE, FABRIC_PAIRING_PROVIDER, GatewayFabricRegistrationAuthority } from "../src/gateway/fabric/registration.ts";
 import { GatewayEventJournal } from "../src/gateway/event-journal.ts";
 import { GatewayFabricEventAdapter } from "../src/gateway/fabric/event-adapter.ts";
 import { recoverGatewayFabric } from "../src/gateway/fabric/recovery.ts";
@@ -102,85 +103,45 @@ test("a legacy Gateway token never becomes Fabric authority, and Fabric keeps it
   const root = await mkdtemp(join(tmpdir(), "fabric-migration-pairing-"));
   t.after(() => rm(root, { recursive: true, force: true }));
   const pairings = new GatewayPairingStore({ path: join(root, "pairings.json") });
-  const security = new FabricConnectorSecurity({ audience: AUDIENCE });
-  const adapter = new FabricPairingAdapter({ pairings, security });
+  const store = new GatewayFabricStore({ path: join(root, "fabric.json") });
+  const authority = new GatewayFabricRegistrationAuthority(new FabricStoreCoordinator(store), { audience: AUDIENCE });
+  const security = new FabricConnectorSecurity({ audience: AUDIENCE, credentialAuthority: authority });
+  const adapter = new FabricPairingAdapter({ pairings, authority, security });
 
   const { publicKey, privateKey } = generateKeyPairSync("ed25519");
   const spki = publicKey.export({ format: "der", type: "spki" }).toString("base64");
+  const request = (token: string, requestId: string) => ({ token, requestId, connectorId: "connector-1", keyId: "key-1", publicKey: spki });
 
-  // A legacy `gateway` pairing must not be upgraded: migration is a new
-  // enrollment, not an extension of the old token's authority.
   const legacy = await pairings.issue({ scopes: ["gateway.workspace"], ttlMs: 60_000 });
-  await assert.rejects(
-    () => adapter.enrollFromPairing({ pairingId: legacy.id, connectorId: "connector-1", keyId: "key-1", publicKey: spki }),
-    (error: FabricContractError) => {
-      assert.equal(error.code, "permission_denied");
-      assert.match(error.message, /never grants Fabric authority/);
-      return true;
-    },
-  );
+  await assert.rejects(() => adapter.enrollFromPairing(request(legacy.token, "legacy-request")), /purpose token is invalid/);
+  assert.equal((await authority.list()).length, 0);
 
-  // A Fabric-audience pairing that carries no Fabric-dedicated scope grants nothing.
-  const scopeLess = await pairings.issue({ audience: FABRIC_PAIRING_AUDIENCE, scopes: ["gateway.workspace"], ttlMs: 60_000 });
-  await assert.rejects(
-    () => adapter.enrollFromPairing({ pairingId: scopeLess.id, connectorId: "connector-1", keyId: "key-1", publicKey: spki }),
-    /no Fabric-dedicated scope/,
-  );
-
-  // Enrollment itself refuses a legacy grant even when called directly.
-  assert.throws(
-    () => security.enroll({ connectorId: "connector-legacy", keyId: "key-1", publicKey: spki, scopes: ["gateway.workspace"] }),
-    /legacy Gateway grants never authorize Fabric/,
-  );
+  const wrongPurpose = await pairings.issue({
+    audience: FABRIC_PAIRING_AUDIENCE, scopes: ["fabric.rotate"], provider: FABRIC_PAIRING_PROVIDER,
+    instance: "connector-1", ttlMs: 60_000,
+  });
+  await assert.rejects(() => adapter.enrollFromPairing(request(wrongPurpose.token, "wrong-purpose-request")), /must grant exactly fabric\.enroll/);
 
   const fabricPairing = await pairings.issue({
-    audience: FABRIC_PAIRING_AUDIENCE,
-    scopes: ["fabric.data.*", "gateway.workspace"],
-    ttlMs: 60_000,
+    audience: FABRIC_PAIRING_AUDIENCE, scopes: [FABRIC_ENROLL_SCOPE], provider: FABRIC_PAIRING_PROVIDER,
+    instance: "connector-1", ttlMs: 60_000,
   });
-  const credential = await adapter.enrollFromPairing({
-    pairingId: fabricPairing.id,
-    connectorId: "connector-1",
-    keyId: "key-1",
-    publicKey: spki,
-  });
-  // The pairing audience authorizes the enrollment; the credential carries the
-  // Hub's own audience, so the two trust domains stay distinct.
-  assert.equal(credential.audience, AUDIENCE);
-  assert.notEqual(credential.audience, FABRIC_PAIRING_AUDIENCE);
-  assert.deepEqual(credential.scopes, ["fabric.data.*"]);
+  const receipt = await adapter.enrollFromPairing(request(fabricPairing.token, "enroll-request"));
+  assert.equal(receipt.credentialGeneration, 1);
+  const credential = authority.credentialOf("connector-1");
+  assert.equal(credential?.audience, AUDIENCE);
+  assert.notEqual(credential?.audience, FABRIC_PAIRING_AUDIENCE);
+  assert.deepEqual(credential?.scopes, ["fabric.connect"]);
 
   const challenge = security.issueChallenge("connector-1");
   assert.equal(challenge.audience, AUDIENCE);
   const proof = (target: { challengeId: string; challengeNonce: string; protocolVersion: string }, audience: string): FabricChallengeProofV1 => {
-    const claims = {
-      connectorId: "connector-1",
-      instanceNonce: "instance-nonce-1",
-      challengeNonce: target.challengeNonce,
-      protocolVersion: target.protocolVersion,
-      audience,
-      credentialGeneration: credential.credentialGeneration,
-    };
-    return {
-      version: "fabric.challenge-proof.v1",
-      challengeId: target.challengeId,
-      connectorId: claims.connectorId,
-      instanceNonce: claims.instanceNonce,
-      challengeNonce: claims.challengeNonce,
-      audience,
-      protocolVersion: claims.protocolVersion,
-      credentialGeneration: claims.credentialGeneration,
-      signature: signPayload(null, Buffer.from(fabricChallengeProofPayload(claims), "utf8"), privateKey).toString("base64"),
-    };
+    const claims = { connectorId: "connector-1", instanceNonce: "instance-nonce-1", challengeNonce: target.challengeNonce, protocolVersion: target.protocolVersion, audience, credentialGeneration: receipt.credentialGeneration };
+    return { version: "fabric.challenge-proof.v1", challengeId: target.challengeId, ...claims, signature: signPayload(null, Buffer.from(fabricChallengeProofPayload(claims), "utf8"), privateKey).toString("base64") };
   };
-  // A correctly signed proof that names the legacy audience is still refused:
-  // audience is a trust boundary, not a label the caller may choose.
   assert.throws(() => security.verifyProof(proof(challenge, "gateway")), /audience does not match this Hub/);
-
   const fresh = security.issueChallenge("connector-1");
-  const accepted = security.verifyProof(proof(fresh, AUDIENCE));
-  assert.equal(accepted.connectorId, "connector-1");
-  assert.equal(accepted.audience, AUDIENCE);
+  assert.equal(security.verifyProof(proof(fresh, AUDIENCE)).connectorId, "connector-1");
 });
 
 test("a Fabric request while Fabric is disabled fails closed and is never executed as legacy work", async (t) => {

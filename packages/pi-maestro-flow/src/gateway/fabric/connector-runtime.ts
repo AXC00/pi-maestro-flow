@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import WebSocket from "ws";
 import {
+  FABRIC_HUB_RELAY_VERSION,
   FABRIC_PROTOCOL_VERSION,
   FabricContractError,
   assertValidFabricEnvelope,
@@ -10,6 +11,11 @@ import {
   type JsonValue,
 } from "pi-maestro-fabric-core/v1";
 import { fabricChallengeProofPayload } from "./security.ts";
+import {
+  FabricDeviceRelayOwner,
+  type FabricDeviceRelayExecutionHandler,
+  type FabricHubRelayLimits,
+} from "./hub-relay.ts";
 
 const CONNECTOR_LIMITS: FabricProtocolLimits = Object.freeze({
   maxFrameBytes: 256 * 1024,
@@ -50,6 +56,10 @@ export interface FabricConnectorRuntimeOptions {
   readonly reconnectDelayMs?: number;
   readonly maxReconnectAttempts?: number;
   readonly advertisementOf?: () => FabricConnectorAdvertisement;
+  /** Optional T4 Device Agent bridge. Its presence advertises relay support. */
+  readonly relayHandler?: FabricDeviceRelayExecutionHandler;
+  readonly relayLimits?: Partial<FabricHubRelayLimits>;
+  readonly onConnected?: (info: { connectionId: string; connectionGeneration: number }) => void;
   readonly onReady?: (info: { connectionId: string; connectionGeneration: number; advertisementRevision: number }) => void;
   readonly onDrain?: (reason: string) => void;
   readonly onError?: (message: string) => void;
@@ -112,6 +122,9 @@ export class FabricConnectorRuntime {
   #reconnectTimer?: NodeJS.Timeout;
   #reconnectAttempts = 0;
   #pending?: PendingStart;
+  #relayOwner?: FabricDeviceRelayOwner;
+  #pendingOperationWrites = 0;
+  #pendingControlWrites = 0;
   #stopRequested = false;
   #attemptToken = 0;
   #failedAttemptToken = 0;
@@ -167,6 +180,10 @@ export class FabricConnectorRuntime {
     this.#advertisementRevision = 0;
     this.#pendingAdvertisement = undefined;
     this.#heartbeatSequence = 0;
+    this.#relayOwner?.retire("Connector runtime restarted");
+    this.#relayOwner = undefined;
+    this.#pendingOperationWrites = 0;
+    this.#pendingControlWrites = 0;
     this.#negotiatedLimits = { ...this.#limits };
     this.#instanceNonce = this.#options.instanceNonce ?? randomUUID();
     this.#stopRequested = false;
@@ -184,6 +201,8 @@ export class FabricConnectorRuntime {
     if (this.#reconnectTimer !== undefined) clearTimeout(this.#reconnectTimer);
     this.#reconnectTimer = undefined;
     this.#clearHeartbeat();
+    this.#relayOwner?.retire(reason);
+    this.#relayOwner = undefined;
     const socket = this.#socket;
     if (socket === undefined || socket.readyState === WebSocket.CLOSED) {
       this.#socket = undefined;
@@ -260,6 +279,7 @@ export class FabricConnectorRuntime {
             instanceNonce: this.#instanceNonce,
             credentialGeneration: this.#options.credentialGeneration,
             supportedVersions: [FABRIC_PROTOCOL_VERSION],
+            ...(this.#options.relayHandler === undefined ? {} : { relayVersions: [FABRIC_HUB_RELAY_VERSION] }),
             capabilityDigest: advertisement.capabilityDigest,
             limits: this.#limits as unknown as JsonValue,
           },
@@ -358,6 +378,7 @@ export class FabricConnectorRuntime {
         const acceptedLease = lease as Readonly<Record<string, JsonValue>>;
         const connectionId = acceptedLease.connectionId;
         const generation = acceptedLease.generation;
+        const deviceId = acceptedLease.deviceId;
         const acceptedLimits = limits as unknown as FabricProtocolLimits;
         try {
           assertValidFabricProtocolLimits(acceptedLimits);
@@ -370,21 +391,56 @@ export class FabricConnectorRuntime {
         }
         if (typeof connectionId !== "string" || !Number.isSafeInteger(generation) || (generation as number) < 1 ||
           envelope.connectionId !== connectionId || envelope.connectionGeneration !== generation ||
-          typeof acceptedLease.deviceId !== "string" || acceptedLease.connectorId !== this.#options.connectorId ||
+          typeof deviceId !== "string" || acceptedLease.connectorId !== this.#options.connectorId ||
           acceptedLease.state !== "connected" || typeof acceptedLease.capabilityDigest !== "string" ||
           typeof acceptedLease.establishedAt !== "number" || typeof acceptedLease.expiresAt !== "number" ||
           typeof acceptedLease.revision !== "number") {
           return this.#failOrReconnect("the Hub returned an invalid connection lease", attemptToken);
         }
+        const relayVersion = envelope.payload.relayVersion;
+        const hubRuntimeEpoch = envelope.payload.hubRuntimeEpoch;
+        if (relayVersion !== undefined && (relayVersion !== FABRIC_HUB_RELAY_VERSION || this.#options.relayHandler === undefined || typeof hubRuntimeEpoch !== "string")) {
+          return this.#failOrReconnect("the Hub selected relay support that this Connector did not offer", attemptToken);
+        }
+        if (relayVersion === undefined && hubRuntimeEpoch !== undefined) {
+          return this.#failOrReconnect("the Hub returned relay authority without negotiating a relay version", attemptToken);
+        }
         this.#negotiatedLimits = { ...acceptedLimits };
         this.#connectionId = connectionId;
         this.#connectionGeneration = generation as number;
+        const currentSocket = (): WebSocket | undefined => {
+          const socket = this.#socket;
+          return socket !== undefined && this.#isCurrentAttempt(socket, attemptToken) ? socket : undefined;
+        };
+        if (relayVersion === FABRIC_HUB_RELAY_VERSION && this.#options.relayHandler !== undefined) {
+          this.#relayOwner = new FabricDeviceRelayOwner({
+            identity: {
+              connectorId: this.#options.connectorId,
+              deviceId,
+              connectionId,
+              connectionGeneration: generation as number,
+              instanceNonce: this.#instanceNonce,
+              state: "connected",
+              current: true,
+              relayVersion,
+            },
+            hubRuntimeEpoch: hubRuntimeEpoch as string,
+            handler: this.#options.relayHandler,
+            ...(this.#options.relayLimits === undefined ? {} : { limits: this.#options.relayLimits }),
+            negotiatedLimits: acceptedLimits,
+            transport: {
+              send: (outgoing, priority) => this.#sendEnvelope(outgoing, priority, attemptToken),
+              get bufferedAmount(): number { return currentSocket()?.bufferedAmount ?? 0; },
+            },
+          });
+        }
         const advertisement = this.#pendingAdvertisement;
         this.#pendingAdvertisement = undefined;
         if (advertisement === undefined) {
           return this.#failOrReconnect("this Connector has no authenticated advertisement to publish", attemptToken);
         }
         this.#advertisementRevision = advertisement.advertisementRevision;
+        this.#options.onConnected?.({ connectionId: this.#connectionId, connectionGeneration: this.#connectionGeneration });
         this.#send({
           kind: "advertise_snapshot",
           payload: {
@@ -398,10 +454,16 @@ export class FabricConnectorRuntime {
       case "ready": {
         const revision = envelope.payload.advertisementRevision;
         const leaseExpiresAt = envelope.payload.leaseExpiresAt;
+        const relayVersion = envelope.payload.relayVersion;
         if (typeof leaseExpiresAt !== "number" || !Number.isSafeInteger(leaseExpiresAt) || leaseExpiresAt <= this.#now()) {
           return this.#failOrReconnect("the Hub reported ready without a live lease expiry", attemptToken);
         }
+        if ((this.#relayOwner === undefined) !== (relayVersion === undefined) ||
+          (relayVersion !== undefined && relayVersion !== FABRIC_HUB_RELAY_VERSION)) {
+          return this.#failOrReconnect("the Hub ready relay echo does not match connection acceptance", attemptToken);
+        }
         this.#state = "ready";
+        this.#relayOwner?.activate();
         this.#reconnectAttempts = 0;
         this.#startHeartbeat();
         this.#settleStart();
@@ -416,10 +478,23 @@ export class FabricConnectorRuntime {
         this.#awaitingAck = false;
         return;
       }
+      case "invoke":
+      case "cancel": {
+        if (this.#state !== "ready" || this.#relayOwner === undefined) {
+          return this.#failOrReconnect("the Hub sent an Agent relay frame before negotiated readiness", attemptToken);
+        }
+        this.#relayOwner.accept(envelope);
+        return;
+      }
+      case "stream":
+      case "receipt":
+        return this.#failOrReconnect("the Hub sent a wrong-direction Agent relay frame", attemptToken);
       case "drain": {
         const reason = typeof envelope.payload.reason === "string" ? envelope.payload.reason : "the Hub is draining";
         this.#state = "draining";
         this.#clearHeartbeat();
+        this.#relayOwner?.retire(reason);
+        this.#relayOwner = undefined;
         this.#options.onDrain?.(reason);
         return;
       }
@@ -433,6 +508,8 @@ export class FabricConnectorRuntime {
         return;
       }
       case "close": {
+        this.#relayOwner?.retire("the Hub closed the channel");
+        this.#relayOwner = undefined;
         this.#state = "closed";
         this.#notifyClosed("the Hub closed the channel");
         return;
@@ -473,29 +550,55 @@ export class FabricConnectorRuntime {
     input: { kind: FabricEnvelopeV1["kind"]; payload: Readonly<Record<string, JsonValue>> },
     attemptToken = this.#attemptToken,
   ): void {
-    const socket = this.#socket;
-    if (socket === undefined || socket.readyState !== WebSocket.OPEN || !this.#isCurrentAttempt(socket, attemptToken)) return;
+    const outgoing: FabricEnvelopeV1 = {
+      version: FABRIC_PROTOCOL_VERSION,
+      messageId: randomUUID(),
+      kind: input.kind,
+      sentAt: this.#now(),
+      ...(this.#connectionId === "" ? {} : { connectionId: this.#connectionId }),
+      ...(this.#connectionGeneration === 0 ? {} : { connectionGeneration: this.#connectionGeneration }),
+      payload: input.payload,
+    };
     try {
-      const envelope: FabricEnvelopeV1 = {
-        version: FABRIC_PROTOCOL_VERSION,
-        messageId: randomUUID(),
-        kind: input.kind,
-        sentAt: this.#now(),
-        ...(this.#connectionId === "" ? {} : { connectionId: this.#connectionId }),
-        ...(this.#connectionGeneration === 0 ? {} : { connectionGeneration: this.#connectionGeneration }),
-        payload: input.payload,
-      };
-      const text = JSON.stringify(envelope);
-      if (Buffer.byteLength(text, "utf8") > this.#negotiatedLimits.maxFrameBytes) {
-        throw new FabricContractError("resource_exhausted", "Fabric frame exceeds maxFrameBytes", "maxFrameBytes");
-      }
-      socket.send(text, (error) => {
-        if (error && this.#isCurrentAttempt(socket, attemptToken)) {
-          this.#failOrReconnect(error.message || "the Connector failed to send a Fabric frame", attemptToken);
-        }
-      });
+      this.#sendEnvelope(outgoing, "control", attemptToken);
     } catch (error) {
       this.#failOrReconnect(error instanceof Error ? error.message : "the Connector failed to send a Fabric frame", attemptToken);
+    }
+  }
+
+  #sendEnvelope(outgoing: FabricEnvelopeV1, priority: "operation" | "control", attemptToken: number): void {
+    const socket = this.#socket;
+    if (socket === undefined || socket.readyState !== WebSocket.OPEN || !this.#isCurrentAttempt(socket, attemptToken)) {
+      if (priority === "operation") throw new FabricContractError("unavailable", "Fabric Connector socket is not open");
+      return;
+    }
+    const text = JSON.stringify(outgoing);
+    if (Buffer.byteLength(text, "utf8") > this.#negotiatedLimits.maxFrameBytes) {
+      throw new FabricContractError("resource_exhausted", "Fabric frame exceeds maxFrameBytes", "maxFrameBytes");
+    }
+    const operationCapacity = this.#negotiatedLimits.maxInFlightOperations;
+    const controlCapacity = 3;
+    const operationBufferedLimit = this.#negotiatedLimits.maxFrameBytes * operationCapacity;
+    const controlBufferedLimit = this.#negotiatedLimits.maxFrameBytes * (operationCapacity + controlCapacity);
+    if ((priority === "operation" && (this.#pendingOperationWrites >= operationCapacity || socket.bufferedAmount > operationBufferedLimit)) ||
+      (priority === "control" && (this.#pendingControlWrites >= controlCapacity || socket.bufferedAmount > controlBufferedLimit))) {
+      throw new FabricContractError("resource_exhausted", "Fabric Connector send backpressure limit is exceeded", "bufferedAmount");
+    }
+    if (priority === "operation") this.#pendingOperationWrites += 1;
+    else this.#pendingControlWrites += 1;
+    const releaseWrite = (): void => {
+      if (priority === "operation") this.#pendingOperationWrites = Math.max(0, this.#pendingOperationWrites - 1);
+      else this.#pendingControlWrites = Math.max(0, this.#pendingControlWrites - 1);
+    };
+    try {
+      socket.send(text, (error) => {
+        if (!this.#isCurrentAttempt(socket, attemptToken)) return;
+        releaseWrite();
+        if (error) this.#failOrReconnect(error.message || "the Connector failed to send a Fabric frame", attemptToken);
+      });
+    } catch (error) {
+      releaseWrite();
+      throw error;
     }
   }
 
@@ -512,6 +615,8 @@ export class FabricConnectorRuntime {
     this.#failedAttemptToken = attemptToken;
     this.#notifyError(reason);
     this.#clearHeartbeat();
+    this.#relayOwner?.retire(reason);
+    this.#relayOwner = undefined;
     const socket = this.#socket;
     if (socket !== undefined && socket.readyState !== WebSocket.CLOSED) {
       try { socket.terminate(); } catch { /* reconnect still fences this attempt */ }
@@ -532,6 +637,8 @@ export class FabricConnectorRuntime {
     this.#connectionGeneration = 0;
     this.#pendingAdvertisement = undefined;
     this.#heartbeatSequence = 0;
+    this.#pendingOperationWrites = 0;
+    this.#pendingControlWrites = 0;
     this.#negotiatedLimits = { ...this.#limits };
     this.#state = "connecting";
     this.#reconnectTimer = setTimeout(() => {

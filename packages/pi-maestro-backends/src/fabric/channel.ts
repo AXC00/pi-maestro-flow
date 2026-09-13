@@ -146,6 +146,33 @@ export interface FabricBackendRouteResolver {
   prepare(request: FabricBackendPrepareRequest, signal: AbortSignal): Promise<PreparedFabricBackendChannel>;
 }
 
+/** Dispatch identity presented when acquiring origin-owned route wiring. */
+export interface FabricBackendRouteResolverAcquireRequest {
+  readonly correlationId: string;
+  readonly placement: TeammatePlacementV1;
+}
+
+/** One generation-owned resolver lease for exactly one placed dispatch. */
+export interface FabricBackendRouteResolverLease {
+  readonly resolver: FabricBackendRouteResolver;
+  readonly generation: number;
+  readonly ownerId: string;
+  release(): void | Promise<void>;
+}
+
+/** Lazily supplies a resolver lease after the dispatch identity is known. */
+export interface FabricBackendRouteResolverAcquirer {
+  acquire(
+    request: FabricBackendRouteResolverAcquireRequest,
+    signal: AbortSignal,
+  ): FabricBackendRouteResolverLease | undefined | Promise<FabricBackendRouteResolverLease | undefined>;
+}
+
+/** Direct resolvers remain supported for embedders and focused transports. */
+export type FabricBackendRouteResolverSource =
+  | FabricBackendRouteResolver
+  | FabricBackendRouteResolverAcquirer;
+
 function positiveGeneration(value: unknown, path: string): asserts value is number {
   if (!Number.isSafeInteger(value) || (value as number) < 1) {
     throw new FabricContractError("protocol_violation", `${path} must be a positive safe integer`, path);
