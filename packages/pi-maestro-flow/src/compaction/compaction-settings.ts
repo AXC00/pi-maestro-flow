@@ -108,6 +108,20 @@ export interface LosslessCompactionSettings {
   enabled: boolean;
 }
 
+export interface ImageBudgetCompactionConfigPatch {
+  enabled?: boolean;
+  /** Soft budget in bytes a single image may contribute to a request body. */
+  maxBytesPerImage?: number;
+  /** Soft budget in bytes for the aggregate image payload of one request. */
+  maxTotalBytes?: number;
+}
+
+export interface ImageBudgetCompactionSettings {
+  enabled: boolean;
+  maxBytesPerImage: number;
+  maxTotalBytes: number;
+}
+
 /**
  * Explicit new-context compaction is enabled by default and remains separate
  * from the threshold-triggered automatic summary compaction path.
@@ -131,6 +145,7 @@ export interface SoftCompactionConfigPatch {
   relevance?: RelevanceCompactionConfigPatch;
   crossTurnDedup?: CrossTurnDedupConfigPatch;
   lossless?: LosslessCompactionConfigPatch;
+  imageBudget?: ImageBudgetCompactionConfigPatch;
 }
 
 export interface SoftCompactionSettings {
@@ -147,7 +162,21 @@ export interface SoftCompactionSettings {
   /** Optional for source compatibility; resolved defaults provide this group. */
   crossTurnDedup?: CrossTurnDedupSettings;
   lossless: LosslessCompactionSettings;
+  /** Optional for source compatibility; resolved defaults provide this group. */
+  imageBudget?: ImageBudgetCompactionSettings;
 }
+
+/**
+ * Default image byte budgets. These are local guardrails, not provider billing
+ * contracts: a single image above `maxBytesPerImage` or an aggregate above
+ * `maxTotalBytes` is eligible for budget-driven prune before request sending.
+ * They are intentionally aligned below the 16MiB local proxy gateway cap.
+ */
+export const DEFAULT_IMAGE_BUDGET: ImageBudgetCompactionSettings = {
+  enabled: true,
+  maxBytesPerImage: 4 * 1024 * 1024,
+  maxTotalBytes: 16 * 1024 * 1024,
+};
 
 /**
  * Balanced soft-layer conditions; equivalent to the historical hardcoded ratios.
@@ -182,11 +211,11 @@ export function createDefaultSoftCompaction(): SoftCompactionSettings {
       minChars: DEFAULT_DEDUP_MIN_CHARS,
     },
     lossless: { enabled: true },
+    imageBudget: { ...DEFAULT_IMAGE_BUDGET },
   };
 }
 
 export const DEFAULT_SOFT_COMPACTION: SoftCompactionSettings = createDefaultSoftCompaction();
-
 export interface CompactionConfigPatch {
   enabled?: boolean;
   reserveTokens?: number;
@@ -293,6 +322,8 @@ function readRawSoft(value: unknown): SoftCompactionConfigPatch | undefined {
   if (crossTurnDedup) soft.crossTurnDedup = crossTurnDedup;
   const lossless = readRawLossless(value.lossless);
   if (lossless) soft.lossless = lossless;
+  const imageBudget = readRawImageBudget(value.imageBudget);
+  if (imageBudget) soft.imageBudget = imageBudget;
   return Object.keys(soft).length > 0 ? soft : undefined;
 }
 
@@ -354,6 +385,17 @@ function readRawLossless(value: unknown): LosslessCompactionConfigPatch | undefi
   const lossless: LosslessCompactionConfigPatch = {};
   if (typeof value.enabled === "boolean") lossless.enabled = value.enabled;
   return Object.keys(lossless).length > 0 ? lossless : undefined;
+}
+
+function readRawImageBudget(value: unknown): ImageBudgetCompactionConfigPatch | undefined {
+  if (!isRecord(value)) return undefined;
+  const imageBudget: ImageBudgetCompactionConfigPatch = {};
+  if (typeof value.enabled === "boolean") imageBudget.enabled = value.enabled;
+  const perImage = positiveInt(value.maxBytesPerImage);
+  if (perImage !== undefined) imageBudget.maxBytesPerImage = perImage;
+  const total = positiveInt(value.maxTotalBytes);
+  if (total !== undefined) imageBudget.maxTotalBytes = total;
+  return Object.keys(imageBudget).length > 0 ? imageBudget : undefined;
 }
 
 function ratioNumber(value: unknown): number | undefined {
@@ -444,6 +486,16 @@ export function resolveEffectiveCompactionSettings(
       }
       if (patch.soft.lossless !== undefined) {
         if (patch.soft.lossless.enabled !== undefined) soft.lossless.enabled = patch.soft.lossless.enabled;
+      }
+      if (patch.soft.imageBudget !== undefined) {
+        const imageBudget = soft.imageBudget ?? (soft.imageBudget = { ...DEFAULT_IMAGE_BUDGET });
+        if (patch.soft.imageBudget.enabled !== undefined) imageBudget.enabled = patch.soft.imageBudget.enabled;
+        if (patch.soft.imageBudget.maxBytesPerImage !== undefined) {
+          imageBudget.maxBytesPerImage = patch.soft.imageBudget.maxBytesPerImage;
+        }
+        if (patch.soft.imageBudget.maxTotalBytes !== undefined) {
+          imageBudget.maxTotalBytes = patch.soft.imageBudget.maxTotalBytes;
+        }
       }
       source.soft = src;
     }
@@ -536,6 +588,20 @@ export function validateCompactionPatch(
     if (soft.crossTurnDedup?.minChars !== undefined && !positiveInt(soft.crossTurnDedup.minChars)) {
       errors.push(`soft.crossTurnDedup.minChars must be a positive safe integer`);
     }
+    if (soft.imageBudget !== undefined) {
+      const imgBudget = soft.imageBudget;
+      for (const field of ["maxBytesPerImage", "maxTotalBytes"] as const) {
+        const value = imgBudget[field];
+        if (value === undefined) continue;
+        if (!isPositiveFiniteNumber(value)) {
+          errors.push(`soft.imageBudget.${field} must be a positive finite number`);
+        }
+      }
+      if (imgBudget.maxBytesPerImage !== undefined && imgBudget.maxTotalBytes !== undefined
+        && imgBudget.maxBytesPerImage >= imgBudget.maxTotalBytes) {
+        errors.push(`soft.imageBudget.maxBytesPerImage must be less than maxTotalBytes`);
+      }
+    }
   }
 
   if (contextWindow === undefined) {
@@ -588,6 +654,19 @@ export function validateEffectiveCompactionSettings(settings: EffectiveCompactio
   }
   if (soft.crossTurnDedup?.minChars !== undefined && !positiveInt(soft.crossTurnDedup.minChars)) {
     errors.push(`soft.crossTurnDedup.minChars must be a positive safe integer`);
+  }
+  const imgBudget = soft.imageBudget;
+  if (imgBudget !== undefined) {
+    for (const field of ["maxBytesPerImage", "maxTotalBytes"] as const) {
+      const value = imgBudget[field];
+      if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) {
+        errors.push(`soft.imageBudget.${field} must be a positive finite number`);
+      }
+    }
+    if (imgBudget.maxBytesPerImage !== undefined && imgBudget.maxTotalBytes !== undefined
+      && imgBudget.maxBytesPerImage >= imgBudget.maxTotalBytes) {
+      errors.push(`soft.imageBudget.maxBytesPerImage must be less than maxTotalBytes`);
+    }
   }
   if (!Number.isSafeInteger(settings.reserveTokens) || settings.reserveTokens <= 0) {
     errors.push(`reserveTokens must be a positive safe integer`);

@@ -29,6 +29,7 @@ import {
   type MessageRecord,
   type CompactionSettings,
   estimateMessageTokens,
+  measureImageBytes,
   pruneToolResult,
   assistantUsage,
   latestProviderUsageEpoch,
@@ -220,6 +221,7 @@ export function computeContextSignals(input: {
   estimatedTokens: number;
   contextWindow: number;
   thresholdTokens: number;
+  imageBudget?: { maxBytesPerImage: number; maxTotalBytes: number; enabled: boolean };
 }): ContextSignals {
   const { messages, estimatedTokens, contextWindow, thresholdTokens } = input;
   const fullnessRatio = contextWindow > 0 ? estimatedTokens / contextWindow : 0;
@@ -227,7 +229,25 @@ export function computeContextSignals(input: {
   const { prunableTokens, redundantTokens } = scanContextTokens(messages);
   const prunableFraction = estimatedTokens > 0 ? Math.min(1, prunableTokens / estimatedTokens) : 0;
   const redundantFraction = estimatedTokens > 0 ? Math.min(1, redundantTokens / estimatedTokens) : 0;
-  return { fullnessRatio, criticalGap, prunableFraction, redundantFraction, cacheHitRatio: latestCacheHitRatio(messages) };
+  const signals: ContextSignals = {
+    fullnessRatio,
+    criticalGap,
+    prunableFraction,
+    redundantFraction,
+    cacheHitRatio: latestCacheHitRatio(messages),
+  };
+  const budget = input.imageBudget;
+  if (budget?.enabled) {
+    const measured = measureImageBytes(messages);
+    signals.imageBytes = measured.imageBytes;
+    signals.imageCount = measured.imageCount;
+    signals.largestImageBytes = measured.largestImageBytes;
+    signals.imageBudgetBytes = budget.maxTotalBytes;
+    signals.imageBudgetExceeded =
+      measured.imageBytes > budget.maxTotalBytes
+      || measured.imageCount > 0 && measured.largestImageBytes > budget.maxBytesPerImage;
+  }
+  return signals;
 }
 
 /**
@@ -240,6 +260,10 @@ export function decideContextAction(band: ContextPressureBand, signals: ContextS
   if (signals.prunableFraction > 0) reasons.push(`prunable:${Math.round(signals.prunableFraction * 100)}%`);
   if (signals.redundantFraction && signals.redundantFraction > 0) reasons.push(`redundant:${Math.round(signals.redundantFraction * 100)}%`);
   if (signals.cacheHitRatio !== undefined) reasons.push(`cache:${Math.round(signals.cacheHitRatio * 100)}%`);
+  if (signals.imageBudgetExceeded) {
+    const imageMb = signals.imageBytes !== undefined ? (signals.imageBytes / (1024 * 1024)).toFixed(1) : "?";
+    reasons.push(`image-bytes:${imageMb}MB`);
+  }
   return { band, action, reasons };
 }
 

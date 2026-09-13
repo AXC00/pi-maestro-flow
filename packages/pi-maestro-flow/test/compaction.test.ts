@@ -6130,9 +6130,9 @@ test("token estimate treats image content blocks as fixed ~1200 tokens, not base
   assert.ok(estimate.trailingTokens >= 1200, `must include at least the fixed image estimate`);
 });
 
-test("token estimate scales linearly with image count, ignoring data size", () => {
+test("token estimate scales linearly with image count, and grows with data size", () => {
   const small = "A".repeat(100);
-  const large = "A".repeat(1_000_000);
+  const large = "A".repeat(2_000_000);
   const mk = (data: string, count: number) => [{
     role: "assistant",
     content: [{ type: "toolCall", id: "c", name: "read", arguments: {} }],
@@ -6147,9 +6147,10 @@ test("token estimate scales linearly with image count, ignoring data size", () =
   const smallOne = estimateContextTokens(mk(small, 1)).trailingTokens;
   const largeOne = estimateContextTokens(mk(large, 1)).trailingTokens;
   const smallThree = estimateContextTokens(mk(small, 3)).trailingTokens;
-  // Same image count → same estimate regardless of data size
-  assert.ok(Math.abs(smallOne - largeOne) < 50, `data size must not affect estimate: ${smallOne} vs ${largeOne}`);
-  // Three images ≈ 3× one image (plus small structural overhead)
+  // Larger image data raises the size-aware estimate (per-image floor applies
+  // to the small case, where 100B base64 is still under the minimum).
+  assert.ok(largeOne > smallOne, `larger image must estimate higher: ${smallOne} vs ${largeOne}`);
+  // Three images ≈ 3× one image (per-image floor 1200 dominates here).
   assert.ok(smallThree > smallOne * 2, `three images must estimate more than double one image: ${smallThree} vs ${smallOne}`);
 });
 

@@ -176,13 +176,32 @@ test("estimateMessageTokens charges documents a fixed cost, not base64 text size
   assert.ok(tokens >= 2000, `document must include the fixed ~2000 per-document estimate`);
 });
 
-test("estimateMessageTokens keeps image estimate unchanged at ~1200 per image", () => {
-  const oneImage = estimateMessageTokens({
+test("estimateMessageTokens estimates images proportionally to base64 size with a floor", () => {
+  const small = estimateMessageTokens({
     role: "user",
     content: [imageBlock()],
     timestamp: 1,
   } as never);
-  assert.ok(oneImage >= 1200 && oneImage < 1300, `single image ~1200, got ${oneImage}`);
+  assert.ok(small >= 1200 && small < 1600, `small 5KB image stays near the floor, got ${small}`);
+  const largeData = "A".repeat(2_000_000); // ~1.5MB decoded
+  const large = estimateMessageTokens({
+    role: "user",
+    content: [{ type: "image", data: largeData, mimeType: "image/png" }],
+    timestamp: 1,
+  } as never);
+  assert.ok(large > small, `larger image must estimate higher (${large} vs ${small})`);
+  assert.ok(large < 10_000, `2MB image must stay bounded, got ${large}`);
+});
+
+test("estimateMessageTokens caps image estimate for pathological payloads", () => {
+  const huge = "A".repeat(50_000_000); // 50MB base64
+  const tokens = estimateMessageTokens({
+    role: "user",
+    content: [{ type: "image", data: huge, mimeType: "image/png" }],
+    timestamp: 1,
+  } as never);
+  assert.ok(tokens >= 1200 && tokens < 20_000, `pathological image stays capped, got ${tokens}`);
+  assert.ok(tokens < 10_000_000, `never counts base64 as text tokens, got ${tokens}`);
 });
 
 test("estimateMessageTokens charges image and document blocks independently in one message", () => {

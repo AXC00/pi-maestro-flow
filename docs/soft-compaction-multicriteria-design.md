@@ -154,3 +154,66 @@ interface SoftCompactionSettings {
   velocity→compact（`action=compact`+reason，非新 band）仅在 Phase 2 证明低误报后启用；
   cache 在 provider 语义标准化后做 auto-prune 有界 defer（带 hysteresis）。
 - **砍掉**：depth。**降级**：prunableFraction（解释指标）、cache（telemetry）。
+
+## 11. Image Byte Budget 与图片 token 估算（v0.30.x 追加）
+
+### 动机
+
+图片 base64 payload 与 token 压力是**正交**的两条曲线：a 个截图可能在 token 上只占
+1M 窗口的 3%，却把**请求体**堆到 13MB，一旦超过本地 AI Toolbox 网关的 16MiB 硬上限
+（`MAX_REQUEST_BODY_BYTES = 16 * 1024 * 1024`），网关直接断连（Broken pipe），`fetch failed`。
+现存故障历史：29 张图/12.69MB base64/单次请求 16.07MB，8 分钟重试耗尽。
+
+结论：图片预算**不能**由 token 压力驱动，必须由独立字节预算驱动。
+
+### 配置面（新增）
+
+```ts
+soft.imageBudget: {
+  enabled: boolean;          // 默认 true（本地护栏，非 provider 计费）
+  maxBytesPerImage: number;  // 默认 4 * 1024 * 1024
+  maxTotalBytes: number;     // 默认 16 * 1024 * 1024（对齐本地代理上限）
+}
+```
+
+- 默认启用且给出保守护栏；非法值在 `validateCompactionPatch`/`validateEffectiveCompactionSettings` 拒绝。
+- 配置读取/合并/校验沿用现有模式（`readRawImageBudget`，user→project 逐字段 merge）。
+
+### 图片 token 估算（替换固定 1200）
+
+`estimateMessageTokens` 对图片块**不再清空后固定 1200**：
+
+```
+每张图片 = clamp( max(1200, decodedBytes / 512), 1200, 16384 )
+其中 decodedBytes ≈ base64Bytes * 3 / 4
+```
+
+- **下限 1200**：小截图不被低估，token 压力行为向后兼容。
+- **上限 16384**：病态/超大 payload 不爆炸（50MB base64 ≈ 16K token，而非数百万）。
+- **仍将 base64 从普通 JSON 文本序列化中剥离**（lightweight copy），绝不按 `/4` 算文本 token。
+- document 块仍固定 2000，不套用图片算法。
+- 该值仅是**本地压力启发式**，不等于 provider 账单。
+
+### 图片字节预算 prune（新增独立 pass）
+
+`runImageBudgetPrune`：仅当 `measureImageBytes` 超预算时运行，**在 token 压力早退之前**执行，
+因此即使 band=normal 也能为超预算图片发出信号：
+
+- 候选：历史 `toolResult` 中含 image block、非 error、非 control 工具、未被 manifest claim 的消息。
+- **保护边界 = 当前 user 消息**（含其图片）及之后内容；不采用 `keepRecentTokens`——刚读入的截图正是
+  需要回收的对象。（`keepRecentTokens` 属 token 语义，字节护栏必须独立。）
+- 替换：`imagePruneReplacement` 确定性生成 `[image:<mime> (<bytes>B, pruned by image byte budget)]`，
+  保留同消息的文本 block 与元数据。
+- 顺序：旧→新（优先丢弃更早、更可能失去时效的截图）。
+- 记录：manifest 新增 `level: "image"`，persist/restore 支持（`restorePruneReplacement` 按确定性
+  replacement 重建字节一致的占位；旧 manifest 无该 level 时安全回退）。
+- 重复评估：候选被 claim，不会二次替换；缓存门控仍适用于 token 收益不足场景。
+
+### 边界说明（flow vs agent core）
+
+- **pi-maestro-flow**：只能对**已在上下文**的历史图片做字节降级与更准确的 token 估算；
+  它不拥有“图片进上下文前的 resize”。
+- **pi-coding-agent**（companion，后续独立 PR）：`read` 工具已在 `image-resize` 路径将图片缩到
+  2000×2000 上限，但 flow 侧无法拦截其输出；更高分辨率截图/非 read 来源需在 agent core 的
+  canonical preprocessing 收紧 max encoded bytes 或调低目标尺寸。
+- 摘要请求**始终剥图**（`[image]`/`[image:route]` 占位，零图片上传），本特性不改变该语义。
