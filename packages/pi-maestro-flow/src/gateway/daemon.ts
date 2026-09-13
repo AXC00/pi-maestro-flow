@@ -9,7 +9,15 @@ import { gatewayIpcAddress, startGatewayIpcServer, type GatewayIpcServerHandle }
 import { GatewayOwnerStore } from "./owner-store.ts";
 import { GatewayRuntime, type GatewayRuntimeOptions } from "./runtime.ts";
 import { FabricConnectorSecurity } from "./fabric/security.ts";
-import { FabricWssServer } from "./fabric/wss-server.ts";
+import { FabricWssServer, type FabricWssAuthority } from "./fabric/wss-server.ts";
+import type { FabricAdvertisementDelta, FabricAdvertisementSnapshot } from "pi-maestro-fabric";
+import { FabricContractError, type JsonValue } from "pi-maestro-fabric-core/v1";
+import {
+  createFabricTeammateRuntimePort,
+  getFabricTeammateRuntimePort,
+  registerFabricTeammateRuntimePort,
+  type FabricTeammateRuntimeRegistration,
+} from "pi-maestro-teammate/v1/fabric-runtime";
 import { GatewayControlDispatcher, type GatewayControlHandler, type GatewayTunnelControlAction } from "./control-dispatcher.ts";
 import type { GatewayTunnelProvider } from "./tunnel/contracts.ts";
 import { GatewayTunnelManager } from "./tunnel/provider.ts";
@@ -45,6 +53,7 @@ export class GatewayDaemon {
   tunnelManager?: GatewayTunnelManager;
   fabricSecurity?: FabricConnectorSecurity;
   fabricWss?: FabricWssServer;
+  private fabricTeammateRuntime?: FabricTeammateRuntimeRegistration;
   private ownerStore?: GatewayOwnerStore;
   private stopping?: Promise<void>;
   private stopped: Promise<void> = Promise.resolve();
@@ -201,6 +210,7 @@ export class GatewayDaemon {
         });
       }
       if (config.fabric.enabled) {
+        this.fabricTeammateRuntime = registerDefaultFabricTeammateRuntime();
         // Fabric rides the Gateway's own TLS listener: a Connector channel on a
         // plaintext socket would authenticate a key over a link anyone can
         // rewrite, and the pairing rules already refuse that for HTTP.
@@ -214,6 +224,7 @@ export class GatewayDaemon {
           security: this.fabricSecurity,
           server: this.http.server,
           limits: config.fabric.limits,
+          authority: createFabricWssAuthority(runtime),
         });
         this.fabricWss.start();
       }
@@ -248,6 +259,8 @@ export class GatewayDaemon {
       this.ipc = undefined;
       await this.runtime?.close().catch(() => undefined);
       this.runtime = undefined;
+      this.fabricTeammateRuntime?.dispose();
+      this.fabricTeammateRuntime = undefined;
       this.controlDispatcher = undefined;
       this.tunnelManager = undefined;
       if (ownerToken) await this.ownerStore?.release(ownerToken).catch(() => undefined);
@@ -268,6 +281,132 @@ export class GatewayDaemon {
 
 export async function startGatewayDaemon(options: GatewayDaemonOptions = {}): Promise<GatewayDaemon> {
   return new GatewayDaemon(options).start();
+}
+
+let defaultFabricTeammateRuntime: FabricTeammateRuntimeRegistration | undefined;
+let defaultFabricTeammateRuntimeConsumers = 0;
+
+export function registerDefaultFabricTeammateRuntime(): FabricTeammateRuntimeRegistration | undefined {
+  const current = getFabricTeammateRuntimePort();
+  if (defaultFabricTeammateRuntime !== undefined && current === defaultFabricTeammateRuntime.port) {
+    defaultFabricTeammateRuntimeConsumers += 1;
+    return defaultFabricTeammateRuntimeLease(defaultFabricTeammateRuntime);
+  }
+  if (current !== undefined) return undefined;
+  const registration = registerFabricTeammateRuntimePort(createFabricTeammateRuntimePort());
+  defaultFabricTeammateRuntime = registration;
+  defaultFabricTeammateRuntimeConsumers = 1;
+  return defaultFabricTeammateRuntimeLease(registration);
+}
+
+function defaultFabricTeammateRuntimeLease(
+  registration: FabricTeammateRuntimeRegistration,
+): FabricTeammateRuntimeRegistration {
+  let disposed = false;
+  return {
+    port: registration.port,
+    dispose(): void {
+      if (disposed) return;
+      disposed = true;
+      if (defaultFabricTeammateRuntime !== registration || defaultFabricTeammateRuntimeConsumers === 0) return;
+      defaultFabricTeammateRuntimeConsumers -= 1;
+      if (defaultFabricTeammateRuntimeConsumers > 0) return;
+      defaultFabricTeammateRuntime = undefined;
+      registration.dispose();
+    },
+  };
+}
+
+export function createFabricWssAuthority(runtime: GatewayRuntime): FabricWssAuthority {
+  const control = runtime.fabricControlRuntime;
+  if (control === undefined) throw new Error("Fabric WSS requires the runtime Fabric managers");
+  return {
+    admit: async (input, owner) => control.connections.acceptInbound(input, owner),
+    acceptSnapshot: async (session, payload) => {
+      const snapshot: FabricAdvertisementSnapshot = {
+        connectionId: session.connectionId,
+        connectionGeneration: session.connectionGeneration,
+        capabilityDigest: requiredString(payload.capabilityDigest, "capabilityDigest"),
+        advertisementRevision: requiredNumber(payload.advertisementRevision, "advertisementRevision"),
+        devices: jsonArray(payload.devices, "devices"),
+        workspaces: jsonArray(payload.workspaces, "workspaces"),
+        endpoints: jsonArray(payload.endpoints, "endpoints"),
+        capabilities: jsonArray(payload.capabilities, "capabilities"),
+      };
+      control.connections.acceptAdvertisement(snapshot);
+    },
+    acceptDelta: async (session, payload) => {
+      const upserts = jsonObject(payload.upserts, "upserts", true);
+      const removals = jsonObject(payload.removals, "removals", true);
+      const delta: FabricAdvertisementDelta = {
+        connectionId: session.connectionId,
+        connectionGeneration: session.connectionGeneration,
+        capabilityDigest: requiredString(payload.capabilityDigest, "capabilityDigest"),
+        baseRevision: requiredNumber(payload.baseRevision, "baseRevision"),
+        advertisementRevision: requiredNumber(payload.advertisementRevision, "advertisementRevision"),
+        ...(upserts === undefined ? {} : { upserts: {
+          ...(upserts.workspaces === undefined ? {} : { workspaces: jsonArray(upserts.workspaces, "upserts.workspaces") }),
+          ...(upserts.endpoints === undefined ? {} : { endpoints: jsonArray(upserts.endpoints, "upserts.endpoints") }),
+          ...(upserts.capabilities === undefined ? {} : { capabilities: jsonArray(upserts.capabilities, "upserts.capabilities") }),
+        } }),
+        ...(removals === undefined ? {} : { removals: {
+          ...(removals.workspaceIds === undefined ? {} : { workspaceIds: jsonArray(removals.workspaceIds, "removals.workspaceIds") }),
+          ...(removals.endpointIds === undefined ? {} : { endpointIds: jsonArray(removals.endpointIds, "removals.endpointIds") }),
+          ...(removals.capabilityIds === undefined ? {} : { capabilityIds: jsonArray(removals.capabilityIds, "removals.capabilityIds") }),
+        } }),
+      };
+      control.connections.acceptAdvertisementDelta(delta);
+    },
+    heartbeat: async (session, input) => {
+      await control.connections.renewInboundLease(
+        session.connectionId,
+        session.connectionGeneration,
+        input.leaseExpiresAt,
+      );
+    },
+    drain: async (session, deadlineAt) => {
+      control.connections.drain(session.connectionId, session.connectionGeneration, deadlineAt);
+    },
+    close: async (session, reason) => {
+      try {
+        await control.connections.disconnect(session.connectionId, session.connectionGeneration, reason);
+      } catch (error) {
+        if (error instanceof FabricContractError && ["not_found", "stale_generation"].includes(error.code)) return;
+        throw error;
+      }
+    },
+  };
+}
+
+function requiredString(value: JsonValue | undefined, path: string): string {
+  if (typeof value !== "string" || value.length === 0) {
+    throw new FabricContractError("invalid_argument", `${path} must be a non-empty string`, path);
+  }
+  return value;
+}
+
+function requiredNumber(value: JsonValue | undefined, path: string): number {
+  if (typeof value !== "number" || !Number.isSafeInteger(value)) {
+    throw new FabricContractError("invalid_argument", `${path} must be a safe integer`, path);
+  }
+  return value;
+}
+
+function jsonObject(
+  value: JsonValue | undefined,
+  path: string,
+  optional = false,
+): Readonly<Record<string, JsonValue>> | undefined {
+  if (value === undefined && optional) return undefined;
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new FabricContractError("invalid_argument", `${path} must be an object`, path);
+  }
+  return value as Readonly<Record<string, JsonValue>>;
+}
+
+function jsonArray<T>(value: JsonValue | undefined, path: string): readonly T[] {
+  if (!Array.isArray(value)) throw new FabricContractError("invalid_argument", `${path} must be an array`, path);
+  return value as unknown as readonly T[];
 }
 
 function assertLivePublicTunnelConfig(

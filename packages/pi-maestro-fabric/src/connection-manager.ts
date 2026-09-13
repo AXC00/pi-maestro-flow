@@ -18,6 +18,7 @@ import {
   openEndpointRoute,
   projectConnection,
   type ConnectionFirstState,
+  type ConnectionLease,
   type ConnectorRecord,
   type DeviceRecord,
   type EndpointRecord,
@@ -59,8 +60,17 @@ interface DurableConnectionReservation {
 interface ManagedConnection {
   state: ConnectionFirstState;
   channel?: FabricLiveConnection;
-  closePromise?: Promise<void>;
-  closeFailure?: unknown;
+  inboundOwner?: FabricManagedConnectionOwner;
+  inbound: boolean;
+  /** Monotonic memory fence. Once true, renewal can never publish again. */
+  closureStarted: boolean;
+  /** The serial queue for renewal and durable lifecycle transitions. */
+  lifecycleTail: Promise<void>;
+  durableCleanupDone: boolean;
+  durableCleanupFailure?: unknown;
+  ownerCloseDone: boolean;
+  ownerCloseAttempt?: Promise<void>;
+  ownerCloseFailure?: unknown;
   ready: boolean;
   advertisement?: AcceptedAdvertisementMetadata;
   authorityConnector: ConnectorRecord;
@@ -69,7 +79,6 @@ interface ManagedConnection {
   providerLease: FabricLiveConnection["descriptor"]["lease"];
   drainHandle?: unknown;
   durableRevision?: number;
-  persistenceTail: Promise<void>;
 }
 
 export interface FabricDeadlineScheduler {
@@ -82,6 +91,23 @@ export interface FabricConnectionManagerOptions {
   scheduler?: FabricDeadlineScheduler;
   terminalCapacity?: number;
   coordinator?: FabricStoreCoordinator;
+}
+
+/** Authenticated inbound Connector data supplied by the Hub handshake. */
+export interface FabricInboundConnectionRequest {
+  readonly requestId: string;
+  readonly connectorId: string;
+  readonly expectedCredentialGeneration: number;
+  readonly connectorInstanceNonce: string;
+  readonly capabilityDigest: string;
+  readonly limits: FabricProtocolLimits;
+  readonly establishedAt: number;
+  readonly expiresAt: number;
+}
+
+/** Physical inbound channel ownership without inventing an outbound exchange transport. */
+export interface FabricManagedConnectionOwner {
+  close(reason: string): Promise<void>;
 }
 
 function cancelledMessage(_signal: FabricCancellationSignal): string {
@@ -120,6 +146,53 @@ function authorityEqual(left: ConnectorRecord | DeviceRecord, right: ConnectorRe
       left.architecture === right.architecture && left.enabled === right.enabled && left.revision === right.revision;
   }
   return false;
+}
+
+function assertValidPriorDurableConnection(value: Readonly<Record<string, unknown>>, connectorId: string): void {
+  const fail = (field: string): never => {
+    throw new FabricContractError("protocol_violation", "Durable connection record is malformed", field);
+  };
+  try {
+    if (value.kind !== "connection") fail("kind");
+    assertFabricIdentifier(value.connectionId, "connectionId");
+    assertFabricIdentifier(value.connectorId, "connectorId");
+    assertFabricIdentifier(value.deviceId, "deviceId");
+    if (value.connectorId !== connectorId) fail("connectorId");
+    assertGeneration(value.generation, "generation");
+    if (!Number.isSafeInteger(value.revision) || (value.revision as number) < 1) fail("revision");
+    assertEpochMilliseconds(value.expiresAt, "expiresAt");
+    if (!["connecting", "connected", "draining", "closed"].includes(String(value.state))) fail("state");
+
+    const details = [
+      value.connectorInstanceNonce,
+      value.capabilityDigest,
+      value.establishedAt,
+      value.connectionRevision,
+    ];
+    const detailCount = details.filter((detail) => detail !== undefined).length;
+    if (detailCount !== 0 && detailCount !== details.length) fail("state");
+    if ((value.state === "connected" || value.state === "draining") && detailCount !== details.length) fail("state");
+    if (detailCount === details.length) {
+      // Reuse the canonical lease validator rather than maintaining a weaker
+      // durable-record dialect. In particular, historical nonces remain Fabric
+      // identifiers and corrupted identity evidence is never overwritten.
+      assertValidConnectionLease({
+        connectionId: value.connectionId,
+        connectorId: value.connectorId,
+        deviceId: value.deviceId,
+        connectorInstanceNonce: value.connectorInstanceNonce,
+        generation: value.generation,
+        state: value.state,
+        capabilityDigest: value.capabilityDigest,
+        establishedAt: value.establishedAt,
+        expiresAt: value.expiresAt,
+        revision: value.connectionRevision,
+      });
+    }
+  } catch (error) {
+    if (error instanceof FabricContractError && error.code === "protocol_violation") throw error;
+    fail(error instanceof FabricContractError ? error.path ?? "record" : "record");
+  }
 }
 
 /** Owns live channels while exposing only redacted, cloned connection projections. */
@@ -262,12 +335,16 @@ export class FabricConnectionManager {
         state: connected,
         channel,
         ready: false,
+        inbound: false,
+        closureStarted: false,
+        lifecycleTail: Promise.resolve(),
+        durableCleanupDone: durableRevision === undefined,
+        ownerCloseDone: false,
         authorityConnector: { ...connector },
         authorityDevice: projectDeviceClone(device),
         negotiatedLimits: { ...descriptor.limits },
         providerLease: { ...descriptor.lease },
         durableRevision,
-        persistenceTail: Promise.resolve(),
       };
       this.#generationHighWater.set(connector.connectorId, lease.generation);
       this.#activeById.set(lease.connectionId, managed);
@@ -290,26 +367,290 @@ export class FabricConnectionManager {
     }
   }
 
+  /**
+   * Admits an already-authenticated inbound channel. Unlike outbound connect(),
+   * replacement is intentional: the durable generation is fenced before the
+   * superseded physical owner is asked to close.
+   */
+  async acceptInbound(
+    request: FabricInboundConnectionRequest,
+    owner: FabricManagedConnectionOwner,
+  ): Promise<PublicConnectionLease> {
+    assertFabricIdentifier(request.requestId, "requestId");
+    assertFabricIdentifier(request.connectorId, "connectorId");
+    assertGeneration(request.expectedCredentialGeneration, "expectedCredentialGeneration");
+    assertFabricIdentifier(request.connectorInstanceNonce, "connectorInstanceNonce");
+    assertBoundedString(request.capabilityDigest, "capabilityDigest", 256);
+    assertEpochMilliseconds(request.establishedAt, "establishedAt");
+    assertEpochMilliseconds(request.expiresAt, "expiresAt");
+    assertValidFabricProtocolLimits(request.limits);
+    const now = this.#now();
+    if (request.establishedAt > now || request.expiresAt <= now) {
+      throw new FabricContractError("expired", "Inbound connection lease must contain the current time", "expiresAt");
+    }
+    const connector = this.directory[FABRIC_DIRECTORY_REGISTRY_AUTHORITY](request.connectorId);
+    if (connector === undefined) throw new FabricContractError("not_found", "Connector is not registered", "connectorId");
+    if (!connector.enabled) throw new FabricContractError("permission_denied", "Connector is disabled", "connectorId");
+    if (connector.credentialGeneration !== request.expectedCredentialGeneration) {
+      throw new FabricContractError("stale_generation", "Connector credential generation is stale", "expectedCredentialGeneration");
+    }
+    const device = this.directory.list().devices
+      .filter((candidate) => candidate.connectorId === connector.connectorId && candidate.enabled)
+      .sort((left, right) => left.deviceId.localeCompare(right.deviceId))[0];
+    if (device === undefined) {
+      throw new FabricContractError("not_found", "Connector has no enabled authority Device", "connectorId");
+    }
+    if (this.#pendingConnectors.has(connector.connectorId)) {
+      throw new FabricContractError("conflict", "A connection attempt is already in progress for this connector", "connectorId");
+    }
+
+    this.#pendingConnectors.add(connector.connectorId);
+    const previous = this.#currentByConnector.get(connector.connectorId);
+    let reservation: DurableConnectionReservation | undefined;
+    let committed = false;
+    try {
+      reservation = await this.#reserveInboundConnection(request, device.deviceId);
+      // The reservation is the durable generation fence. Mirror that fence in
+      // memory before any later await so the overwritten predecessor can no
+      // longer authorize work even when admission subsequently fails.
+      if (reservation !== undefined) {
+        this.#generationHighWater.set(connector.connectorId, reservation.generation);
+        if (previous !== undefined) {
+          this.#fenceReplacedInbound(previous, "superseded by a newer connection generation");
+        }
+      }
+      let checkedAt = this.#now();
+      this.#assertInboundAuthority(request, connector, device, checkedAt);
+      const connectionId = reservation?.connectionId ?? `connection-${crypto.randomUUID()}`;
+      const generation = reservation?.generation
+        ?? (this.#generationHighWater.get(connector.connectorId) ?? 0) + 1;
+      if (!Number.isSafeInteger(generation)) {
+        throw new FabricContractError("resource_exhausted", "Connection generation is exhausted", "generation");
+      }
+      const lease: ConnectionLease = {
+        connectionId,
+        deviceId: device.deviceId,
+        connectorId: connector.connectorId,
+        connectorInstanceNonce: request.connectorInstanceNonce,
+        generation,
+        state: "connected",
+        capabilityDigest: request.capabilityDigest,
+        establishedAt: request.establishedAt,
+        expiresAt: request.expiresAt,
+        revision: 0,
+      };
+      const connecting = beginConnection(createRegisteredConnectionState(device), request.requestId);
+      const connected = establishConnection(connecting, lease, checkedAt);
+      const durableRevision = reservation === undefined
+        ? undefined
+        : await this.#commitDurableConnection(reservation, lease, checkedAt);
+      checkedAt = this.#now();
+      this.#assertInboundAuthority(request, connector, device, checkedAt);
+      const managed: ManagedConnection = {
+        state: connected,
+        inboundOwner: owner,
+        inbound: true,
+        closureStarted: false,
+        lifecycleTail: Promise.resolve(),
+        durableCleanupDone: durableRevision === undefined,
+        ownerCloseDone: false,
+        ready: false,
+        authorityConnector: { ...connector },
+        authorityDevice: projectDeviceClone(device),
+        negotiatedLimits: { ...request.limits },
+        providerLease: { ...lease },
+        durableRevision,
+      };
+      this.#generationHighWater.set(connector.connectorId, generation);
+      this.#activeById.set(connectionId, managed);
+      this.#currentByDevice.set(device.deviceId, managed);
+      this.#currentByConnector.set(connector.connectorId, managed);
+      if (reservation === undefined && previous !== undefined && previous !== managed) {
+        this.#fenceReplacedInbound(previous, "superseded by a newer connection generation");
+      }
+      committed = true;
+      return projectConnection(lease);
+    } catch (error) {
+      if (committed) throw error;
+      const cleanupFailures: unknown[] = [];
+      if (reservation !== undefined) {
+        try {
+          await this.#closeDurableReservation(reservation, "inbound connection admission rejected");
+        } catch (rollbackError) {
+          cleanupFailures.push(rollbackError);
+        }
+      }
+      try {
+        await owner.close("inbound connection admission rejected");
+      } catch (ownerError) {
+        cleanupFailures.push(ownerError);
+      }
+      if (cleanupFailures.length > 0) {
+        throw new AggregateError(
+          [error, ...cleanupFailures],
+          "Inbound connection admission failed and cleanup remains retryable",
+          { cause: error },
+        );
+      }
+      throw error;
+    } finally {
+      this.#pendingConnectors.delete(connector.connectorId);
+    }
+  }
+
+  /** Renews only the exact current inbound generation and commits before publishing it. */
+  async renewInboundLease(
+    connectionId: string,
+    expectedGeneration: number,
+    expiresAt: number,
+  ): Promise<PublicConnectionLease> {
+    assertEpochMilliseconds(expiresAt, "expiresAt");
+    const managed = this.#requireCurrent(connectionId, expectedGeneration);
+    this.#assertRenewableInbound(managed, connectionId, expectedGeneration, expiresAt, this.#now());
+    return this.#enqueueLifecycle(managed, async () => {
+      const current = this.#assertRenewableInbound(managed, connectionId, expectedGeneration, expiresAt, this.#now());
+      const next: ConnectionLease = { ...current, expiresAt, revision: current.revision + 1 };
+      assertValidConnectionLease(next, this.#now());
+      if (this.#coordinator !== undefined && managed.durableRevision !== undefined) {
+        const expectedRevision = managed.durableRevision;
+        const durableRevision = expectedRevision + 1;
+        await this.#coordinator.commit("lease", this.#now(), (store) => {
+          const durable = store.records[current.connectorId];
+          if (durable !== undefined) assertValidPriorDurableConnection(durable, current.connectorId);
+          if (durable?.revision !== expectedRevision || durable.connectionId !== connectionId || durable.generation !== expectedGeneration) {
+            throw new FabricContractError("stale_generation", "Durable connection lease is no longer current", "connectionId");
+          }
+          return {
+            mutations: [{
+              kind: "upsert",
+              subjectId: current.connectorId,
+              expectedRevision,
+              value: { ...durable, expiresAt, connectionRevision: next.revision, revision: durableRevision },
+              eventKind: "connection.renewed",
+              payload: { connectionId, connectorId: current.connectorId, generation: expectedGeneration, expiresAt },
+            }],
+            value: durableRevision,
+          };
+        });
+        // The commit belongs to this captured owner even if a later generation
+        // fences it before the continuation resumes. Cleanup must observe the
+        // committed revision, while publication below still requires currency.
+        this.#assertManagedIdentity(managed, connectionId, expectedGeneration);
+        managed.durableRevision = durableRevision;
+      }
+      const after = this.#assertRenewableInbound(managed, connectionId, expectedGeneration, expiresAt, this.#now());
+      if (after !== current || after.revision !== current.revision || after.expiresAt !== current.expiresAt) {
+        throw new FabricContractError("stale_generation", "Connection changed while its lease was renewing", "connectionId");
+      }
+      managed.state = { ...managed.state, connection: next };
+      managed.providerLease = { ...next };
+      return projectConnection(next);
+    });
+  }
+
+  #assertRenewableInbound(
+    managed: ManagedConnection,
+    connectionId: string,
+    expectedGeneration: number,
+    expiresAt: number,
+    now: number,
+  ): ConnectionLease {
+    if (this.#requireCurrent(connectionId, expectedGeneration) !== managed) {
+      throw new FabricContractError("stale_generation", "Connection owner changed while its lease was renewing", "connectionId");
+    }
+    if (!managed.inbound) throw new FabricContractError("invalid_state", "Only inbound leases are heartbeat-renewed", "connectionId");
+    if (managed.closureStarted) {
+      throw new FabricContractError("invalid_state", "Connection closure has started and cannot be renewed", "state");
+    }
+    const current = managed.state.connection!;
+    if ((managed.state.phase !== "connected" && managed.state.phase !== "ready") || current.state !== "connected") {
+      throw new FabricContractError("invalid_state", "Only a live connected inbound lease may renew", "state");
+    }
+    this.#revalidateAuthority(managed, now);
+    if (expiresAt <= current.expiresAt) {
+      throw new FabricContractError("invalid_argument", "Connection renewal must extend expiry", "expiresAt");
+    }
+    assertValidConnectionLease({ ...current, expiresAt }, now);
+    return current;
+  }
+
+  async #reserveInboundConnection(
+    request: FabricInboundConnectionRequest,
+    deviceId: string,
+  ): Promise<DurableConnectionReservation | undefined> {
+    if (this.#coordinator === undefined) return undefined;
+    const connectionId = `connection-${crypto.randomUUID()}`;
+    return this.#coordinator.commit("lease", this.#now(), (store) => {
+      const previous = store.records[request.connectorId];
+      if (previous !== undefined) assertValidPriorDurableConnection(previous, request.connectorId);
+      const previousRevision = previous?.revision as number | undefined;
+      const priorGeneration = previous?.generation as number | undefined;
+      const generation = Math.max(priorGeneration ?? 0, this.#generationHighWater.get(request.connectorId) ?? 0) + 1;
+      if (!Number.isSafeInteger(generation)) throw new FabricContractError("resource_exhausted", "Connection generation is exhausted", "generation");
+      const revision = (previousRevision ?? 0) + 1;
+      return {
+        mutations: [{
+          kind: "upsert",
+          subjectId: request.connectorId,
+          expectedRevision: previousRevision as number | undefined,
+          value: {
+            revision,
+            kind: "connection",
+            connectionId,
+            connectorId: request.connectorId,
+            deviceId,
+            generation,
+            state: "connecting",
+            expiresAt: request.expiresAt,
+          },
+          eventKind: "connection.connecting",
+          payload: { connectionId, connectorId: request.connectorId, deviceId, generation, state: "connecting" },
+        }],
+        value: { connectionId, connectorId: request.connectorId, deviceId, generation, revision },
+      };
+    });
+  }
+
+  #assertInboundAuthority(
+    request: FabricInboundConnectionRequest,
+    expectedConnector: ConnectorRecord,
+    expectedDevice: DeviceRecord,
+    now: number,
+  ): void {
+    if (request.establishedAt > now || request.expiresAt <= now) {
+      throw new FabricContractError("expired", "Inbound connection lease expired during admission", "expiresAt");
+    }
+    const connector = this.directory[FABRIC_DIRECTORY_REGISTRY_AUTHORITY](request.connectorId);
+    const device = this.directory.getDevice(expectedDevice.deviceId);
+    if (
+      connector === undefined || device === undefined || !connector.enabled || !device.enabled ||
+      !authorityEqual(connector, expectedConnector) || !authorityEqual(device, expectedDevice) ||
+      device.connectorId !== connector.connectorId || connector.credentialGeneration !== request.expectedCredentialGeneration
+    ) {
+      throw new FabricContractError("stale_generation", "Directory authority changed during inbound admission", "connectorId");
+    }
+  }
+
+  #fenceReplacedInbound(managed: ManagedConnection, reason: string): void {
+    this.#fenceMemory(managed);
+    void this.#enqueueCleanup(managed, reason).catch(() => {
+      // Per-step failures are retained on the ManagedConnection for explicit
+      // disconnect retry; automatic fencing must never create an unhandled rejection.
+    });
+  }
+
   async #reserveDurableConnection(request: FabricConnectRequest): Promise<DurableConnectionReservation | undefined> {
     if (this.#coordinator === undefined) return undefined;
     const at = this.#now();
     const allocatedConnectionId = `connection-${crypto.randomUUID()}`;
     return this.#coordinator.commit("lease", at, (store) => {
       const previous = store.records[request.connectorId];
-      const previousRevision = previous?.revision;
-      if (previousRevision !== undefined && (typeof previousRevision !== "number" || !Number.isSafeInteger(previousRevision) || previousRevision < 1)) {
-        throw new FabricContractError("protocol_violation", "Durable connection record has an invalid revision", "revision");
-      }
-      if (previous !== undefined && previous.kind !== "connection") {
-        throw new FabricContractError("conflict", "Durable lease identity is already used by another record", "connectorId");
-      }
+      if (previous !== undefined) assertValidPriorDurableConnection(previous, request.connectorId);
+      const previousRevision = previous?.revision as number | undefined;
       if (previous !== undefined && previous.state !== "closed") {
         throw new FabricContractError("conflict", "A durable connection generation is still active", "connectorId");
       }
-      const priorGeneration = previous?.generation;
-      if (priorGeneration !== undefined && (typeof priorGeneration !== "number" || !Number.isSafeInteger(priorGeneration) || priorGeneration < 1)) {
-        throw new FabricContractError("protocol_violation", "Durable connection record has an invalid generation", "generation");
-      }
+      const priorGeneration = previous?.generation as number | undefined;
       const generation = Math.max(priorGeneration ?? 0, this.#generationHighWater.get(request.connectorId) ?? 0) + 1;
       if (!Number.isSafeInteger(generation)) throw new FabricContractError("resource_exhausted", "Connection generation is exhausted", "generation");
       const revision = (previousRevision ?? 0) + 1;
@@ -390,17 +731,18 @@ export class FabricConnectionManager {
     const at = this.#now();
     await this.#coordinator.commit("lease", at, (store) => {
       const current = store.records[reservation.connectorId];
-      if (current?.connectionId !== reservation.connectionId || current.generation !== reservation.generation) {
+      if (current === undefined) return { mutations: [], value: undefined };
+      assertValidPriorDurableConnection(current, reservation.connectorId);
+      if (current.connectionId !== reservation.connectionId || current.generation !== reservation.generation) {
         return { mutations: [], value: undefined };
       }
-      const currentRevision = current.revision;
-      if (typeof currentRevision !== "number") throw new FabricContractError("protocol_violation", "Durable connection record has no revision", "revision");
+      const currentRevision = current.revision as number;
       return {
         mutations: [{
           kind: "upsert",
           subjectId: reservation.connectorId,
           expectedRevision: currentRevision,
-          value: { ...current, state: "closed", expiresAt: at, revision: currentRevision + 1 },
+          value: { ...current, state: "closed", revision: currentRevision + 1 },
           eventKind: "connection.closed",
           payload: { connectionId: reservation.connectionId, connectorId: reservation.connectorId, generation: reservation.generation, state: "closed", reason },
         }],
@@ -590,25 +932,27 @@ export class FabricConnectionManager {
       if (
         device === undefined || connector === undefined || !device.enabled || !connector.enabled ||
         !authorityEqual(device, managed.authorityDevice) || !authorityEqual(connector, managed.authorityConnector) ||
-        device.connectorId !== lease.connectorId || connector.instanceNonce !== lease.connectorInstanceNonce
+        device.connectorId !== lease.connectorId || (!managed.inbound && connector.instanceNonce !== lease.connectorInstanceNonce)
       ) {
         throw new FabricContractError("stale_generation", "Current directory authority changed", "connectorId");
       }
       const descriptor = managed.channel?.descriptor;
-      if (
-        descriptor === undefined || descriptor.protocolVersion !== FABRIC_PROTOCOL_VERSION ||
-        !limitsEqual(descriptor.limits, managed.negotiatedLimits) ||
-        descriptor.lease.connectionId !== providerLease.connectionId || descriptor.lease.generation !== providerLease.generation ||
-        descriptor.lease.deviceId !== providerLease.deviceId || descriptor.lease.connectorId !== providerLease.connectorId ||
-        descriptor.lease.connectorInstanceNonce !== providerLease.connectorInstanceNonce ||
-        descriptor.lease.capabilityDigest !== providerLease.capabilityDigest || descriptor.lease.state !== providerLease.state ||
-        descriptor.lease.establishedAt !== providerLease.establishedAt || descriptor.lease.expiresAt !== providerLease.expiresAt ||
-        descriptor.lease.revision !== providerLease.revision
-      ) {
-        throw new FabricContractError("protocol_violation", "Provider descriptor changed after admission", "descriptor");
+      if (!managed.inbound) {
+        if (
+          descriptor === undefined || descriptor.protocolVersion !== FABRIC_PROTOCOL_VERSION ||
+          !limitsEqual(descriptor.limits, managed.negotiatedLimits) ||
+          descriptor.lease.connectionId !== providerLease.connectionId || descriptor.lease.generation !== providerLease.generation ||
+          descriptor.lease.deviceId !== providerLease.deviceId || descriptor.lease.connectorId !== providerLease.connectorId ||
+          descriptor.lease.connectorInstanceNonce !== providerLease.connectorInstanceNonce ||
+          descriptor.lease.capabilityDigest !== providerLease.capabilityDigest || descriptor.lease.state !== providerLease.state ||
+          descriptor.lease.establishedAt !== providerLease.establishedAt || descriptor.lease.expiresAt !== providerLease.expiresAt ||
+          descriptor.lease.revision !== providerLease.revision
+        ) {
+          throw new FabricContractError("protocol_violation", "Provider descriptor changed after admission", "descriptor");
+        }
+        assertValidFabricProtocolLimits(descriptor.limits);
+        assertValidConnectionLease(descriptor.lease, now);
       }
-      assertValidFabricProtocolLimits(descriptor.limits);
-      assertValidConnectionLease(descriptor.lease, now);
       assertValidConnectionLease(lease, now);
     } catch (error) {
       this.#fenceAndClose(managed, "authority revalidation failed");
@@ -618,18 +962,10 @@ export class FabricConnectionManager {
   }
 
   #fenceAndClose(managed: ManagedConnection, reason: string): void {
-    if (managed.state.phase !== "closed") {
-      const closed = closeConnection(managed.state);
-      if (closed.connection !== undefined) {
-        managed.state = { ...closed, connection: { ...closed.connection, revision: closed.connection.revision + 1 } };
-      }
-    }
-    managed.ready = false;
-    void this.#persistManagedState(managed, reason).then(
-      () => this.#attemptClose(managed, reason),
-      (error: unknown) => { managed.closeFailure = error; },
-    ).catch((error: unknown) => {
-      managed.closeFailure = error;
+    this.#fenceMemory(managed);
+    void this.#enqueueCleanup(managed, reason).catch(() => {
+      // Automatic cleanup is best-effort. Durable and owner failures remain
+      // independently retryable through disconnect().
     });
   }
 
@@ -670,20 +1006,35 @@ export class FabricConnectionManager {
     assertEpochMilliseconds(deadlineAt, "deadlineAt");
     const now = this.#now();
     if (deadlineAt <= now) throw new FabricContractError("deadline_exceeded", "Drain deadline must be in the future", "deadlineAt");
-    const managed = this.#requireManagedReady(connectionId, expectedGeneration);
+    const managed = this.#requireCurrent(connectionId, expectedGeneration);
+    this.#revalidateAuthority(managed, now);
     const currentLease = managed.state.connection!;
+    if (managed.closureStarted || (managed.state.phase !== "connected" && managed.state.phase !== "ready") || currentLease.state !== "connected") {
+      throw new FabricContractError("invalid_state", "Only an admitted connected generation may drain", "state");
+    }
     if (deadlineAt > currentLease.expiresAt) {
       throw new FabricContractError("invalid_argument", "Drain deadline cannot exceed the connection lease", "deadlineAt");
     }
     const draining = beginConnectionDrain(managed.state);
     if (draining.connection === undefined) throw new FabricContractError("invalid_state", "Drain lost its connection state");
     const drainingLease = { ...draining.connection, revision: draining.connection.revision + 1 };
+    managed.closureStarted = true;
     managed.state = { ...draining, connection: drainingLease };
     managed.ready = false;
-    void this.#persistManagedState(managed, "explicit drain").catch((error: unknown) => {
-      managed.closeFailure = error;
+    void this.#enqueueLifecycle(managed, async () => {
+      try {
+        await this.#persistLeaseState(managed, drainingLease, "explicit drain");
+      } catch (error) {
+        managed.durableCleanupFailure = error;
+        throw error;
+      }
+    }).catch(() => {
+      // A later deadline/disconnect cleanup retries from the durable record.
     });
+    const ownerConnectionId = drainingLease.connectionId;
+    const ownerGeneration = drainingLease.generation;
     managed.drainHandle = this.#scheduler.schedule(deadlineAt, () => {
+      if (!this.#isManagedIdentity(managed, ownerConnectionId, ownerGeneration)) return;
       this.#fenceAndClose(managed, "drain deadline reached");
     });
     return projectConnection(drainingLease);
@@ -702,82 +1053,182 @@ export class FabricConnectionManager {
     const lease = managed?.state.connection;
     if (managed === undefined || lease === undefined) throw new FabricContractError("not_found", "Connection is not known", "connectionId");
     if (lease.generation !== expectedGeneration) throw new FabricContractError("stale_generation", "Connection generation is stale", "connectionGeneration");
+    this.#fenceMemory(managed);
+    const closedLease = projectConnection(managed.state.connection!);
+    await this.#enqueueCleanup(managed, reason);
+    return closedLease;
+  }
+
+  #enqueueLifecycle<T>(managed: ManagedConnection, action: () => Promise<T>): Promise<T> {
+    const run = managed.lifecycleTail.then(action);
+    managed.lifecycleTail = run.then(() => undefined, () => undefined);
+    return run;
+  }
+
+  #isManagedIdentity(managed: ManagedConnection, connectionId: string, generation: number): boolean {
+    const lease = managed.state.connection;
+    return this.#activeById.get(connectionId) === managed && lease?.connectionId === connectionId && lease.generation === generation;
+  }
+
+  #assertManagedIdentity(managed: ManagedConnection, connectionId: string, generation: number): void {
+    if (!this.#isManagedIdentity(managed, connectionId, generation)) {
+      throw new FabricContractError("stale_generation", "Connection owner changed during lifecycle work", "connectionId");
+    }
+  }
+
+  #fenceMemory(managed: ManagedConnection): void {
+    managed.closureStarted = true;
     if (managed.state.phase !== "closed") {
       const closed = closeConnection(managed.state);
       if (closed.connection === undefined) throw new FabricContractError("invalid_state", "Close lost its connection state");
       managed.state = { ...closed, connection: { ...closed.connection, revision: closed.connection.revision + 1 } };
-      managed.ready = false;
     }
-    const closedLease = projectConnection(managed.state.connection!);
-    await this.#persistManagedState(managed, reason);
-    await this.#attemptClose(managed, reason);
-    return closedLease;
+    managed.ready = false;
   }
 
-  async #persistManagedState(managed: ManagedConnection, reason: string): Promise<void> {
-    if (this.#coordinator === undefined || managed.durableRevision === undefined) return;
-    const run = managed.persistenceTail.then(async () => {
-      const lease = managed.state.connection;
-      if (lease === undefined || managed.durableRevision === undefined) return;
-      const expectedRevision = managed.durableRevision;
-      const nextRevision = expectedRevision + 1;
-      await this.#coordinator!.commit("lease", this.#now(), (store) => {
-        const current = store.records[lease.connectorId];
-        if (
-          current?.revision !== expectedRevision || current.connectionId !== lease.connectionId ||
-          current.generation !== lease.generation
-        ) {
-          throw new FabricContractError("stale_generation", "Durable connection lease is no longer current", "connectionId");
-        }
-        return {
-          mutations: [{
-            kind: "upsert",
-            subjectId: lease.connectorId,
-            expectedRevision,
-            value: {
-              ...current,
-              state: lease.state,
-              expiresAt: lease.expiresAt,
-              connectionRevision: lease.revision,
-              revision: nextRevision,
-            },
-            eventKind: `connection.${lease.state}`,
-            payload: { connectionId: lease.connectionId, connectorId: lease.connectorId, generation: lease.generation, state: lease.state, reason },
-          }],
-          value: undefined,
-        };
-      });
-      managed.durableRevision = nextRevision;
-    });
-    managed.persistenceTail = run.catch(() => undefined);
-    return run;
-  }
-
-  async #attemptClose(managed: ManagedConnection, reason: string): Promise<void> {
-    if (managed.closePromise !== undefined) return managed.closePromise;
-    const channel = managed.channel;
+  #enqueueCleanup(managed: ManagedConnection, reason: string): Promise<void> {
     const lease = managed.state.connection;
-    if (channel === undefined || lease === undefined) return;
-    managed.closeFailure = undefined;
-    const attempt = Promise.resolve().then(() => channel.close(reason)).then(() => {
-      if (managed.drainHandle !== undefined) this.#scheduler.cancel(managed.drainHandle);
-      managed.drainHandle = undefined;
-      managed.channel = undefined;
-      if (this.#currentByDevice.get(lease.deviceId) === managed) this.#currentByDevice.delete(lease.deviceId);
-      if (this.#currentByConnector.get(lease.connectorId) === managed) this.#currentByConnector.delete(lease.connectorId);
-      this.#activeById.delete(lease.connectionId);
-      const terminal = projectConnection(lease);
-      this.#terminalById.delete(lease.connectionId);
-      this.#terminalById.set(lease.connectionId, terminal);
-      this.#enforceTerminalCapacity();
-    }, (error: unknown) => {
-      managed.closeFailure = error;
-      throw new FabricContractError("unavailable", "Channel close failed; disconnect may be retried", "connectionId");
-    }).finally(() => {
-      managed.closePromise = undefined;
+    if (lease === undefined) return Promise.resolve();
+
+    // Physical ownership is fenced independently from durable serialization.
+    // A non-settling store operation must never keep the transport alive.
+    const ownerAttempt = this.#startOwnerCleanup(managed, lease, reason);
+    const durableAttempt = this.#enqueueLifecycle(managed, async () => {
+      if (managed.durableCleanupDone) return;
+      try {
+        await this.#attemptDurableCleanup(managed, lease, reason);
+        managed.durableCleanupDone = true;
+        managed.durableCleanupFailure = undefined;
+      } catch (error) {
+        managed.durableCleanupFailure = error;
+        throw error;
+      }
     });
-    managed.closePromise = attempt;
+
+    return Promise.allSettled([durableAttempt, ownerAttempt]).then((results) => {
+      const failures = results.flatMap((result) => result.status === "rejected" ? [result.reason] : []);
+      if (managed.durableCleanupDone && managed.ownerCloseDone) this.#finalizeManaged(managed, lease);
+      if (failures.length > 0) {
+        const failure = new FabricContractError("unavailable", "Connection cleanup incomplete; disconnect may be retried", "connectionId");
+        Object.defineProperty(failure, "cause", {
+          configurable: true,
+          value: failures.length === 1 ? failures[0] : new AggregateError(failures, "Connection cleanup steps failed"),
+        });
+        throw failure;
+      }
+    });
+  }
+
+  #startOwnerCleanup(managed: ManagedConnection, lease: ConnectionLease, reason: string): Promise<void> {
+    if (managed.ownerCloseDone) return Promise.resolve();
+    if (managed.ownerCloseAttempt !== undefined) return managed.ownerCloseAttempt;
+
+    const attempt = Promise.resolve().then(() => this.#attemptOwnerClose(managed, lease, reason)).then(() => {
+      managed.ownerCloseDone = true;
+      managed.ownerCloseFailure = undefined;
+    }, (error: unknown) => {
+      managed.ownerCloseFailure = error;
+      throw error;
+    }).finally(() => {
+      if (managed.ownerCloseAttempt === attempt) managed.ownerCloseAttempt = undefined;
+    });
+    managed.ownerCloseAttempt = attempt;
     return attempt;
+  }
+
+  async #persistLeaseState(managed: ManagedConnection, lease: ConnectionLease, reason: string): Promise<void> {
+    if (this.#coordinator === undefined || managed.durableRevision === undefined) return;
+    const expectedRevision = managed.durableRevision;
+    const nextRevision = expectedRevision + 1;
+    await this.#coordinator.commit("lease", this.#now(), (store) => {
+      const current = store.records[lease.connectorId];
+      if (current !== undefined) assertValidPriorDurableConnection(current, lease.connectorId);
+      if (
+        current?.revision !== expectedRevision || current.connectionId !== lease.connectionId ||
+        current.generation !== lease.generation
+      ) {
+        throw new FabricContractError("stale_generation", "Durable connection lease is no longer current", "connectionId");
+      }
+      return {
+        mutations: [{
+          kind: "upsert",
+          subjectId: lease.connectorId,
+          expectedRevision,
+          value: {
+            ...current,
+            state: lease.state,
+            expiresAt: lease.expiresAt,
+            connectionRevision: lease.revision,
+            revision: nextRevision,
+          },
+          eventKind: `connection.${lease.state}`,
+          payload: { connectionId: lease.connectionId, connectorId: lease.connectorId, generation: lease.generation, state: lease.state, reason },
+        }],
+        value: undefined,
+      };
+    });
+    this.#assertManagedIdentity(managed, lease.connectionId, lease.generation);
+    managed.durableRevision = nextRevision;
+  }
+
+  async #attemptDurableCleanup(managed: ManagedConnection, lease: ConnectionLease, reason: string): Promise<void> {
+    if (this.#coordinator === undefined || managed.durableRevision === undefined) return;
+    const at = this.#now();
+    const committedRevision = await this.#coordinator.commit("lease", at, (store) => {
+      const current = store.records[lease.connectorId];
+      if (current === undefined) return { mutations: [], value: managed.durableRevision! };
+      assertValidPriorDurableConnection(current, lease.connectorId);
+      if (current.connectionId !== lease.connectionId || current.generation !== lease.generation) {
+        // A newer durable generation is already the authoritative fence.
+        return { mutations: [], value: managed.durableRevision! };
+      }
+      const currentRevision = current.revision as number;
+      if (current.state === "closed") return { mutations: [], value: currentRevision };
+      const nextRevision = currentRevision + 1;
+      return {
+        mutations: [{
+          kind: "upsert",
+          subjectId: lease.connectorId,
+          expectedRevision: currentRevision,
+          value: {
+            ...current,
+            state: "closed",
+            // Preserve the memory-fenced lease boundary. A renewal that was
+            // already inside its durable await must not extend closure.
+            expiresAt: lease.expiresAt,
+            connectionRevision: lease.revision,
+            revision: nextRevision,
+          },
+          eventKind: "connection.closed",
+          payload: { connectionId: lease.connectionId, connectorId: lease.connectorId, generation: lease.generation, state: "closed", reason },
+        }],
+        value: nextRevision,
+      };
+    });
+    this.#assertManagedIdentity(managed, lease.connectionId, lease.generation);
+    managed.durableRevision = committedRevision;
+  }
+
+  async #attemptOwnerClose(managed: ManagedConnection, lease: ConnectionLease, reason: string): Promise<void> {
+    const owner = managed.channel ?? managed.inboundOwner;
+    if (owner === undefined) return;
+    await owner.close(reason);
+    this.#assertManagedIdentity(managed, lease.connectionId, lease.generation);
+    if (managed.channel === owner) managed.channel = undefined;
+    if (managed.inboundOwner === owner) managed.inboundOwner = undefined;
+  }
+
+  #finalizeManaged(managed: ManagedConnection, lease: ConnectionLease): void {
+    if (!this.#isManagedIdentity(managed, lease.connectionId, lease.generation)) return;
+    if (managed.drainHandle !== undefined) this.#scheduler.cancel(managed.drainHandle);
+    managed.drainHandle = undefined;
+    if (this.#currentByDevice.get(lease.deviceId) === managed) this.#currentByDevice.delete(lease.deviceId);
+    if (this.#currentByConnector.get(lease.connectorId) === managed) this.#currentByConnector.delete(lease.connectorId);
+    if (this.#activeById.get(lease.connectionId) === managed) this.#activeById.delete(lease.connectionId);
+    const terminal = projectConnection(lease);
+    this.#terminalById.delete(lease.connectionId);
+    this.#terminalById.set(lease.connectionId, terminal);
+    this.#enforceTerminalCapacity();
   }
 
   #enforceTerminalCapacity(): void {

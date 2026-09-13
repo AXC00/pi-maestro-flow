@@ -4,6 +4,7 @@ import {
   FABRIC_PROTOCOL_VERSION,
   FabricContractError,
   assertValidFabricEnvelope,
+  assertValidFabricProtocolLimits,
   type FabricEnvelopeV1,
   type FabricProtocolLimits,
   type JsonValue,
@@ -68,6 +69,18 @@ function positive(value: number | undefined, fallback: number, label: string): n
   return result;
 }
 
+function utf8Bound(value: string, maxBytes: number): string {
+  let result = "";
+  let bytes = 0;
+  for (const character of value) {
+    const size = Buffer.byteLength(character, "utf8");
+    if (bytes + size > maxBytes) break;
+    result += character;
+    bytes += size;
+  }
+  return result;
+}
+
 /**
  * Connector side of the outbound WSS control channel.
  *
@@ -81,6 +94,7 @@ export class FabricConnectorRuntime {
   readonly #options: FabricConnectorRuntimeOptions;
   readonly #now: () => number;
   readonly #limits: FabricProtocolLimits;
+  #negotiatedLimits: FabricProtocolLimits;
   readonly #connectTimeoutMs: number;
   readonly #reconnectDelayMs: number;
   readonly #maxReconnectAttempts: number;
@@ -91,6 +105,7 @@ export class FabricConnectorRuntime {
   #connectionId = "";
   #connectionGeneration = 0;
   #advertisementRevision = 0;
+  #pendingAdvertisement?: FabricConnectorAdvertisement;
   #heartbeatSequence = 0;
   #heartbeatTimer?: NodeJS.Timeout;
   #awaitingAck = false;
@@ -98,6 +113,8 @@ export class FabricConnectorRuntime {
   #reconnectAttempts = 0;
   #pending?: PendingStart;
   #stopRequested = false;
+  #attemptToken = 0;
+  #failedAttemptToken = 0;
 
   constructor(options: FabricConnectorRuntimeOptions) {
     if (!options.url.startsWith("wss://")) {
@@ -118,6 +135,8 @@ export class FabricConnectorRuntime {
       maxAdvertisementItems: positive(options.limits?.maxAdvertisementItems, CONNECTOR_LIMITS.maxAdvertisementItems, "maxAdvertisementItems"),
       maxResultBytes: positive(options.limits?.maxResultBytes, CONNECTOR_LIMITS.maxResultBytes, "maxResultBytes"),
     };
+    assertValidFabricProtocolLimits(this.#limits);
+    this.#negotiatedLimits = { ...this.#limits };
   }
 
   get state(): FabricConnectorRuntimeState {
@@ -137,6 +156,19 @@ export class FabricConnectorRuntime {
     if (this.#state !== "idle" && this.#state !== "closed") {
       throw new FabricContractError("invalid_state", "Fabric Connector runtime is already started");
     }
+    if (this.#reconnectTimer !== undefined) clearTimeout(this.#reconnectTimer);
+    this.#reconnectTimer = undefined;
+    this.#clearHeartbeat();
+    this.#socket = undefined;
+    this.#reconnectAttempts = 0;
+    this.#failedAttemptToken = 0;
+    this.#connectionId = "";
+    this.#connectionGeneration = 0;
+    this.#advertisementRevision = 0;
+    this.#pendingAdvertisement = undefined;
+    this.#heartbeatSequence = 0;
+    this.#negotiatedLimits = { ...this.#limits };
+    this.#instanceNonce = this.#options.instanceNonce ?? randomUUID();
     this.#stopRequested = false;
     this.#state = "connecting";
     return new Promise<void>((resolve, reject) => {
@@ -148,37 +180,56 @@ export class FabricConnectorRuntime {
   /** Bounded stop: drain if ready, then close and clear every timer. */
   async stop(reason = "the Connector is stopping"): Promise<void> {
     this.#stopRequested = true;
+    this.#attemptToken += 1;
     if (this.#reconnectTimer !== undefined) clearTimeout(this.#reconnectTimer);
     this.#reconnectTimer = undefined;
     this.#clearHeartbeat();
     const socket = this.#socket;
     if (socket === undefined || socket.readyState === WebSocket.CLOSED) {
+      this.#socket = undefined;
       this.#state = "closed";
       this.#settleStart(new FabricContractError("cancelled", reason));
       return;
     }
-    if (this.#state === "ready") {
-      this.#state = "draining";
-      this.#send({ kind: "drain", payload: { reason } });
-    }
-    await new Promise<void>((resolve) => {
-      const done = (): void => resolve();
-      const timer = setTimeout(() => {
-        try { socket.terminate(); } catch { /* already gone */ }
-        done();
-      }, this.#connectTimeoutMs);
-      timer.unref?.();
-      socket.once("close", () => {
-        clearTimeout(timer);
-        done();
+    try {
+      if (this.#state === "ready") {
+        this.#state = "draining";
+        this.#send({ kind: "drain", payload: { reason } });
+      }
+      await new Promise<void>((resolve) => {
+        let settled = false;
+        let timer: NodeJS.Timeout | undefined;
+        const done = (): void => {
+          if (settled) return;
+          settled = true;
+          if (timer !== undefined) clearTimeout(timer);
+          resolve();
+        };
+        timer = setTimeout(() => {
+          try { socket.terminate(); } catch { /* the transport is already unusable */ }
+          done();
+        }, this.#connectTimeoutMs);
+        timer.unref?.();
+        socket.once("close", done);
+        try {
+          if (socket.readyState === WebSocket.CONNECTING) socket.terminate();
+          else socket.close(1000, utf8Bound(reason, 123));
+        } catch {
+          try { socket.terminate(); } catch { /* the transport is already unusable */ }
+          done();
+        }
       });
-      try { socket.close(1000, reason.slice(0, 120)); } catch { done(); }
-    });
-    this.#state = "closed";
-    this.#options.onClosed?.(reason);
+    } finally {
+      if (this.#socket === socket) this.#socket = undefined;
+      this.#state = "closed";
+      this.#settleStart(new FabricContractError("cancelled", reason));
+      this.#notifyClosed(reason);
+    }
   }
 
   #connect(): void {
+    const attemptToken = ++this.#attemptToken;
+    this.#negotiatedLimits = { ...this.#limits };
     const socket = new WebSocket(this.#options.url, {
       ...(this.#ca === undefined ? {} : { ca: this.#ca }),
       maxPayload: this.#limits.maxFrameBytes,
@@ -186,48 +237,75 @@ export class FabricConnectorRuntime {
     });
     this.#socket = socket;
     const timer = setTimeout(() => {
-      if (this.#state === "connecting") {
-        try { socket.terminate(); } catch { /* already gone */ }
-        this.#failOrReconnect("the Hub did not answer within connectTimeoutMs");
+      if (this.#isCurrentAttempt(socket, attemptToken) && this.#state === "connecting") {
+        this.#failOrReconnect("the Hub did not answer within connectTimeoutMs", attemptToken);
       }
     }, this.#connectTimeoutMs);
     timer.unref?.();
 
     socket.on("open", () => {
+      if (!this.#isCurrentAttempt(socket, attemptToken)) return;
       clearTimeout(timer);
-      this.#send({
-        kind: "client_hello",
-        payload: {
-          connectorId: this.#options.connectorId,
-          keyId: this.#options.keyId,
-          instanceNonce: this.#instanceNonce,
-          limits: this.#limits as unknown as JsonValue,
-        },
-      });
+      try {
+        const advertisement = this.#options.advertisementOf?.();
+        if (advertisement === undefined) {
+          return this.#failOrReconnect("this Connector has no advertisement to publish", attemptToken);
+        }
+        this.#pendingAdvertisement = advertisement;
+        this.#send({
+          kind: "client_hello",
+          payload: {
+            connectorId: this.#options.connectorId,
+            keyId: this.#options.keyId,
+            instanceNonce: this.#instanceNonce,
+            credentialGeneration: this.#options.credentialGeneration,
+            supportedVersions: [FABRIC_PROTOCOL_VERSION],
+            capabilityDigest: advertisement.capabilityDigest,
+            limits: this.#limits as unknown as JsonValue,
+          },
+        }, attemptToken);
+      } catch (error) {
+        this.#failOrReconnect(error instanceof Error ? error.message : "the Connector failed to open its Fabric session", attemptToken);
+      }
     });
     socket.on("message", (data, isBinary) => {
-      if (isBinary) return this.#failOrReconnect("the Hub sent a binary frame");
+      if (!this.#isCurrentAttempt(socket, attemptToken)) return;
+      if (isBinary) return this.#failOrReconnect("the Hub sent a binary frame", attemptToken);
+      const bytes = Buffer.isBuffer(data) ? data.length : Buffer.byteLength(String(data), "utf8");
+      if (bytes > this.#negotiatedLimits.maxFrameBytes) {
+        return this.#failOrReconnect("the Hub exceeded the negotiated maxFrameBytes", attemptToken);
+      }
       let parsed: unknown;
       try {
         parsed = JSON.parse(Buffer.isBuffer(data) ? data.toString("utf8") : String(data));
         assertValidFabricEnvelope(parsed);
       } catch (error) {
-        return this.#failOrReconnect(error instanceof Error ? error.message : "the Hub sent a malformed frame");
+        return this.#failOrReconnect(error instanceof Error ? error.message : "the Hub sent a malformed frame", attemptToken);
       }
-      this.#onEnvelope(parsed);
+      try {
+        this.#onEnvelope(parsed, attemptToken);
+      } catch (error) {
+        this.#failOrReconnect(error instanceof Error ? error.message : "the Connector failed to handle a Hub frame", attemptToken);
+      }
     });
     socket.on("error", (error: Error) => {
-      this.#options.onError?.(error.message);
+      if (this.#isCurrentAttempt(socket, attemptToken)) this.#notifyError(error.message);
     });
     socket.on("close", (code: number) => {
       clearTimeout(timer);
+      if (!this.#isCurrentAttempt(socket, attemptToken)) return;
+      this.#socket = undefined;
       this.#clearHeartbeat();
       if (this.#stopRequested || this.#state === "closed") return;
-      this.#failOrReconnect(`the Hub closed the channel (${code})`);
+      this.#failOrReconnect(`the Hub closed the channel (${code})`, attemptToken);
     });
   }
 
-  #onEnvelope(envelope: FabricEnvelopeV1): void {
+  #isCurrentAttempt(socket: WebSocket, attemptToken: number): boolean {
+    return attemptToken === this.#attemptToken && socket === this.#socket;
+  }
+
+  #onEnvelope(envelope: FabricEnvelopeV1, attemptToken: number): void {
     switch (envelope.kind) {
       case "server_challenge": {
         const challengeId = envelope.payload.challengeId;
@@ -236,7 +314,13 @@ export class FabricConnectorRuntime {
         const protocolVersion = envelope.payload.protocolVersion;
         if (typeof challengeId !== "string" || typeof challengeNonce !== "string"
           || typeof audience !== "string" || typeof protocolVersion !== "string") {
-          return this.#failOrReconnect("the Hub sent an incomplete challenge");
+          return this.#failOrReconnect("the Hub sent an incomplete challenge", attemptToken);
+        }
+        if (audience !== this.#options.audience) {
+          return this.#failOrReconnect("the Hub challenge audience does not match this Connector", attemptToken);
+        }
+        if (protocolVersion !== FABRIC_PROTOCOL_VERSION) {
+          return this.#failOrReconnect("the Hub selected an unsupported Fabric protocol", attemptToken);
         }
         // The generation is the one this Connector was enrolled under; a
         // Connector that does not know it cannot prove one.
@@ -265,16 +349,40 @@ export class FabricConnectorRuntime {
         return;
       }
       case "connection_accepted": {
-        const connectionId = envelope.payload.connectionId;
-        const generation = envelope.payload.connectionGeneration;
-        if (typeof connectionId !== "string" || !Number.isSafeInteger(generation) || (generation as number) < 1) {
-          return this.#failOrReconnect("the Hub accepted the connection without a generation");
+        const lease = envelope.payload.lease;
+        const limits = envelope.payload.limits;
+        if (typeof lease !== "object" || lease === null || Array.isArray(lease) ||
+          typeof limits !== "object" || limits === null || Array.isArray(limits)) {
+          return this.#failOrReconnect("the Hub accepted the connection without its locked lease and limits", attemptToken);
         }
+        const acceptedLease = lease as Readonly<Record<string, JsonValue>>;
+        const connectionId = acceptedLease.connectionId;
+        const generation = acceptedLease.generation;
+        const acceptedLimits = limits as unknown as FabricProtocolLimits;
+        try {
+          assertValidFabricProtocolLimits(acceptedLimits);
+        } catch {
+          return this.#failOrReconnect("the Hub returned invalid negotiated limits", attemptToken);
+        }
+        const limitFields = Object.keys(this.#limits) as Array<keyof FabricProtocolLimits>;
+        if (limitFields.some((field) => acceptedLimits[field] > this.#limits[field])) {
+          return this.#failOrReconnect("the Hub widened the Connector's negotiated limits", attemptToken);
+        }
+        if (typeof connectionId !== "string" || !Number.isSafeInteger(generation) || (generation as number) < 1 ||
+          envelope.connectionId !== connectionId || envelope.connectionGeneration !== generation ||
+          typeof acceptedLease.deviceId !== "string" || acceptedLease.connectorId !== this.#options.connectorId ||
+          acceptedLease.state !== "connected" || typeof acceptedLease.capabilityDigest !== "string" ||
+          typeof acceptedLease.establishedAt !== "number" || typeof acceptedLease.expiresAt !== "number" ||
+          typeof acceptedLease.revision !== "number") {
+          return this.#failOrReconnect("the Hub returned an invalid connection lease", attemptToken);
+        }
+        this.#negotiatedLimits = { ...acceptedLimits };
         this.#connectionId = connectionId;
         this.#connectionGeneration = generation as number;
-        const advertisement = this.#options.advertisementOf?.();
+        const advertisement = this.#pendingAdvertisement;
+        this.#pendingAdvertisement = undefined;
         if (advertisement === undefined) {
-          return this.#failOrReconnect("this Connector has no advertisement to publish");
+          return this.#failOrReconnect("this Connector has no authenticated advertisement to publish", attemptToken);
         }
         this.#advertisementRevision = advertisement.advertisementRevision;
         this.#send({
@@ -289,6 +397,10 @@ export class FabricConnectorRuntime {
       }
       case "ready": {
         const revision = envelope.payload.advertisementRevision;
+        const leaseExpiresAt = envelope.payload.leaseExpiresAt;
+        if (typeof leaseExpiresAt !== "number" || !Number.isSafeInteger(leaseExpiresAt) || leaseExpiresAt <= this.#now()) {
+          return this.#failOrReconnect("the Hub reported ready without a live lease expiry", attemptToken);
+        }
         this.#state = "ready";
         this.#reconnectAttempts = 0;
         this.#startHeartbeat();
@@ -314,30 +426,31 @@ export class FabricConnectorRuntime {
       case "error": {
         const code = typeof envelope.payload.code === "string" ? envelope.payload.code : "protocol_violation";
         const message = typeof envelope.payload.message === "string" ? envelope.payload.message : "the Hub refused the Connector";
-        this.#options.onError?.(`${code}: ${message}`);
+        this.#notifyError(`${code}: ${message}`);
         // A generation fence is terminal for this attempt; a retryable refusal
         // is answered by a fresh connection, never by reviving this one.
-        this.#failOrReconnect(`${code}: ${message}`);
+        this.#failOrReconnect(`${code}: ${message}`, attemptToken);
         return;
       }
       case "close": {
         this.#state = "closed";
-        this.#options.onClosed?.("the Hub closed the channel");
+        this.#notifyClosed("the Hub closed the channel");
         return;
       }
       default:
-        this.#failOrReconnect(`the Hub sent an unexpected frame kind ${envelope.kind}`);
+        this.#failOrReconnect(`the Hub sent an unexpected frame kind ${envelope.kind}`, attemptToken);
     }
   }
 
   #startHeartbeat(): void {
     this.#clearHeartbeat();
+    const attemptToken = this.#attemptToken;
     this.#heartbeatTimer = setInterval(() => {
-      if (this.#state !== "ready" || this.#stopRequested) return;
+      if (this.#state !== "ready" || this.#stopRequested || attemptToken !== this.#attemptToken) return;
       // A lease that lapsed without an acknowledgement is not renewed by
       // sending another heartbeat: the connection is re-established instead.
       if (this.#awaitingAck) {
-        this.#failOrReconnect("the Hub did not acknowledge the previous heartbeat");
+        this.#failOrReconnect("the Hub did not acknowledge the previous heartbeat", attemptToken);
         return;
       }
       this.#heartbeatSequence += 1;
@@ -346,7 +459,7 @@ export class FabricConnectorRuntime {
         kind: "heartbeat",
         payload: { sequence: this.#heartbeatSequence, observedAt: this.#now() },
       });
-    }, this.#limits.heartbeatIntervalMs);
+    }, this.#negotiatedLimits.heartbeatIntervalMs);
     this.#heartbeatTimer.unref?.();
   }
 
@@ -356,34 +469,59 @@ export class FabricConnectorRuntime {
     this.#awaitingAck = false;
   }
 
-  #send(input: { kind: FabricEnvelopeV1["kind"]; payload: Readonly<Record<string, JsonValue>> }): void {
+  #send(
+    input: { kind: FabricEnvelopeV1["kind"]; payload: Readonly<Record<string, JsonValue>> },
+    attemptToken = this.#attemptToken,
+  ): void {
     const socket = this.#socket;
-    if (socket === undefined || socket.readyState !== WebSocket.OPEN) return;
-    const envelope: FabricEnvelopeV1 = {
-      version: FABRIC_PROTOCOL_VERSION,
-      messageId: randomUUID(),
-      kind: input.kind,
-      sentAt: this.#now(),
-      ...(this.#connectionId === "" ? {} : { connectionId: this.#connectionId }),
-      ...(this.#connectionGeneration === 0 ? {} : { connectionGeneration: this.#connectionGeneration }),
-      payload: input.payload,
-    };
-    const text = JSON.stringify(envelope);
-    if (Buffer.byteLength(text, "utf8") > this.#limits.maxFrameBytes) {
-      throw new FabricContractError("resource_exhausted", "Fabric frame exceeds maxFrameBytes", "maxFrameBytes");
+    if (socket === undefined || socket.readyState !== WebSocket.OPEN || !this.#isCurrentAttempt(socket, attemptToken)) return;
+    try {
+      const envelope: FabricEnvelopeV1 = {
+        version: FABRIC_PROTOCOL_VERSION,
+        messageId: randomUUID(),
+        kind: input.kind,
+        sentAt: this.#now(),
+        ...(this.#connectionId === "" ? {} : { connectionId: this.#connectionId }),
+        ...(this.#connectionGeneration === 0 ? {} : { connectionGeneration: this.#connectionGeneration }),
+        payload: input.payload,
+      };
+      const text = JSON.stringify(envelope);
+      if (Buffer.byteLength(text, "utf8") > this.#negotiatedLimits.maxFrameBytes) {
+        throw new FabricContractError("resource_exhausted", "Fabric frame exceeds maxFrameBytes", "maxFrameBytes");
+      }
+      socket.send(text, (error) => {
+        if (error && this.#isCurrentAttempt(socket, attemptToken)) {
+          this.#failOrReconnect(error.message || "the Connector failed to send a Fabric frame", attemptToken);
+        }
+      });
+    } catch (error) {
+      this.#failOrReconnect(error instanceof Error ? error.message : "the Connector failed to send a Fabric frame", attemptToken);
     }
-    socket.send(text);
   }
 
-  #failOrReconnect(reason: string): void {
-    this.#options.onError?.(reason);
+  #notifyError(message: string): void {
+    try { this.#options.onError?.(message); } catch { /* observers cannot escape transport callbacks */ }
+  }
+
+  #notifyClosed(reason: string): void {
+    try { this.#options.onClosed?.(reason); } catch { /* observers cannot escape transport callbacks */ }
+  }
+
+  #failOrReconnect(reason: string, attemptToken = this.#attemptToken): void {
+    if (attemptToken !== this.#attemptToken || this.#failedAttemptToken === attemptToken) return;
+    this.#failedAttemptToken = attemptToken;
+    this.#notifyError(reason);
     this.#clearHeartbeat();
-    try { this.#socket?.terminate(); } catch { /* already gone */ }
+    const socket = this.#socket;
+    if (socket !== undefined && socket.readyState !== WebSocket.CLOSED) {
+      try { socket.terminate(); } catch { /* reconnect still fences this attempt */ }
+    }
     if (this.#stopRequested || this.#state === "closed") return;
     if (this.#reconnectAttempts >= this.#maxReconnectAttempts) {
+      this.#socket = undefined;
       this.#state = "closed";
       this.#settleStart(new FabricContractError("unavailable", `Fabric Connector gave up: ${reason}`));
-      this.#options.onClosed?.(reason);
+      this.#notifyClosed(reason);
       return;
     }
     this.#reconnectAttempts += 1;
@@ -392,11 +530,13 @@ export class FabricConnectorRuntime {
     this.#instanceNonce = randomUUID();
     this.#connectionId = "";
     this.#connectionGeneration = 0;
+    this.#pendingAdvertisement = undefined;
     this.#heartbeatSequence = 0;
+    this.#negotiatedLimits = { ...this.#limits };
     this.#state = "connecting";
     this.#reconnectTimer = setTimeout(() => {
       this.#reconnectTimer = undefined;
-      if (!this.#stopRequested) this.#connect();
+      if (!this.#stopRequested && attemptToken === this.#attemptToken) this.#connect();
     }, this.#reconnectDelayMs);
     this.#reconnectTimer.unref?.();
   }

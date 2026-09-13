@@ -11,6 +11,7 @@ import type {
   BackendCapabilities,
   BackendRun,
 } from "pi-maestro-backend-core/v1/backend";
+import type { BackendRegistry } from "pi-maestro-backend-core/v1/registry";
 import type {
   AgentTerminalStatus,
   SingleResult,
@@ -55,6 +56,31 @@ export interface FabricTeammateAttempt extends BackendRun {
  */
 export interface FabricTeammateRuntimePort {
   startAttempt(request: FabricTeammateAttemptRequest): Promise<FabricTeammateAttempt>;
+}
+
+export interface FabricTeammateRuntimePortOptions {
+  /** Test/embedder override; production resolves the source workspace registry. */
+  readonly backendRegistry?: BackendRegistry;
+}
+
+/**
+ * Create the production source-side runtime.
+ *
+ * Each call resolves and starts exactly one source-local backend attempt. It
+ * never enters the teammate orchestration loop, so it cannot retry another
+ * model, publish an agent:// result, or recursively place through Fabric.
+ */
+export function createFabricTeammateRuntimePort(
+  options: FabricTeammateRuntimePortOptions = {},
+): FabricTeammateRuntimePort {
+  return {
+    async startAttempt(request) {
+      // Keep the registry getter a light process seam. The execution engine is
+      // loaded only when a source Endpoint actually admits an attempt.
+      const { startFabricSourceBackendAttempt } = await import("../../runs/execution.ts");
+      return startFabricSourceBackendAttempt(request, options);
+    },
+  };
 }
 
 export interface FabricTeammateRuntimeRegistration {

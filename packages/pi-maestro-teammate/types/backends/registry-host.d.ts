@@ -96,6 +96,23 @@ export declare function dispatchRegistryForProjectionSync(projection: CompiledMo
  */
 export declare function dispatchRegistrySync(workspaceRoot: string, extrasOf: (spec: TeammateRunSpec, options: BackendRunOptions) => PiSubprocessRunExtras, remoteManagerOf?: () => RemoteManagerPort, globalFilePath?: string, fabricRouteResolverOf?: () => FabricBackendRouteResolver): TeammateBackendRegistry | undefined;
 /**
+ * Build the registry used by an already-admitted source-local Fabric attempt.
+ *
+ * Source execution still honours the operator's selected default deployment,
+ * but it must traverse the backend seam even when the project retains legacy
+ * mode. This does not change ordinary dispatch mode: only the explicit source
+ * runtime calls this helper.
+ */
+export declare function dispatchSourceAttemptRegistrySync(workspaceRoot: string, extrasOf: (spec: TeammateRunSpec, options: BackendRunOptions) => PiSubprocessRunExtras, globalFilePath?: string): TeammateBackendRegistry;
+/**
+ * Add the reserved Fabric deployment for one placed origin dispatch only.
+ *
+ * The overlay is never persisted and is never used for a placementless task.
+ * An operator may explicitly register the reserved name to the same module,
+ * but may not redirect it to a different implementation.
+ */
+export declare function dispatchFabricPlacementRegistrySync(workspaceRoot: string, extrasOf: (spec: TeammateRunSpec, options: BackendRunOptions) => PiSubprocessRunExtras, fabricRouteResolverOf: () => FabricBackendRouteResolver, remoteManagerOf?: () => RemoteManagerPort, globalFilePath?: string): TeammateBackendRegistry;
+/**
  * Forget cached documents and published pairs so an operator edit takes effect.
  *
  * Generations intentionally survive: they carry the last published identity,

@@ -5,12 +5,18 @@ import { WebSocketServer, type RawData, type WebSocket } from "ws";
 import {
   FABRIC_PROTOCOL_VERSION,
   FabricContractError,
+  assertBoundedString,
+  assertFabricIdentifier,
+  assertGeneration,
   assertValidFabricEnvelope,
+  assertValidFabricProtocolLimits,
   type FabricEnvelopeV1,
   type FabricMessageKind,
   type FabricProtocolLimits,
   type JsonValue,
+  type PublicConnectionLease,
 } from "pi-maestro-fabric-core/v1";
+import type { FabricManagedConnectionOwner } from "pi-maestro-fabric";
 import {
   FABRIC_CHALLENGE_PROOF_VERSION,
   type FabricChallengeProofV1,
@@ -29,24 +35,15 @@ const HUB_LIMITS: FabricProtocolLimits = Object.freeze({
   maxResultBytes: 1024 * 1024,
 });
 
-/** Connection states; a frame is accepted only in the states listed for it. */
-export const FABRIC_CONNECTOR_STATES = [
-  "connecting",
-  "challenged",
-  "connected",
-  "ready",
-  "draining",
-  "closed",
-] as const;
+export const FABRIC_CONNECTOR_STATES = ["connecting", "challenged", "connected", "ready", "draining", "closed"] as const;
 export type FabricConnectorState = (typeof FABRIC_CONNECTOR_STATES)[number];
 
-/** The exact inbound kinds each state accepts. Anything else is refused. */
 const ACCEPTED_KINDS: Readonly<Record<FabricConnectorState, readonly FabricMessageKind[]>> = Object.freeze({
   connecting: ["client_hello"],
   challenged: ["client_proof"],
-  connected: ["advertise_snapshot", "advertise_delta", "heartbeat", "drain", "close"],
+  connected: ["advertise_snapshot", "advertise_delta", "drain", "close"],
   ready: ["advertise_delta", "heartbeat", "drain", "close"],
-  draining: ["heartbeat", "close"],
+  draining: ["close"],
   closed: [],
 });
 
@@ -56,50 +53,113 @@ export interface FabricConnectorSession {
   readonly connectionGeneration: number;
   readonly instanceNonce: string;
   readonly state: FabricConnectorState;
-  /** Advertisement revision the Hub currently holds for this connection. */
   readonly advertisementRevision: number;
   readonly lastHeartbeatAt: number;
-  /** True only while this session's generation is the Connector's current one. */
   readonly current: boolean;
+}
+
+export interface FabricWssAdmissionInput {
+  readonly requestId: string;
+  readonly connectorId: string;
+  readonly expectedCredentialGeneration: number;
+  readonly connectorInstanceNonce: string;
+  readonly capabilityDigest: string;
+  readonly limits: FabricProtocolLimits;
+  readonly establishedAt: number;
+  readonly expiresAt: number;
+}
+
+/** Host authority used by production WSS. Every mutation is awaited before ACK. */
+export interface FabricWssAuthority {
+  admit(input: FabricWssAdmissionInput, owner: FabricManagedConnectionOwner): Promise<PublicConnectionLease>;
+  acceptSnapshot(session: FabricConnectorSession, payload: Readonly<Record<string, JsonValue>>): Promise<void>;
+  acceptDelta(session: FabricConnectorSession, payload: Readonly<Record<string, JsonValue>>): Promise<void>;
+  heartbeat(session: FabricConnectorSession, input: {
+    readonly sequence: number;
+    readonly observedAt: number;
+    readonly leaseExpiresAt: number;
+  }): Promise<void>;
+  drain(session: FabricConnectorSession, deadlineAt: number, reason: string): Promise<void>;
+  close(session: FabricConnectorSession, reason: string): Promise<void>;
 }
 
 export interface FabricWssServerOptions {
   readonly security: FabricConnectorSecurity;
-  /**
-   * The host's own listener. TLS is the host's decision: the daemon refuses to
-   * mount this without its HTTPS listener, and attaching here does not itself
-   * make the socket secure.
-   */
   readonly server: HttpServer | HttpsServer;
   readonly path?: string;
   readonly limits?: Partial<FabricProtocolLimits>;
   readonly now?: () => number;
-  /** Bounded window a `drain` allows before the Hub fences the generation. */
   readonly drainTimeoutMs?: number;
-  readonly onReady?: (session: FabricConnectorSession) => void;
-  readonly onSessionClosed?: (session: FabricConnectorSession, reason: string) => void;
+  readonly authority?: FabricWssAuthority;
+  readonly onReady?: (session: FabricConnectorSession) => void | Promise<void>;
+  readonly onSessionClosed?: (session: FabricConnectorSession, reason: string) => void | Promise<void>;
   readonly onAdvertisement?: (
     session: FabricConnectorSession,
     revision: number,
     payload: Readonly<Record<string, JsonValue>>,
-  ) => void;
+  ) => void | Promise<void>;
+}
+
+type RetirementState = "active" | "retiring" | "retired";
+type CleanupState = "not_required" | "pending" | "running" | "succeeded";
+type SocketCleanupState = "pending" | "closing" | "terminating" | "succeeded";
+
+interface QueuedAction {
+  settled: boolean;
+  timer?: NodeJS.Timeout;
 }
 
 interface LiveSession {
+  readonly key: string;
   readonly socket: WebSocket;
-  /** Published by client_hello; empty until then. */
+  readonly sessionToken: string;
+  retirementState: RetirementState;
+  retirementReason?: string;
   instanceNonce: string;
   state: FabricConnectorState;
   connectionId: string;
   connectionGeneration: number;
+  credentialGeneration: number;
+  helloConnectorId: string;
   credential?: FabricConnectorCredentialV1;
   challengeId?: string;
   challengeNonce?: string;
+  challengeAudience?: string;
+  challengeProtocolVersion?: string;
+  capabilityDigest: string;
+  lease?: PublicConnectionLease;
+  negotiatedLimits: FabricProtocolLimits;
   advertisementRevision: number;
   lastHeartbeatAt: number;
   heartbeatSequence: number;
-  drainDeadline?: number;
-  readonly openedAt: number;
+  phaseDeadlineAt: number;
+  queueDepth: number;
+  tail: Promise<void>;
+  readonly queuedActions: Set<QueuedAction>;
+  authorityView?: FabricConnectorSession;
+  authorityCleanupSuppressed: boolean;
+  authorityCleanupState: CleanupState;
+  authorityCleanupAttempt: number;
+  authorityWatchdog?: NodeJS.Timeout;
+  authorityRetryTimer?: NodeJS.Timeout;
+  callbackCleanupState: CleanupState;
+  callbackCleanupAttempt: number;
+  callbackWatchdog?: NodeJS.Timeout;
+  callbackRetryTimer?: NodeJS.Timeout;
+  socketCleanupState: SocketCleanupState;
+  socketCleanupTimer?: NodeJS.Timeout;
+  socketCleanupPromise?: Promise<void>;
+  resolveSocketCleanup?: () => void;
+}
+
+interface SessionContinuation {
+  readonly sessionToken: string;
+  readonly state: FabricConnectorState;
+  readonly connectionId: string;
+  readonly connectionGeneration: number;
+  readonly advertisementRevision: number;
+  readonly heartbeatSequence: number;
+  readonly leaseRevision?: number;
 }
 
 function positive(value: number | undefined, fallback: number, label: string): number {
@@ -114,35 +174,89 @@ function envelopeOf(
   kind: FabricMessageKind,
   payload: Readonly<Record<string, JsonValue>>,
   now: () => number,
-  extra: { connectionId?: string; connectionGeneration?: number; correlationId?: string } = {},
+  extra: { connectionId?: string; connectionGeneration?: number; correlationId?: string; operationId?: string } = {},
 ): FabricEnvelopeV1 {
-  return {
-    version: FABRIC_PROTOCOL_VERSION,
-    messageId: randomUUID(),
-    kind,
-    sentAt: now(),
-    ...extra,
-    payload,
-  };
+  return { version: FABRIC_PROTOCOL_VERSION, messageId: randomUUID(), kind, sentAt: now(), ...extra, payload };
 }
 
-function frameBytes(data: RawData, isBinary: boolean): number {
-  if (isBinary) return Buffer.isBuffer(data) ? data.length : Buffer.byteLength(String(data));
-  return Buffer.byteLength(Buffer.isBuffer(data) ? data.toString("utf8") : String(data), "utf8");
+function frameBytes(data: RawData): number {
+  return Buffer.isBuffer(data) ? data.length : Buffer.byteLength(String(data), "utf8");
 }
 
 function textOf(data: RawData): string {
   return Buffer.isBuffer(data) ? data.toString("utf8") : String(data);
 }
 
-/**
- * Hub-side Connector admission over the daemon's own TLS listener.
- *
- * The server owns framing, the handshake state machine, heartbeat lease
- * renewal, drain, and generation fencing. It never reads a secret: proof
- * verification is delegated to {@link FabricConnectorSecurity}, which holds only
- * public keys.
- */
+function protocolLimits(value: JsonValue | undefined, hub: FabricProtocolLimits): FabricProtocolLimits {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new FabricContractError("invalid_argument", "client_hello limits must be an object", "limits");
+  }
+  const input = value as Readonly<Record<string, JsonValue>>;
+  const fields = [
+    "maxFrameBytes", "maxInFlightOperations", "heartbeatIntervalMs",
+    "heartbeatTimeoutMs", "maxAdvertisementItems", "maxResultBytes",
+  ] as const;
+  for (const field of fields) {
+    if (typeof input[field] !== "number") {
+      throw new FabricContractError("invalid_argument", `client_hello limits.${field} must be a number`, `limits.${field}`);
+    }
+  }
+  const requested: FabricProtocolLimits = {
+    maxFrameBytes: input.maxFrameBytes as number,
+    maxInFlightOperations: input.maxInFlightOperations as number,
+    heartbeatIntervalMs: input.heartbeatIntervalMs as number,
+    heartbeatTimeoutMs: input.heartbeatTimeoutMs as number,
+    maxAdvertisementItems: input.maxAdvertisementItems as number,
+    maxResultBytes: input.maxResultBytes as number,
+  };
+  assertValidFabricProtocolLimits(requested);
+  const negotiated = {
+    maxFrameBytes: Math.min(requested.maxFrameBytes, hub.maxFrameBytes),
+    maxInFlightOperations: Math.min(requested.maxInFlightOperations, hub.maxInFlightOperations),
+    heartbeatIntervalMs: Math.min(requested.heartbeatIntervalMs, hub.heartbeatIntervalMs),
+    heartbeatTimeoutMs: Math.min(requested.heartbeatTimeoutMs, hub.heartbeatTimeoutMs),
+    maxAdvertisementItems: Math.min(requested.maxAdvertisementItems, hub.maxAdvertisementItems),
+    maxResultBytes: Math.min(requested.maxResultBytes, hub.maxResultBytes),
+  };
+  assertValidFabricProtocolLimits(negotiated);
+  return negotiated;
+}
+
+function utf8Bound(value: string, maxBytes: number): string {
+  let result = "";
+  let bytes = 0;
+  for (const character of value) {
+    const size = Buffer.byteLength(character, "utf8");
+    if (bytes + size > maxBytes) break;
+    result += character;
+    bytes += size;
+  }
+  return result;
+}
+
+function safeContractMessage(error: FabricContractError): string {
+  const sanitized = error.message.replace(/[\r\n\u0000-\u001f\u007f]+/gu, " ");
+  return utf8Bound(sanitized, 512);
+}
+
+function assertAdmissionLease(
+  lease: PublicConnectionLease,
+  connectorId: string,
+  capabilityDigest: string,
+  now: number,
+): void {
+  assertFabricIdentifier(lease.connectionId, "lease.connectionId");
+  assertFabricIdentifier(lease.deviceId, "lease.deviceId");
+  assertFabricIdentifier(lease.connectorId, "lease.connectorId");
+  assertGeneration(lease.generation, "lease.generation");
+  if (lease.connectorId !== connectorId || lease.capabilityDigest !== capabilityDigest || lease.state !== "connected" ||
+    !Number.isSafeInteger(lease.establishedAt) || lease.establishedAt > now ||
+    !Number.isSafeInteger(lease.expiresAt) || lease.expiresAt <= now ||
+    !Number.isSafeInteger(lease.revision) || lease.revision < 0) {
+    throw new FabricContractError("protocol_violation", "Fabric authority returned an invalid connection lease", "lease");
+  }
+}
+
 export class FabricWssServer {
   readonly #options: FabricWssServerOptions;
   readonly #security: FabricConnectorSecurity;
@@ -152,7 +266,7 @@ export class FabricWssServer {
   readonly #drainTimeoutMs: number;
   readonly #sessions = new Map<string, LiveSession>();
   readonly #liveByConnector = new Map<string, string>();
-  readonly #generations = new Map<string, number>();
+  readonly #legacyGenerations = new Map<string, number>();
   readonly #wss: WebSocketServer;
   #sweep?: NodeJS.Timeout;
   #closed = false;
@@ -172,61 +286,59 @@ export class FabricWssServer {
       maxResultBytes: positive(options.limits?.maxResultBytes, HUB_LIMITS.maxResultBytes, "maxResultBytes"),
     };
     if (this.#limits.heartbeatTimeoutMs <= this.#limits.heartbeatIntervalMs) {
-      throw new FabricContractError(
-        "invalid_argument",
-        "heartbeatTimeoutMs must exceed heartbeatIntervalMs, or a healthy Connector is fenced",
-        "heartbeatTimeoutMs",
-      );
+      throw new FabricContractError("invalid_argument", "heartbeatTimeoutMs must exceed heartbeatIntervalMs, or a healthy Connector is fenced", "heartbeatTimeoutMs");
     }
     this.#wss = new WebSocketServer({ server: options.server, path: this.#path, maxPayload: this.#limits.maxFrameBytes });
     this.#wss.on("connection", (socket, request) => this.#onConnection(socket, request));
   }
 
-  /** Begin heartbeat sweeping. */
   start(): void {
     if (this.#closed || this.#sweep !== undefined) return;
-    this.#sweep = setInterval(() => this.#sweepLeases(), this.#limits.heartbeatIntervalMs);
-    this.#sweep.unref?.();
+    this.#scheduleSweep();
   }
 
-  /** Current session view, for inventory and tests. */
   sessions(): FabricConnectorSession[] {
-    return [...this.#sessions.values()].map((session) => this.#view(session));
+    return [...this.#sessions.values()]
+      .filter((session) => session.retirementState === "active")
+      .map((session) => this.#view(session));
   }
 
   sessionOf(connectorId: string): FabricConnectorSession | undefined {
     const id = this.#liveByConnector.get(connectorId);
     const session = id === undefined ? undefined : this.#sessions.get(id);
-    return session === undefined ? undefined : this.#view(session);
+    return session === undefined || session.retirementState !== "active" ? undefined : this.#view(session);
   }
 
-  /**
-   * Bounded shutdown: drain ready sessions, wait for their close, then
-   * terminate whatever is left. The Hub never blocks shutdown on a peer.
-   */
   async close(reason = "the Hub is shutting down"): Promise<void> {
     if (this.#closed) return;
     this.#closed = true;
-    if (this.#sweep !== undefined) clearInterval(this.#sweep);
+    if (this.#sweep !== undefined) clearTimeout(this.#sweep);
     this.#sweep = undefined;
+    const deadlineAt = Date.now() + this.#drainTimeoutMs;
     const sessions = [...this.#sessions.values()];
-    for (const session of sessions) this.#sendDrain(session, reason);
-    await Promise.race([
+    for (const session of sessions) {
+      try {
+        this.#sendDrain(session, reason);
+      } catch (error) {
+        void this.#retire(session, error instanceof FabricContractError ? safeContractMessage(error) : "Fabric drain could not be delivered");
+      }
+    }
+    await this.#withinDeadline(
       Promise.all(sessions.map((session) => new Promise<void>((resolve) => {
         if (session.socket.readyState === session.socket.CLOSED) return resolve();
         session.socket.once("close", () => resolve());
       }))).then(() => undefined),
-      new Promise<void>((resolve) => {
-        const timer = setTimeout(resolve, this.#drainTimeoutMs);
-        timer.unref?.();
-      }),
-    ]);
-    for (const session of this.#sessions.values()) {
-      try { session.socket.terminate(); } catch { /* already gone */ }
-    }
-    this.#sessions.clear();
-    this.#liveByConnector.clear();
-    await new Promise<void>((resolve) => this.#wss.close(() => resolve()));
+      Math.max(0, deadlineAt - Date.now()),
+    );
+    const retirements = sessions.map((session) => this.#retire(session, reason));
+    await this.#withinDeadline(
+      Promise.allSettled(retirements).then(() => undefined),
+      Math.max(0, deadlineAt - Date.now()),
+    );
+    await this.#withinDeadline(
+      new Promise<void>((resolve) => this.#wss.close(() => resolve())),
+      Math.max(0, deadlineAt - Date.now()),
+    );
   }
 
   #onConnection(socket: WebSocket, request: IncomingMessage): void {
@@ -234,67 +346,111 @@ export class FabricWssServer {
       socket.close(1012, "the Hub is shutting down");
       return;
     }
+    const now = this.#now();
     const session: LiveSession = {
-      socket,
-      instanceNonce: "",
-      state: "connecting",
-      connectionId: "",
-      connectionGeneration: 0,
-      advertisementRevision: 0,
-      lastHeartbeatAt: this.#now(),
-      heartbeatSequence: 0,
-      openedAt: this.#now(),
+      key: randomUUID(), socket, sessionToken: randomUUID(), retirementState: "active",
+      instanceNonce: "", state: "connecting", connectionId: "", connectionGeneration: 0,
+      credentialGeneration: 0, helloConnectorId: "", capabilityDigest: "", negotiatedLimits: { ...this.#limits }, advertisementRevision: 0,
+      lastHeartbeatAt: now, heartbeatSequence: 0, phaseDeadlineAt: now + this.#limits.heartbeatTimeoutMs,
+      queueDepth: 0, tail: Promise.resolve(), queuedActions: new Set(), authorityCleanupSuppressed: false,
+      authorityCleanupState: "not_required", authorityCleanupAttempt: 0,
+      callbackCleanupState: this.#options.onSessionClosed === undefined ? "not_required" : "pending", callbackCleanupAttempt: 0,
+      socketCleanupState: "pending",
     };
-    this.#sessions.set(randomUUID(), session);
-    socket.on("message", (data, isBinary) => this.#onMessage(session, data, isBinary));
-    socket.on("close", () => this.#retire(session, "the Connector closed the channel"));
-    socket.on("error", () => this.#retire(session, "the Connector channel errored"));
+    this.#sessions.set(session.key, session);
+    this.#scheduleSweep();
+    socket.on("message", (data, isBinary) => this.#enqueue(session, () => this.#onMessage(session, data, isBinary)));
+    socket.on("close", () => this.#onSocketClosed(session));
+    socket.on("error", () => { void this.#retire(session, "the Connector channel errored"); });
   }
 
-  #onMessage(session: LiveSession, data: RawData, isBinary: boolean): void {
-    if (session.state === "closed") return;
-    // Binary, oversized, and unparsable frames are refused before any handler
-    // sees them: a frame the protocol does not describe is not a message.
+  #enqueue(session: LiveSession, action: () => Promise<void>): void {
+    if (session.retirementState !== "active") return;
+    if (session.queueDepth >= session.negotiatedLimits.maxInFlightOperations) {
+      this.#failSessionOperation(session, new FabricContractError("resource_exhausted", "Fabric session action queue is full"));
+      return;
+    }
+
+    const queued: QueuedAction = { settled: false };
+    const settle = (): boolean => {
+      if (queued.settled) return false;
+      queued.settled = true;
+      if (queued.timer !== undefined) clearTimeout(queued.timer);
+      session.queuedActions.delete(queued);
+      session.queueDepth -= 1;
+      return true;
+    };
+    const timeoutMs = Math.max(1, Math.min(this.#drainTimeoutMs, session.negotiatedLimits.heartbeatTimeoutMs));
+    session.queueDepth += 1;
+    session.queuedActions.add(queued);
+    queued.timer = setTimeout(() => {
+      if (!settle() || session.retirementState !== "active") return;
+      this.#failSessionOperation(session, new FabricContractError("unavailable", "Fabric session operation timed out in the queue"));
+    }, timeoutMs);
+    queued.timer.unref?.();
+
+    const run = async (): Promise<void> => {
+      if (queued.settled || session.retirementState !== "active") {
+        settle();
+        return;
+      }
+      try {
+        await action();
+        settle();
+      } catch (error) {
+        if (settle()) this.#failSessionOperation(session, error);
+      }
+    };
+    session.tail = session.tail.then(run, run);
+  }
+
+  #failSessionOperation(session: LiveSession, error: unknown): void {
+    if (session.retirementState !== "active") return;
+    try {
+      const code = error instanceof FabricContractError ? error.code : "unavailable";
+      const message = error instanceof FabricContractError ? safeContractMessage(error) : "Fabric session operation failed";
+      this.#sendError(session, "error", code, message);
+    } catch {
+      try { session.socket.terminate(); } catch { /* retirement still fences the session */ }
+    } finally {
+      void this.#retire(session, "Fabric session operation failed");
+    }
+  }
+
+  async #onMessage(session: LiveSession, data: RawData, isBinary: boolean): Promise<void> {
+    if (session.retirementState !== "active") return;
     if (isBinary) return this.#reject(session, "binary", 1003, "protocol_violation", "Fabric frames must be JSON text");
-    if (frameBytes(data, false) > this.#limits.maxFrameBytes) {
+    if (frameBytes(data) > session.negotiatedLimits.maxFrameBytes) {
       return this.#reject(session, "oversized", 1009, "resource_exhausted", "Fabric frame exceeds maxFrameBytes");
     }
     let parsed: unknown;
-    try {
-      parsed = JSON.parse(textOf(data));
-    } catch {
-      return this.#reject(session, "malformed", 1008, "protocol_violation", "Fabric frame is not valid JSON");
-    }
-    try {
-      assertValidFabricEnvelope(parsed);
-    } catch (error) {
-      return this.#reject(
-        session,
-        "malformed",
-        1008,
-        "protocol_violation",
-        error instanceof Error ? error.message : "Fabric frame is not a valid envelope",
-      );
+    try { parsed = JSON.parse(textOf(data)); }
+    catch { return this.#reject(session, "malformed", 1008, "protocol_violation", "Fabric frame is not valid JSON"); }
+    try { assertValidFabricEnvelope(parsed); }
+    catch (error) {
+      return this.#reject(session, "malformed", 1008, "protocol_violation", error instanceof Error ? error.message : "Fabric frame is not a valid envelope");
     }
     const envelope = parsed;
     if (!ACCEPTED_KINDS[session.state].includes(envelope.kind)) {
-      return this.#reject(
-        session,
-        "unexpected-kind",
-        1008,
-        "invalid_state",
-        `Fabric frame kind ${JSON.stringify(envelope.kind)} is not accepted while ${session.state}`,
-      );
+      return this.#reject(session, "unexpected-kind", 1008, "invalid_state", `Fabric frame kind ${JSON.stringify(envelope.kind)} is not accepted while ${session.state}`);
     }
     try {
-      this.#handle(session, envelope);
+      await this.#handle(session, envelope);
     } catch (error) {
-      const code = error instanceof FabricContractError ? error.code : "protocol_violation";
-      this.#sendError(session, envelope.kind, code, error instanceof Error ? error.message : String(error));
+      const code = error instanceof FabricContractError ? error.code : "unavailable";
+      const message = error instanceof FabricContractError ? safeContractMessage(error) : "Fabric authority operation failed";
+      try {
+        this.#sendError(session, envelope.kind, code, message, false, envelope);
+      } finally {
+        // Authority/callback failures are fatal for the serialized session, but
+        // an already admitted durable lease must still take the independently
+        // retryable close path.
+        await this.#retire(session, "Fabric authority operation failed");
+      }
     }
   }
 
-  #handle(session: LiveSession, envelope: FabricEnvelopeV1): void {
+  async #handle(session: LiveSession, envelope: FabricEnvelopeV1): Promise<void> {
     switch (envelope.kind) {
       case "client_hello": return this.#onHello(session, envelope);
       case "client_proof": return this.#onProof(session, envelope);
@@ -303,206 +459,554 @@ export class FabricWssServer {
       case "heartbeat": return this.#onHeartbeat(session, envelope);
       case "drain": return this.#onDrain(session, envelope);
       case "close": return this.#retire(session, "the Connector closed the channel");
-      default:
-        throw new FabricContractError("invalid_state", "Unsupported Fabric frame", "kind");
+      default: throw new FabricContractError("invalid_state", "Unsupported Fabric frame", "kind");
     }
   }
 
-  #onHello(session: LiveSession, envelope: FabricEnvelopeV1): void {
+  async #onHello(session: LiveSession, envelope: FabricEnvelopeV1): Promise<void> {
     const connectorId = envelope.payload.connectorId;
     const instanceNonce = envelope.payload.instanceNonce;
-    if (typeof connectorId !== "string" || typeof instanceNonce !== "string" || instanceNonce.length === 0) {
-      throw new FabricContractError("invalid_argument", "client_hello must name a Connector and instance nonce", "payload");
+    const credentialGeneration = envelope.payload.credentialGeneration;
+    const supportedVersions = envelope.payload.supportedVersions;
+    const capabilityDigest = envelope.payload.capabilityDigest;
+    assertFabricIdentifier(connectorId, "connectorId");
+    assertBoundedString(instanceNonce, "instanceNonce", 128);
+    assertGeneration(credentialGeneration, "credentialGeneration");
+    assertBoundedString(capabilityDigest, "capabilityDigest", 256);
+    if (instanceNonce.length === 0 || capabilityDigest.length === 0) {
+      throw new FabricContractError("invalid_argument", "client_hello nonce and capability digest must be non-empty", "payload");
     }
-    // Issuing the challenge is what refuses an unknown, revoked, or expired
-    // Connector, so a refused hello never learns why.
+    if (!Array.isArray(supportedVersions) || supportedVersions.length === 0 ||
+      supportedVersions.some((version) => typeof version !== "string") ||
+      !supportedVersions.includes(FABRIC_PROTOCOL_VERSION)) {
+      throw new FabricContractError("unsupported_version", "client_hello must support fabric.v1", "supportedVersions");
+    }
+    const negotiatedLimits = protocolLimits(envelope.payload.limits, this.#limits);
     const challenge = this.#security.issueChallenge(connectorId);
     session.state = "challenged";
+    session.helloConnectorId = connectorId;
     session.instanceNonce = instanceNonce;
+    session.credentialGeneration = credentialGeneration;
     session.challengeId = challenge.challengeId;
     session.challengeNonce = challenge.challengeNonce;
+    session.challengeAudience = challenge.audience;
+    session.challengeProtocolVersion = challenge.protocolVersion;
     session.credential = undefined;
+    session.capabilityDigest = capabilityDigest;
+    session.negotiatedLimits = negotiatedLimits;
+    session.phaseDeadlineAt = Math.min(challenge.expiresAt, this.#now() + negotiatedLimits.heartbeatTimeoutMs);
+    this.#scheduleSweep();
     this.#send(session, envelopeOf("server_challenge", {
-      challengeId: challenge.challengeId,
-      challengeNonce: challenge.challengeNonce,
-      audience: challenge.audience,
-      protocolVersion: challenge.protocolVersion,
-      expiresAt: challenge.expiresAt,
-    }, this.#now, { correlationId: envelope.messageId }));
+      challengeId: challenge.challengeId, challengeNonce: challenge.challengeNonce, audience: challenge.audience,
+      protocolVersion: challenge.protocolVersion, expiresAt: challenge.expiresAt,
+    }, this.#now, { correlationId: envelope.messageId, ...(envelope.operationId === undefined ? {} : { operationId: envelope.operationId }) }));
   }
 
-  #onProof(session: LiveSession, envelope: FabricEnvelopeV1): void {
-    if (session.challengeId === undefined) {
+  async #onProof(session: LiveSession, envelope: FabricEnvelopeV1): Promise<void> {
+    if (session.challengeId === undefined || session.challengeNonce === undefined ||
+      session.challengeAudience === undefined || session.challengeProtocolVersion === undefined) {
       throw new FabricContractError("invalid_state", "No Fabric challenge is outstanding", "kind");
     }
     const payload = envelope.payload;
+    if (typeof payload.challengeId !== "string" || typeof payload.connectorId !== "string" ||
+      typeof payload.instanceNonce !== "string" || typeof payload.challengeNonce !== "string" ||
+      typeof payload.audience !== "string" || typeof payload.protocolVersion !== "string" ||
+      typeof payload.credentialGeneration !== "number" || typeof payload.signature !== "string") {
+      throw new FabricContractError("invalid_argument", "client_proof is missing a required proof field", "payload");
+    }
+    if (payload.challengeId !== session.challengeId || payload.connectorId !== session.helloConnectorId ||
+      payload.instanceNonce !== session.instanceNonce || payload.challengeNonce !== session.challengeNonce ||
+      payload.audience !== session.challengeAudience || payload.protocolVersion !== session.challengeProtocolVersion ||
+      payload.credentialGeneration !== session.credentialGeneration) {
+      throw new FabricContractError("unauthenticated", "client_proof does not match this socket challenge", "payload");
+    }
     const proof: FabricChallengeProofV1 = {
       version: FABRIC_CHALLENGE_PROOF_VERSION,
-      challengeId: typeof payload.challengeId === "string" ? payload.challengeId : session.challengeId,
-      connectorId: typeof payload.connectorId === "string" ? payload.connectorId : "",
-      instanceNonce: typeof payload.instanceNonce === "string" ? payload.instanceNonce : session.instanceNonce,
-      challengeNonce: typeof payload.challengeNonce === "string" ? payload.challengeNonce : "",
-      audience: typeof payload.audience === "string" ? payload.audience : "",
-      protocolVersion: typeof payload.protocolVersion === "string" ? payload.protocolVersion : "",
-      credentialGeneration: typeof payload.credentialGeneration === "number" ? payload.credentialGeneration : 0,
-      signature: typeof payload.signature === "string" ? payload.signature : "",
+      challengeId: payload.challengeId,
+      connectorId: payload.connectorId,
+      instanceNonce: payload.instanceNonce,
+      challengeNonce: payload.challengeNonce,
+      audience: payload.audience,
+      protocolVersion: payload.protocolVersion,
+      credentialGeneration: payload.credentialGeneration,
+      signature: payload.signature,
     };
     const credential = this.#security.verifyProof(proof);
-    // A newer connection for the same Connector fences the older generation, so
-    // a reconnect can never revive the routes its predecessor held.
-    const previousId = this.#liveByConnector.get(credential.connectorId);
-    if (previousId !== undefined && previousId !== this.#sessionKey(session)) {
-      const previous = this.#sessions.get(previousId);
-      if (previous !== undefined) {
-        this.#sendError(previous, "client_proof", "stale_generation", "A newer connection superseded this generation");
-        this.#retire(previous, "superseded by a newer connection generation");
+    const admittedAt = this.#now();
+    const continuation = this.#continuation(session);
+    let lease: PublicConnectionLease;
+    if (this.#options.authority !== undefined) {
+      // Fence retirement completion while allocation is outstanding: admit may
+      // create durable authority before its promise publishes the lease here.
+      session.authorityCleanupState = "pending";
+      try {
+        lease = await this.#options.authority.admit({
+          requestId: envelope.messageId,
+          connectorId: credential.connectorId,
+          expectedCredentialGeneration: credential.credentialGeneration,
+          connectorInstanceNonce: session.instanceNonce,
+          capabilityDigest: session.capabilityDigest,
+          limits: session.negotiatedLimits,
+          establishedAt: admittedAt,
+          expiresAt: admittedAt + session.negotiatedLimits.heartbeatTimeoutMs,
+        }, { close: async (reason) => this.#closeOwned(session, reason) });
+      } catch (error) {
+        session.authorityCleanupState = "not_required";
+        this.#tryCompleteRetirement(session);
+        throw error;
       }
+      assertAdmissionLease(lease, credential.connectorId, session.capabilityDigest, this.#now());
+      // Retain cleanup authority before checking the continuation. If shutdown
+      // fenced this socket while admit awaited, the newly durable lease still
+      // has an idempotently retryable close path without becoming live locally.
+      session.authorityView = {
+        connectorId: credential.connectorId,
+        connectionId: lease.connectionId,
+        connectionGeneration: lease.generation,
+        instanceNonce: session.instanceNonce,
+        state: "connected",
+        advertisementRevision: 0,
+        lastHeartbeatAt: admittedAt,
+        current: false,
+      };
+      this.#assertContinuation(session, continuation);
+    } else {
+      const previousId = this.#liveByConnector.get(credential.connectorId);
+      if (previousId !== undefined && previousId !== session.key) {
+        const previous = this.#sessions.get(previousId);
+        if (previous !== undefined) {
+          this.#sendError(previous, "client_proof", "stale_generation", "A newer connection superseded this generation");
+          await this.#retire(previous, "superseded by a newer connection generation", false);
+          this.#assertContinuation(session, continuation);
+        }
+      }
+      this.#assertContinuation(session, continuation);
+      const generation = (this.#legacyGenerations.get(credential.connectorId) ?? 0) + 1;
+      this.#legacyGenerations.set(credential.connectorId, generation);
+      lease = {
+        connectionId: `connection-${credential.connectorId}-${generation}`,
+        deviceId: credential.connectorId,
+        connectorId: credential.connectorId,
+        generation,
+        state: "connected",
+        capabilityDigest: session.capabilityDigest,
+        establishedAt: admittedAt,
+        expiresAt: admittedAt + session.negotiatedLimits.heartbeatTimeoutMs,
+        revision: 0,
+      };
     }
-    const generation = (this.#generations.get(credential.connectorId) ?? 0) + 1;
-    this.#generations.set(credential.connectorId, generation);
+    session.lease = { ...lease };
+    session.connectionId = lease.connectionId;
+    session.connectionGeneration = lease.generation;
     session.credential = credential;
-    session.connectionId = `connection-${credential.connectorId}-${generation}`;
-    session.connectionGeneration = generation;
     session.state = "connected";
     session.lastHeartbeatAt = this.#now();
-    this.#liveByConnector.set(credential.connectorId, this.#sessionKey(session));
+    session.phaseDeadlineAt = lease.expiresAt;
+    this.#liveByConnector.set(credential.connectorId, session.key);
+    session.authorityView = this.#view(session);
+    this.#scheduleSweep();
     this.#send(session, envelopeOf("connection_accepted", {
+      connectionId: session.connectionId, connectionGeneration: session.connectionGeneration,
+      connectorId: credential.connectorId, lease: lease as unknown as JsonValue,
+      limits: session.negotiatedLimits as unknown as JsonValue,
+    }, this.#now, {
       connectionId: session.connectionId,
-      connectionGeneration: generation,
-      connectorId: credential.connectorId,
-      limits: this.#limits as unknown as JsonValue,
-    }, this.#now, { connectionId: session.connectionId, connectionGeneration: generation, correlationId: envelope.messageId }));
+      connectionGeneration: session.connectionGeneration,
+      correlationId: envelope.messageId,
+      ...(envelope.operationId === undefined ? {} : { operationId: envelope.operationId }),
+    }));
   }
 
-  #onSnapshot(session: LiveSession, envelope: FabricEnvelopeV1): void {
+  async #onSnapshot(session: LiveSession, envelope: FabricEnvelopeV1): Promise<void> {
     const revision = envelope.payload.advertisementRevision;
     if (!Number.isSafeInteger(revision) || (revision as number) < 1) {
       throw new FabricContractError("invalid_argument", "advertise_snapshot must carry a positive revision", "advertisementRevision");
     }
+    let continuation = this.#continuation(session);
+    await this.#options.authority?.acceptSnapshot(this.#view(session), envelope.payload);
+    this.#assertContinuation(session, continuation);
     session.advertisementRevision = revision as number;
     session.state = "ready";
     session.lastHeartbeatAt = this.#now();
-    this.#options.onAdvertisement?.(this.#view(session), session.advertisementRevision, envelope.payload);
+    session.phaseDeadlineAt = session.lease?.expiresAt ?? session.lastHeartbeatAt + session.negotiatedLimits.heartbeatTimeoutMs;
+    continuation = this.#continuation(session);
+    await this.#options.onAdvertisement?.(this.#view(session), session.advertisementRevision, envelope.payload);
+    this.#assertContinuation(session, continuation);
+    if (this.#now() >= session.phaseDeadlineAt) {
+      throw new FabricContractError("expired", "Fabric connection expired before readiness was published", "leaseExpiresAt");
+    }
+    const leaseExpiresAt = session.lease?.expiresAt ?? session.phaseDeadlineAt;
+    this.#scheduleSweep();
     this.#send(session, envelopeOf("ready", {
+      connectionId: session.connectionId, connectionGeneration: session.connectionGeneration,
+      advertisementRevision: session.advertisementRevision, leaseExpiresAt,
+    }, this.#now, {
       connectionId: session.connectionId,
       connectionGeneration: session.connectionGeneration,
-      advertisementRevision: session.advertisementRevision,
-      heartbeatIntervalMs: this.#limits.heartbeatIntervalMs,
-    }, this.#now, { connectionId: session.connectionId, connectionGeneration: session.connectionGeneration }));
-    const view = this.#view(session);
-    if (view !== undefined) this.#options.onReady?.(view);
+      correlationId: envelope.messageId,
+      ...(envelope.operationId === undefined ? {} : { operationId: envelope.operationId }),
+    }));
+    continuation = this.#continuation(session);
+    await this.#options.onReady?.(this.#view(session));
+    this.#assertContinuation(session, continuation);
   }
 
-  #onDelta(session: LiveSession, envelope: FabricEnvelopeV1): void {
+  async #onDelta(session: LiveSession, envelope: FabricEnvelopeV1): Promise<void> {
     const base = envelope.payload.baseRevision;
     if (!Number.isSafeInteger(base) || (base as number) < 0) {
       throw new FabricContractError("invalid_argument", "advertise_delta must carry a base revision", "baseRevision");
     }
     if (base !== session.advertisementRevision) {
-      // Resync rather than merge: a delta against a revision the Hub does not
-      // hold cannot be applied without inventing state it never saw.
-      this.#sendError(session, "advertise_delta", "conflict", "Advertisement base revision is stale; resend a snapshot", true);
+      this.#sendError(session, "advertise_delta", "conflict", "Advertisement base revision is stale; resend a snapshot", true, envelope);
       return;
     }
     const revision = envelope.payload.advertisementRevision;
     if (!Number.isSafeInteger(revision) || (revision as number) <= session.advertisementRevision) {
       throw new FabricContractError("invalid_argument", "advertise_delta must advance the revision", "advertisementRevision");
     }
+    let continuation = this.#continuation(session);
+    await this.#options.authority?.acceptDelta(this.#view(session), envelope.payload);
+    this.#assertContinuation(session, continuation);
     session.advertisementRevision = revision as number;
-    this.#options.onAdvertisement?.(this.#view(session), session.advertisementRevision, envelope.payload);
+    continuation = this.#continuation(session);
+    await this.#options.onAdvertisement?.(this.#view(session), session.advertisementRevision, envelope.payload);
+    this.#assertContinuation(session, continuation);
   }
 
-  #onHeartbeat(session: LiveSession, envelope: FabricEnvelopeV1): void {
-    if (envelope.connectionId !== session.connectionId
-      || envelope.connectionGeneration !== session.connectionGeneration) {
-      throw new FabricContractError(
-        "stale_generation",
-        "Fabric heartbeat does not match this connection generation",
-        "connectionGeneration",
-      );
+  async #onHeartbeat(session: LiveSession, envelope: FabricEnvelopeV1): Promise<void> {
+    if (envelope.connectionId !== session.connectionId || envelope.connectionGeneration !== session.connectionGeneration) {
+      throw new FabricContractError("stale_generation", "Fabric heartbeat does not match this connection generation", "connectionGeneration");
     }
     const sequence = envelope.payload.sequence;
     if (!Number.isSafeInteger(sequence) || (sequence as number) <= session.heartbeatSequence) {
-      throw new FabricContractError(
-        "invalid_argument",
-        "Fabric heartbeat sequence must be strictly increasing within a generation",
-        "sequence",
-      );
+      throw new FabricContractError("invalid_argument", "Fabric heartbeat sequence must be strictly increasing within a generation", "sequence");
     }
+    const observedAt = this.#now();
+    const leaseExpiresAt = observedAt + session.negotiatedLimits.heartbeatTimeoutMs;
+    const continuation = this.#continuation(session);
+    await this.#options.authority?.heartbeat(this.#view(session), { sequence: sequence as number, observedAt, leaseExpiresAt });
+    this.#assertContinuation(session, continuation);
     session.heartbeatSequence = sequence as number;
-    session.lastHeartbeatAt = this.#now();
-    this.#send(session, envelopeOf("heartbeat_ack", {
-      sequence: session.heartbeatSequence,
-      leaseExpiresAt: session.lastHeartbeatAt + this.#limits.heartbeatTimeoutMs,
-    }, this.#now, { connectionId: session.connectionId, connectionGeneration: session.connectionGeneration }));
+    session.lastHeartbeatAt = observedAt;
+    session.phaseDeadlineAt = leaseExpiresAt;
+    if (session.lease !== undefined) {
+      session.lease = { ...session.lease, expiresAt: leaseExpiresAt, revision: session.lease.revision + 1 };
+    }
+    this.#scheduleSweep();
+    this.#send(session, envelopeOf("heartbeat_ack", { sequence: session.heartbeatSequence, leaseExpiresAt }, this.#now, {
+      connectionId: session.connectionId,
+      connectionGeneration: session.connectionGeneration,
+      correlationId: envelope.messageId,
+      ...(envelope.operationId === undefined ? {} : { operationId: envelope.operationId }),
+    }));
   }
 
-  #onDrain(session: LiveSession, envelope: FabricEnvelopeV1): void {
-    const reason = typeof envelope.payload.reason === "string" ? envelope.payload.reason : "the Connector is draining";
+  async #onDrain(session: LiveSession, envelope: FabricEnvelopeV1): Promise<void> {
+    const reason = typeof envelope.payload.reason === "string"
+      ? envelope.payload.reason.replace(/[\r\n\u0000-\u001f\u007f]/gu, " ").slice(0, 256)
+      : "the Connector is draining";
+    const now = this.#now();
+    const deadlineAt = Math.min(now + this.#drainTimeoutMs, session.lease?.expiresAt ?? Number.MAX_SAFE_INTEGER);
+    if (deadlineAt <= now) throw new FabricContractError("expired", "Fabric lease expired before drain admission", "deadlineAt");
+    const continuation = this.#continuation(session);
+    await this.#options.authority?.drain(this.#view(session), deadlineAt, reason);
+    this.#assertContinuation(session, continuation);
     session.state = "draining";
-    session.drainDeadline = this.#now() + this.#drainTimeoutMs;
-    this.#sendDrain(session, reason);
+    session.phaseDeadlineAt = deadlineAt;
+    this.#scheduleSweep();
+    this.#sendDrain(session, reason, deadlineAt);
   }
 
-  #sendDrain(session: LiveSession, reason: string): void {
-    if (session.state === "closed") return;
-    this.#send(session, envelopeOf("drain", {
-      reason,
-      deadlineAt: this.#now() + this.#drainTimeoutMs,
-    }, this.#now, { connectionId: session.connectionId, connectionGeneration: session.connectionGeneration }));
+  #sendDrain(session: LiveSession, reason: string, deadlineAt = this.#now() + this.#drainTimeoutMs): void {
+    if (session.retirementState !== "active") return;
+    const safeReason = reason.replace(/[\r\n\u0000-\u001f\u007f]/gu, " ").slice(0, 256);
+    this.#send(session, envelopeOf("drain", { reason: safeReason, deadlineAt }, this.#now, {
+      ...(session.connectionId === "" ? {} : { connectionId: session.connectionId }),
+      ...(session.connectionGeneration === 0 ? {} : { connectionGeneration: session.connectionGeneration }),
+    }));
   }
 
-  /** Fence every generation whose heartbeat lease lapsed. */
   #sweepLeases(): void {
     const now = this.#now();
     for (const session of [...this.#sessions.values()]) {
-      if (session.state === "closed") continue;
-      if (session.state === "draining" && (session.drainDeadline ?? 0) <= now) {
-        this.#retire(session, "the drain window closed");
-        continue;
-      }
-      // A connection still negotiating has no lease yet; its window is bounded
-      // by the challenge, not by heartbeat.
-      if (session.state !== "ready" && session.state !== "draining") continue;
-      if (now - session.lastHeartbeatAt > this.#limits.heartbeatTimeoutMs) {
-        this.#retire(session, "heartbeat lease expired");
+      if (session.retirementState !== "active") continue;
+      if (session.phaseDeadlineAt <= now) {
+        const reason = session.state === "draining" ? "the drain window closed"
+          : session.state === "ready" ? "heartbeat lease expired"
+          : "Fabric handshake phase expired";
+        this.#enqueue(session, () => this.#retire(session, reason));
       }
     }
   }
 
-  #retire(session: LiveSession, reason: string): void {
-    if (session.state === "closed") return;
-    session.state = "closed";
-    for (const [key, candidate] of this.#sessions) {
-      if (candidate === session) {
-        this.#sessions.delete(key);
-        if (session.credential !== undefined && this.#liveByConnector.get(session.credential.connectorId) === key) {
-          this.#liveByConnector.delete(session.credential.connectorId);
+  #scheduleSweep(): void {
+    if (this.#closed) return;
+    if (this.#sweep !== undefined) clearTimeout(this.#sweep);
+    const now = this.#now();
+    let delay = this.#limits.heartbeatIntervalMs;
+    for (const session of this.#sessions.values()) {
+      if (session.retirementState === "active") delay = Math.min(delay, Math.max(1, session.phaseDeadlineAt - now));
+    }
+    this.#sweep = setTimeout(() => {
+      this.#sweep = undefined;
+      this.#sweepLeases();
+      this.#scheduleSweep();
+    }, Math.min(2_147_483_647, delay));
+    this.#sweep.unref?.();
+  }
+
+  async #withinDeadline(promise: Promise<void>, ms: number): Promise<void> {
+    if (ms <= 0) return;
+    let timer: NodeJS.Timeout | undefined;
+    try {
+      await Promise.race([
+        promise,
+        new Promise<void>((resolve) => {
+          timer = setTimeout(resolve, ms);
+          timer.unref?.();
+        }),
+      ]);
+    } finally {
+      if (timer !== undefined) clearTimeout(timer);
+    }
+  }
+
+  #continuation(session: LiveSession): SessionContinuation {
+    return {
+      sessionToken: session.sessionToken,
+      state: session.state,
+      connectionId: session.connectionId,
+      connectionGeneration: session.connectionGeneration,
+      advertisementRevision: session.advertisementRevision,
+      heartbeatSequence: session.heartbeatSequence,
+      ...(session.lease === undefined ? {} : { leaseRevision: session.lease.revision }),
+    };
+  }
+
+  #assertContinuation(session: LiveSession, expected: SessionContinuation): void {
+    if (session.sessionToken !== expected.sessionToken || session.retirementState !== "active" ||
+      this.#sessions.get(session.key) !== session || session.state !== expected.state ||
+      session.connectionId !== expected.connectionId || session.connectionGeneration !== expected.connectionGeneration ||
+      session.advertisementRevision !== expected.advertisementRevision || session.heartbeatSequence !== expected.heartbeatSequence ||
+      session.lease?.revision !== expected.leaseRevision) {
+      throw new FabricContractError("stale_generation", "Fabric session changed while an operation awaited", "connectionId");
+    }
+    if (session.credential !== undefined && this.#liveByConnector.get(session.credential.connectorId) !== session.key) {
+      throw new FabricContractError("stale_generation", "Fabric session is no longer the live Connector generation", "connectionGeneration");
+    }
+    if (session.lease !== undefined && session.lease.expiresAt <= this.#now()) {
+      throw new FabricContractError("expired", "Fabric connection lease expired while an operation awaited", "leaseExpiresAt");
+    }
+  }
+
+  async #closeOwned(session: LiveSession, reason: string): Promise<void> {
+    await this.#retire(session, reason);
+  }
+
+  #retire(session: LiveSession, reason: string, notifyAuthority = true, closeCode = 1000): Promise<void> {
+    if (!notifyAuthority) {
+      session.authorityCleanupSuppressed = true;
+      session.authorityCleanupState = "not_required";
+      if (session.authorityWatchdog !== undefined) clearTimeout(session.authorityWatchdog);
+      if (session.authorityRetryTimer !== undefined) clearTimeout(session.authorityRetryTimer);
+      session.authorityWatchdog = undefined;
+      session.authorityRetryTimer = undefined;
+    }
+    if (session.retirementState === "active") {
+      session.retirementState = "retiring";
+      session.retirementReason = reason;
+      session.state = "closed";
+      if (session.credential !== undefined && this.#liveByConnector.get(session.credential.connectorId) === session.key) {
+        this.#liveByConnector.delete(session.credential.connectorId);
+      }
+      for (const queued of session.queuedActions) {
+        queued.settled = true;
+        if (queued.timer !== undefined) clearTimeout(queued.timer);
+      }
+      session.queuedActions.clear();
+      session.queueDepth = 0;
+      const authorityView = session.authorityView ??
+        (session.credential !== undefined && session.connectionId !== "" && session.connectionGeneration > 0
+          ? this.#view(session)
+          : undefined);
+      if (!session.authorityCleanupSuppressed && authorityView !== undefined && this.#options.authority !== undefined) {
+        session.authorityView = authorityView;
+        session.authorityCleanupState = "pending";
+      }
+      this.#startAuthorityCleanup(session);
+      this.#startCallbackCleanup(session);
+      this.#startSocketCleanup(session, closeCode);
+      this.#scheduleSweep();
+    } else if (session.retirementState === "retiring") {
+      this.#startAuthorityCleanup(session);
+      this.#startCallbackCleanup(session);
+      this.#startSocketCleanup(session, closeCode);
+    }
+    this.#tryCompleteRetirement(session);
+    return this.#socketCleanupPromise(session);
+  }
+
+  #socketCleanupPromise(session: LiveSession): Promise<void> {
+    if (session.socketCleanupState === "succeeded") return Promise.resolve();
+    if (session.socketCleanupPromise === undefined) {
+      session.socketCleanupPromise = new Promise<void>((resolve) => { session.resolveSocketCleanup = resolve; });
+    }
+    return session.socketCleanupPromise;
+  }
+
+  #startSocketCleanup(session: LiveSession, closeCode: number): void {
+    if (session.socketCleanupState === "succeeded") return;
+    void this.#socketCleanupPromise(session);
+    if (session.socket.readyState === session.socket.CLOSED) {
+      this.#markSocketClosed(session);
+      return;
+    }
+    if (session.socketCleanupState === "pending") {
+      if (session.socket.readyState === session.socket.OPEN) {
+        session.socketCleanupState = "closing";
+        try {
+          session.socket.close(closeCode, utf8Bound(session.retirementReason ?? "Fabric session retired", 123));
+        } catch {
+          this.#terminateSocket(session);
         }
-        break;
+      } else {
+        this.#terminateSocket(session);
       }
     }
-    const view = this.#view(session);
-    if (view !== undefined) this.#options.onSessionClosed?.(view, reason);
-    try { session.socket.close(1000, reason.slice(0, 120)); } catch { /* already gone */ }
+    this.#scheduleSocketTerminate(session);
   }
 
-  #sessionKey(session: LiveSession): string {
-    for (const [key, candidate] of this.#sessions) if (candidate === session) return key;
-    return randomUUID();
+  #scheduleSocketTerminate(session: LiveSession): void {
+    if (session.socketCleanupState === "succeeded" || session.socketCleanupTimer !== undefined) return;
+    session.socketCleanupTimer = setTimeout(() => {
+      session.socketCleanupTimer = undefined;
+      if (session.socketCleanupState !== "succeeded") this.#terminateSocket(session);
+    }, this.#cleanupWatchdogMs());
+    session.socketCleanupTimer.unref?.();
+  }
+
+  #terminateSocket(session: LiveSession): void {
+    if (session.socketCleanupState === "succeeded") return;
+    session.socketCleanupState = "terminating";
+    try {
+      session.socket.terminate();
+    } catch {
+      session.socketCleanupState = "pending";
+    }
+    this.#scheduleSocketTerminate(session);
+  }
+
+  #onSocketClosed(session: LiveSession): void {
+    this.#markSocketClosed(session);
+    if (session.retirementState === "active") void this.#retire(session, "the Connector closed the channel");
+  }
+
+  #markSocketClosed(session: LiveSession): void {
+    if (session.socketCleanupState === "succeeded") return;
+    session.socketCleanupState = "succeeded";
+    if (session.socketCleanupTimer !== undefined) clearTimeout(session.socketCleanupTimer);
+    session.socketCleanupTimer = undefined;
+    session.resolveSocketCleanup?.();
+    session.resolveSocketCleanup = undefined;
+    this.#tryCompleteRetirement(session);
+  }
+
+  #startAuthorityCleanup(session: LiveSession): void {
+    if (session.retirementState !== "retiring" || session.authorityCleanupState !== "pending" ||
+      session.authorityView === undefined || this.#options.authority === undefined) return;
+    session.authorityCleanupState = "running";
+    const attempt = ++session.authorityCleanupAttempt;
+    session.authorityWatchdog = setTimeout(() => {
+      session.authorityWatchdog = undefined;
+      if (session.authorityCleanupState !== "running" || session.authorityCleanupAttempt !== attempt) return;
+      session.authorityCleanupState = "pending";
+      this.#scheduleAuthorityRetry(session);
+    }, this.#cleanupWatchdogMs());
+    session.authorityWatchdog.unref?.();
+    void Promise.resolve()
+      .then(() => this.#options.authority!.close(session.authorityView!, session.retirementReason ?? "Fabric session retired"))
+      .then(() => {
+        if (session.authorityCleanupState === "succeeded") return;
+        session.authorityCleanupState = "succeeded";
+        if (session.authorityWatchdog !== undefined) clearTimeout(session.authorityWatchdog);
+        if (session.authorityRetryTimer !== undefined) clearTimeout(session.authorityRetryTimer);
+        session.authorityWatchdog = undefined;
+        session.authorityRetryTimer = undefined;
+        this.#tryCompleteRetirement(session);
+      }, () => {
+        if (session.authorityCleanupState !== "running" || session.authorityCleanupAttempt !== attempt) return;
+        if (session.authorityWatchdog !== undefined) clearTimeout(session.authorityWatchdog);
+        session.authorityWatchdog = undefined;
+        session.authorityCleanupState = "pending";
+        this.#scheduleAuthorityRetry(session);
+      });
+  }
+
+  #scheduleAuthorityRetry(session: LiveSession): void {
+    if (session.authorityCleanupState !== "pending" || session.authorityRetryTimer !== undefined) return;
+    session.authorityRetryTimer = setTimeout(() => {
+      session.authorityRetryTimer = undefined;
+      this.#startAuthorityCleanup(session);
+    }, this.#cleanupWatchdogMs());
+    session.authorityRetryTimer.unref?.();
+  }
+
+  #startCallbackCleanup(session: LiveSession): void {
+    if (session.retirementState !== "retiring" || session.callbackCleanupState !== "pending" ||
+      this.#options.onSessionClosed === undefined) return;
+    session.callbackCleanupState = "running";
+    const attempt = ++session.callbackCleanupAttempt;
+    session.callbackWatchdog = setTimeout(() => {
+      session.callbackWatchdog = undefined;
+      if (session.callbackCleanupState !== "running" || session.callbackCleanupAttempt !== attempt) return;
+      session.callbackCleanupState = "pending";
+      this.#scheduleCallbackRetry(session);
+    }, this.#cleanupWatchdogMs());
+    session.callbackWatchdog.unref?.();
+    void Promise.resolve()
+      .then(() => this.#options.onSessionClosed!(this.#view(session), session.retirementReason ?? "Fabric session retired"))
+      .then(() => {
+        if (session.callbackCleanupState === "succeeded") return;
+        session.callbackCleanupState = "succeeded";
+        if (session.callbackWatchdog !== undefined) clearTimeout(session.callbackWatchdog);
+        if (session.callbackRetryTimer !== undefined) clearTimeout(session.callbackRetryTimer);
+        session.callbackWatchdog = undefined;
+        session.callbackRetryTimer = undefined;
+      }, () => {
+        if (session.callbackCleanupState !== "running" || session.callbackCleanupAttempt !== attempt) return;
+        if (session.callbackWatchdog !== undefined) clearTimeout(session.callbackWatchdog);
+        session.callbackWatchdog = undefined;
+        session.callbackCleanupState = "pending";
+        this.#scheduleCallbackRetry(session);
+      });
+  }
+
+  #scheduleCallbackRetry(session: LiveSession): void {
+    if (session.callbackCleanupState !== "pending" || session.callbackRetryTimer !== undefined) return;
+    session.callbackRetryTimer = setTimeout(() => {
+      session.callbackRetryTimer = undefined;
+      this.#startCallbackCleanup(session);
+    }, this.#cleanupWatchdogMs());
+    session.callbackRetryTimer.unref?.();
+  }
+
+  #cleanupWatchdogMs(): number {
+    return Math.max(1, Math.min(100, this.#drainTimeoutMs));
+  }
+
+  #tryCompleteRetirement(session: LiveSession): void {
+    if (session.retirementState !== "retiring" || session.socketCleanupState !== "succeeded" ||
+      (session.authorityCleanupState !== "succeeded" && session.authorityCleanupState !== "not_required")) return;
+    session.retirementState = "retired";
+    if (this.#sessions.get(session.key) === session) this.#sessions.delete(session.key);
   }
 
   #view(session: LiveSession): FabricConnectorSession {
     return {
-      connectorId: session.credential?.connectorId ?? "",
-      connectionId: session.connectionId,
-      connectionGeneration: session.connectionGeneration,
-      instanceNonce: session.instanceNonce,
-      state: session.state,
-      advertisementRevision: session.advertisementRevision,
-      lastHeartbeatAt: session.lastHeartbeatAt,
-      current: session.credential !== undefined
-        && this.#liveByConnector.get(session.credential.connectorId) === this.#sessionKey(session),
+      connectorId: session.credential?.connectorId ?? "", connectionId: session.connectionId,
+      connectionGeneration: session.connectionGeneration, instanceNonce: session.instanceNonce, state: session.state,
+      advertisementRevision: session.advertisementRevision, lastHeartbeatAt: session.lastHeartbeatAt,
+      current: session.credential !== undefined && this.#liveByConnector.get(session.credential.connectorId) === session.key,
     };
   }
 
@@ -512,32 +1016,28 @@ export class FabricWssServer {
     code: string,
     message: string,
     retryable = false,
+    source?: FabricEnvelopeV1,
   ): void {
     this.#send(session, envelopeOf("error", { code, message, kind, retryable }, this.#now, {
       ...(session.connectionId === "" ? {} : { connectionId: session.connectionId }),
       ...(session.connectionGeneration === 0 ? {} : { connectionGeneration: session.connectionGeneration }),
+      ...(source === undefined ? {} : { correlationId: source.messageId }),
+      ...(source?.operationId === undefined ? {} : { operationId: source.operationId }),
     }));
   }
 
-  #reject(
-    session: LiveSession,
-    label: string,
-    closeCode: number,
-    code: string,
-    message: string,
-  ): void {
-    this.#sendError(session, "error", code, message);
-    const view = this.#view(session);
-    if (view !== undefined) this.#options.onSessionClosed?.(view, `refused a ${label} frame`);
-    session.state = "closed";
-    try { session.socket.close(closeCode, label.slice(0, 120)); } catch { /* already gone */ }
-    for (const [key, candidate] of this.#sessions) if (candidate === session) this.#sessions.delete(key);
+  async #reject(session: LiveSession, label: string, closeCode: number, code: string, message: string): Promise<void> {
+    try {
+      this.#sendError(session, "error", code, message);
+    } finally {
+      await this.#retire(session, label, true, closeCode);
+    }
   }
 
   #send(session: LiveSession, envelope: FabricEnvelopeV1): void {
     if (session.socket.readyState !== session.socket.OPEN) return;
     const text = JSON.stringify(envelope);
-    if (Buffer.byteLength(text, "utf8") > this.#limits.maxFrameBytes) {
+    if (Buffer.byteLength(text, "utf8") > session.negotiatedLimits.maxFrameBytes) {
       throw new FabricContractError("resource_exhausted", "Fabric frame exceeds maxFrameBytes", "maxFrameBytes");
     }
     session.socket.send(text);

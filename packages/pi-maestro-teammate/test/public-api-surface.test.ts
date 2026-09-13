@@ -125,6 +125,11 @@ test("the public V1 model-routing subpath exports the canonical V3 contracts", a
   assert.equal(routing.isModelRoutingProfileId("1-public"), true);
 });
 
+test("the public V1 Fabric runtime subpath exports the production factory", async () => {
+  const fabricRuntime = await import("pi-maestro-teammate/v1/fabric-runtime");
+  assert.equal(typeof fabricRuntime.createFabricTeammateRuntimePort, "function");
+});
+
 test("the public V1 supervision subpath exports the shared Advisor runtime registry", async () => {
   const supervision = await import("pi-maestro-teammate/v1/supervision");
   assert.equal(typeof supervision.registerAdvisorRuntime, "function");

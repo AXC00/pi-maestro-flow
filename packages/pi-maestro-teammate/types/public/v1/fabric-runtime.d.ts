@@ -6,6 +6,7 @@
  * public contract and Teammate never imports Flow.
  */
 import type { AttemptOutcome, BackendCapabilities, BackendRun } from "pi-maestro-backend-core/v1/backend";
+import type { BackendRegistry } from "pi-maestro-backend-core/v1/registry";
 import type { AgentTerminalStatus, SingleResult, TeammateRunSpec } from "pi-maestro-backend-core/v1/spec";
 import type { TeammatePlacementV1 } from "pi-maestro-fabric-core/v1/placement";
 import type { FabricBackendRouteResolver } from "pi-maestro-backends/fabric";
@@ -41,6 +42,18 @@ export interface FabricTeammateAttempt extends BackendRun {
 export interface FabricTeammateRuntimePort {
     startAttempt(request: FabricTeammateAttemptRequest): Promise<FabricTeammateAttempt>;
 }
+export interface FabricTeammateRuntimePortOptions {
+    /** Test/embedder override; production resolves the source workspace registry. */
+    readonly backendRegistry?: BackendRegistry;
+}
+/**
+ * Create the production source-side runtime.
+ *
+ * Each call resolves and starts exactly one source-local backend attempt. It
+ * never enters the teammate orchestration loop, so it cannot retry another
+ * model, publish an agent:// result, or recursively place through Fabric.
+ */
+export declare function createFabricTeammateRuntimePort(options?: FabricTeammateRuntimePortOptions): FabricTeammateRuntimePort;
 export interface FabricTeammateRuntimeRegistration {
     readonly port: FabricTeammateRuntimePort;
     dispose(): void;

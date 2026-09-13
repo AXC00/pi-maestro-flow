@@ -7,11 +7,13 @@ import type { BackendRunOptions, BackendCapabilities } from "pi-maestro-backend-
 import type { TeammateRunSpec } from "pi-maestro-backend-core/v1/spec";
 import {
   FABRIC_BACKEND,
+  dispatchFabricPlacementRegistrySync,
   dispatchRegistrySync,
   forgetBackendRegistryConfigSync,
 } from "../src/backends/registry-host.ts";
 import type { FabricBackendRouteResolver } from "pi-maestro-backends/fabric";
 import { normalizeTeammateParams } from "../src/runs/execution-infra.ts";
+import { runGraph, runSingleTeammate } from "../src/runs/execution.ts";
 
 process.env.PI_CODING_AGENT_DIR = mkdtempSync(join(tmpdir(), "teammate-fabric-agent-"));
 
@@ -85,6 +87,91 @@ test("placement reaches the Fabric backend registration instead of the default",
     todoBinding: "unsupported", toolFilter: "unsupported", steer: "native", followUp: "native", abort: "native",
   });
   assert.equal(Object.keys(CAPABILITIES).length, Object.keys(resolved.backend.capabilities(resolved.config)).length);
+});
+
+test("a live provider overlays the reserved Fabric backend in legacy mode without persisting config", async () => {
+  const root = workspace(JSON.stringify({
+    mode: "legacy",
+    default: "pi-subprocess",
+    backends: { "pi-subprocess": { module: "pi-subprocess" } },
+  }));
+  let prepared = 0;
+  const resolver: FabricBackendRouteResolver = {
+    async prepare() { prepared += 1; throw new Error("prepare must not run during resolution"); },
+  };
+  const registry = dispatchFabricPlacementRegistrySync(root, extras, () => resolver);
+  const resolved = await registry.resolve({
+    agent: "general", task: "placed", backend: FABRIC_BACKEND, placement: placement() as never,
+  }, FABRIC_BACKEND);
+  assert.equal(resolved.backend.name, FABRIC_BACKEND);
+  assert.equal(prepared, 0);
+  assert.equal(dispatchRegistrySync(root, extras), undefined, "placement overlay must not change legacy behavior");
+});
+
+test("a conflicting operator Fabric registration is rejected instead of overwritten", () => {
+  const root = workspace(JSON.stringify({
+    mode: "backend-registry",
+    default: "pi-subprocess",
+    backends: { [FABRIC_BACKEND]: { module: "operator-fabric" } },
+  }));
+  const resolver: FabricBackendRouteResolver = {
+    async prepare() { throw new Error("unused"); },
+  };
+  assert.throws(
+    () => dispatchFabricPlacementRegistrySync(root, extras, () => resolver),
+    /reserved for placed Fabric dispatches.*conflicting module "operator-fabric"/,
+  );
+});
+
+test("a placed dispatch with no live provider fails closed before local execution", async () => {
+  const root = workspace(JSON.stringify({
+    mode: "legacy",
+    default: "pi-subprocess",
+    backends: { "pi-subprocess": { module: "pi-subprocess" } },
+  }));
+  const published: string[] = [];
+  const result = await runSingleTeammate({
+    agent: "general",
+    task: "must remain remote",
+    placement: placement() as never,
+  }, {
+    baseCwd: root,
+    onResultPublished(value) { published.push(value.messages.at(-1)?.content ?? ""); },
+  });
+  assert.match(result.messages.at(-1)?.content ?? "", /no live Fabric route resolver provider/);
+  assert.match(result.messages.at(-1)?.content ?? "", /refusing to run a placed task on this machine/);
+  assert.equal(published.length, 1);
+});
+
+test("mixed legacy graph preflights placed and placementless tasks against their own registries", async () => {
+  const root = workspace(JSON.stringify({
+    mode: "legacy",
+    default: "remote-default",
+    backends: {
+      "remote-default": {
+        module: "remote-workers",
+        config: { targetId: "beta", driver: "pi-rpc" },
+      },
+    },
+  }));
+  let prepared = 0;
+  const resolver: FabricBackendRouteResolver = {
+    async prepare() { prepared += 1; throw new Error("unknown agents must fail before route preparation"); },
+  };
+  const results = await runGraph([
+    { agent: "missing-local-agent", prompt: "legacy local" },
+    { agent: "missing-placed-agent", prompt: "Fabric placed", placement: placement() as never },
+  ], 2, {
+    baseCwd: root,
+    fabricRouteResolverOf: () => resolver,
+  });
+
+  assert.equal(results.length, 2);
+  for (const result of results) {
+    assert.match(result.messages.at(-1)?.content ?? "", /Unknown teammate agent/);
+    assert.doesNotMatch(result.messages.at(-1)?.content ?? "", /backend could not be resolved for this graph/);
+  }
+  assert.equal(prepared, 0);
 });
 
 test("a dispatch without Fabric wiring refuses the Fabric backend by name", async () => {

@@ -55,6 +55,7 @@ import {
   type TeammateTaskType,
 } from "../models/model-routing.ts";
 import type { TeammateModelCapability } from "../models/model-catalog.ts";
+import { deriveModelRuntimeDescriptor } from "../models/model-registry.ts";
 import {
   rankModelsByHealth,
   sharedModelCircuitBreaker,
@@ -175,16 +176,20 @@ import { outcomeOf } from "../backends/pi-subprocess.ts";
 import { closeBackendControlStdin, createBackendControlStdin } from "../backends/control-shim.ts";
 import {
   backendRegistryConfigSync,
+  dispatchFabricPlacementRegistrySync,
   dispatchRegistryForProjectionSync,
   dispatchRegistrySync,
+  dispatchSourceAttemptRegistrySync,
   FABRIC_BACKEND,
   modelRegistryPairSync,
   PI_SUBPROCESS,
+  REMOTE_WORKERS,
 } from "../backends/registry-host.ts";
 import { runSingleAttempt } from "./pi-subprocess-attempt.ts";
 import type {
   AttemptOutcome,
   BackendCapabilities,
+  BackendRun,
   BackendRunOptions,
   ConfigValue,
 } from "pi-maestro-backend-core/v1/backend";
@@ -193,6 +198,8 @@ import type {
   ResolvedBackend,
 } from "pi-maestro-backend-core/v1/registry";
 import type { TeammateRunSpec } from "pi-maestro-backend-core/v1/spec";
+import { assertFabricIdentifier } from "pi-maestro-fabric-core/v1/common";
+import { assertValidTeammatePlacement } from "pi-maestro-fabric-core/v1/validation";
 
 export {
   TOOL_EXECUTION_HEARTBEAT_MS,
@@ -328,23 +335,15 @@ function modelRegistrationBackendSpecOf(
   candidate: ResolvedModelRegistrationCandidate,
 ): TeammateRunSpec {
   const selector = candidate.route.selector;
-  // A placed task is served by the Fabric adapter and by nothing else. A
-  // candidate pointing at another deployment would run on this machine a task
-  // that was placed on another Endpoint, so it is refused before any start.
-  if (params.placement !== undefined && candidate.deployment.registration.module !== FABRIC_BACKEND) {
-    throw new Error(
-      `Teammate task carries a Fabric placement, but the resolved model registration routes to deployment `
-      + `${JSON.stringify(candidate.route.deploymentId)}, which is not the ${JSON.stringify(FABRIC_BACKEND)} `
-      + "deployment; a placed task runs only on the selected Fabric Endpoint",
-    );
-  }
   return {
     agent: params.agent,
     task: params.task ?? "",
     ...(params.name === undefined ? {} : { name: params.name }),
-    // TeammateBackend v1 has no deployment field. The selected canonical
-    // deployment travels through its existing registration selector.
-    backend: candidate.route.deploymentId,
+    // Placement selects the Fabric route, while the captured model registry
+    // still translates canonical registration ids into adapter selectors.
+    // Without placement, the canonical candidate's deployment remains the
+    // backend selector exactly as before.
+    backend: params.placement === undefined ? candidate.route.deploymentId : FABRIC_BACKEND,
     ...(params.context === undefined ? {} : { context: params.context }),
     // Fixed and deployment-default routes are selected by registration alone.
     // Only adapter-model owns a backend model selector value.
@@ -365,6 +364,7 @@ async function preflightModelRegistrationPlan(
   plan: ResolvedModelRegistrationRouting,
   options: RunTeammateOptions,
   graphTaskCount = 1,
+  registry: BackendRegistry = context.registry,
 ): Promise<string[]> {
   const resolutions = new Map<string, ResolvedBackend>();
   const warnings = (await Promise.all(plan.candidates.map(async (candidate) => {
@@ -381,7 +381,7 @@ async function preflightModelRegistrationPlan(
       }
     }
     const spec = modelRegistrationBackendSpecOf(params, cwd, candidate);
-    const resolved = await context.registry.resolve(spec, candidate.route.deploymentId);
+    const resolved = await registry.resolve(spec, spec.backend);
     const verdict = validateBackendCapabilities(
       [{ spec, ...(spec.name === undefined ? {} : { name: spec.name }) }],
       () => ({ name: resolved.backend.name, capabilities: resolved.capabilities }),
@@ -692,6 +692,265 @@ function backendOptionsOf(
   };
 }
 
+class BackendCapabilityAdmissionError extends Error {
+  constructor(readonly errors: readonly string[]) {
+    super(errors.join("\n"));
+    this.name = "BackendCapabilityAdmissionError";
+  }
+}
+
+interface PreparedBackendAttempt {
+  readonly backendName: string;
+  readonly config: Record<string, ConfigValue>;
+  readonly capabilities: BackendCapabilities;
+  start(spec: TeammateRunSpec, options: BackendRunOptions): Promise<BackendRun>;
+}
+
+/** Resolve and adjudicate once, then expose a one-shot start closure. */
+async function prepareBackendAttemptOnce(
+  registry: BackendRegistry,
+  spec: TeammateRunSpec,
+  requestedBackend?: string,
+  preflight?: ResolvedBackend,
+): Promise<PreparedBackendAttempt> {
+  const { backend, config, capabilities } = preflight ?? await registry.resolve(spec, requestedBackend);
+  const errors = validateBackendCapabilities(
+    [{ spec, ...(spec.name === undefined ? {} : { name: spec.name }) }],
+    () => ({ name: backend.name, capabilities }),
+  ).errors;
+  if (errors.length > 0) throw new BackendCapabilityAdmissionError(errors);
+  let started = false;
+  return {
+    backendName: backend.name,
+    config,
+    capabilities,
+    async start(startSpec, options) {
+      if (started) throw new Error(`teammate backend ${JSON.stringify(backend.name)} attempt was already started`);
+      started = true;
+      return backend.start(startSpec, options);
+    },
+  };
+}
+
+interface FabricSourceRuntimeOptions {
+  readonly backendRegistry?: BackendRegistry;
+}
+
+function sourceModelRegistrationPlan(
+  projection: ModelRegistryDispatchContext["authority"],
+  requestedModel: string | undefined,
+): ResolvedModelRegistrationRouting {
+  if (requestedModel === undefined
+    || projection.routesByRegistrationId.has(requestedModel)
+    || projection.modelAliases.has(requestedModel)) {
+    return resolveModelRegistrationRouting(projection, { model: requestedModel });
+  }
+  const selectorMatches: string[] = [];
+  for (const [registrationId, route] of projection.routesByRegistrationId) {
+    if (route.selector.kind === "adapter-model" && route.selector.value === requestedModel) {
+      selectorMatches.push(registrationId);
+    }
+  }
+  if (selectorMatches.length > 1) {
+    throw new TypeError(
+      `Fabric source model selector ${JSON.stringify(requestedModel)} is ambiguous across canonical registrations: `
+      + selectorMatches.map((id) => JSON.stringify(id)).join(", "),
+    );
+  }
+  return resolveModelRegistrationRouting(projection, {
+    model: selectorMatches[0] ?? requestedModel,
+  });
+}
+
+function assertFabricSourceLocalDeployment(
+  deploymentId: string,
+  transportKind: ReturnType<typeof deriveModelRuntimeDescriptor>["transport"]["kind"],
+): void {
+  if (transportKind === "remote-worker"
+    || transportKind === "acp-direct-ssh"
+    || transportKind === "dsh-direct-ssh") {
+    throw new Error(
+      `Fabric source runtime refuses non-local deployment ${JSON.stringify(deploymentId)} `
+      + `with transport ${JSON.stringify(transportKind)}`,
+    );
+  }
+}
+
+const SOURCE_SPEC_KEYS = new Set([
+  "agent", "task", "name", "context", "model", "thinking", "cwd", "outputSchema",
+]);
+
+function assertSourceAttemptInput(input: {
+  placement: unknown;
+  spec: TeammateRunSpec;
+  correlationId: string;
+  baseCwd: string;
+  signal: AbortSignal;
+}): string {
+  // The source runtime must defend its public seam when invoked directly, not
+  // rely only on the Flow bridge that normally constructs this request.
+  if (!input.spec || typeof input.spec !== "object" || Array.isArray(input.spec)) {
+    throw new TypeError("Fabric source attempt spec must be an object");
+  }
+  for (const key of Object.keys(input.spec)) {
+    if (!SOURCE_SPEC_KEYS.has(key)) {
+      throw new TypeError(`Fabric source attempt spec contains forbidden field ${JSON.stringify(key)}`);
+    }
+  }
+  if (typeof input.spec.agent !== "string" || input.spec.agent.trim() === "") {
+    throw new TypeError("Fabric source attempt spec.agent must be a non-empty string");
+  }
+  if (typeof input.spec.task !== "string" || input.spec.task.trim() === "") {
+    throw new TypeError("Fabric source attempt spec.task must be a non-empty string");
+  }
+  assertFabricIdentifier(input.correlationId, "correlationId");
+  if (typeof input.baseCwd !== "string" || !path.isAbsolute(input.baseCwd)) {
+    throw new TypeError("Fabric source attempt baseCwd must be an absolute source-local path");
+  }
+  let trustedCwd: string;
+  try {
+    const stat = fs.statSync(input.baseCwd);
+    if (!stat.isDirectory()) throw new Error("not a directory");
+    trustedCwd = fs.realpathSync(input.baseCwd);
+  } catch (cause) {
+    throw new TypeError(`Fabric source attempt baseCwd is not an accessible directory: ${input.baseCwd}`, { cause });
+  }
+  if (typeof input.spec.cwd !== "string" || !path.isAbsolute(input.spec.cwd)) {
+    throw new TypeError("Fabric source attempt spec.cwd must be the absolute source-local workspace path");
+  }
+  let requestedCwd: string;
+  try {
+    requestedCwd = fs.realpathSync(input.spec.cwd);
+  } catch (cause) {
+    throw new TypeError(`Fabric source attempt spec.cwd is not accessible: ${input.spec.cwd}`, { cause });
+  }
+  if (requestedCwd !== trustedCwd) {
+    throw new TypeError("Fabric source attempt spec.cwd must equal the trusted source-local baseCwd");
+  }
+  if (!input.signal || typeof input.signal.aborted !== "boolean"
+    || typeof input.signal.addEventListener !== "function") {
+    throw new TypeError("Fabric source attempt signal must be an AbortSignal");
+  }
+  return trustedCwd;
+}
+
+/**
+ * Start one source-local backend attempt for the public Fabric runtime port.
+ * This path deliberately omits orchestration, fallback, publication and any
+ * remote/Fabric backend wiring.
+ *
+ * @internal Public consumers use createFabricTeammateRuntimePort().
+ */
+export async function startFabricSourceBackendAttempt(
+  input: {
+    placement: import("pi-maestro-fabric-core/v1/placement").TeammatePlacementV1;
+    spec: TeammateRunSpec;
+    correlationId: string;
+    baseCwd: string;
+    signal: AbortSignal;
+    onChildEvent?: (event: Record<string, unknown>) => void;
+    onTurnComplete?: (result: SingleResult, terminalStatus?: AgentTerminalStatus) => void;
+  },
+  runtimeOptions: FabricSourceRuntimeOptions = {},
+): Promise<{
+  acceptedBackend: string;
+  acceptedModel?: string;
+  acceptedCapabilities: BackendCapabilities;
+  outcome: Promise<AttemptOutcome>;
+  send: BackendRun["send"];
+  abort: BackendRun["abort"];
+}> {
+  const cwd = assertSourceAttemptInput(input);
+  assertValidTeammatePlacement(input.placement);
+  if (input.signal.aborted) throw new Error("Fabric source attempt was aborted before launch");
+
+  const hostOptions: RunTeammateOptions = {
+    baseCwd: cwd,
+    signal: input.signal,
+    ...(input.onChildEvent === undefined ? {} : { onChildEvent: input.onChildEvent }),
+    ...(input.onTurnComplete === undefined ? {} : { onTurnComplete: input.onTurnComplete }),
+  };
+  const extrasOf = () => ({ hostOptions, cwd, replyTo: "caller" as const });
+  let registry = runtimeOptions.backendRegistry;
+  let requestedBackend: string | undefined;
+  let selectedModule: string | undefined;
+  let localSpec: TeammateRunSpec = { ...input.spec, cwd };
+
+  if (registry === undefined) {
+    const config = backendRegistryConfigSync(cwd);
+    if (config.mode === "model-registry") {
+      const pair = modelRegistryPairSync(cwd);
+      if (pair === undefined) throw new Error("Fabric source model registry has no live dispatch projection");
+      const plan = sourceModelRegistrationPlan(pair.dispatch, input.spec.model);
+      const candidate = plan.candidates[0];
+      if (candidate === undefined || plan.candidates.length !== 1) {
+        throw new Error("Fabric source runtime must resolve exactly one local model registration");
+      }
+      assertFabricSourceLocalDeployment(
+        candidate.route.deploymentId,
+        candidate.deployment.runtime.transport.kind,
+      );
+      requestedBackend = candidate.route.deploymentId;
+      selectedModule = candidate.deployment.registration.module;
+      const selector = candidate.route.selector;
+      localSpec = {
+        ...localSpec,
+        backend: requestedBackend,
+        ...(selector.kind === "adapter-model" ? { model: selector.value } : { model: undefined }),
+      };
+      registry = dispatchRegistryForProjectionSync(pair.dispatch, extrasOf);
+    } else {
+      requestedBackend = config.default;
+      const selectedRegistration = config.backends[requestedBackend];
+      selectedModule = selectedRegistration?.module;
+      if (selectedRegistration !== undefined) {
+        assertFabricSourceLocalDeployment(
+          requestedBackend,
+          deriveModelRuntimeDescriptor(requestedBackend, selectedRegistration).transport.kind,
+        );
+      }
+      localSpec = { ...localSpec, backend: requestedBackend };
+      registry = dispatchSourceAttemptRegistrySync(cwd, extrasOf);
+    }
+  }
+
+  if (selectedModule === FABRIC_BACKEND || selectedModule === REMOTE_WORKERS) {
+    throw new Error(`Fabric source runtime refuses recursive backend module ${JSON.stringify(selectedModule)}`);
+  }
+  const prepared = await prepareBackendAttemptOnce(registry, localSpec, requestedBackend);
+  if (prepared.backendName === FABRIC_BACKEND || prepared.backendName === REMOTE_WORKERS) {
+    throw new Error(`Fabric source runtime refuses recursive backend ${JSON.stringify(prepared.backendName)}`);
+  }
+  if (input.signal.aborted) {
+    throw new Error("Fabric source attempt was aborted while preparing its local backend");
+  }
+  assertFabricIdentifier(prepared.backendName, "acceptedBackend");
+  const backendOptions = backendOptionsOf(
+    input.correlationId,
+    cwd,
+    hostOptions,
+    input.spec.agent,
+    Date.now(),
+    prepared.config,
+  );
+  const run = await prepared.start(localSpec, backendOptions);
+  const abortRun = (): void => { run.abort(); };
+  input.signal.addEventListener("abort", abortRun, { once: true });
+  if (input.signal.aborted) abortRun();
+  void run.outcome.then(
+    () => input.signal.removeEventListener("abort", abortRun),
+    () => input.signal.removeEventListener("abort", abortRun),
+  );
+  return {
+    acceptedBackend: prepared.backendName,
+    ...(localSpec.model === undefined ? {} : { acceptedModel: localSpec.model }),
+    acceptedCapabilities: prepared.capabilities,
+    outcome: run.outcome,
+    send: run.send.bind(run),
+    abort: run.abort.bind(run),
+  };
+}
+
 export async function runSingleTeammate(
   params: RunSingleTeammateParams,
   options: RunTeammateOptions,
@@ -855,6 +1114,9 @@ async function runSingleTeammateV1(
     return rejectAndPublish("Teammate run aborted before launch.", "terminated");
   }
 
+  // Placement changes the backend route, not the model identity namespace.
+  // Keep the captured model-registry authority so canonical ids are translated
+  // to their adapter selectors before the Fabric backend sends the wire spec.
   let modelRegistryContext = options.modelRegistryDispatch as MutableModelRegistryDispatchContext | undefined;
   try {
     const authority = captureModelRegistryAuthority(options);
@@ -921,16 +1183,13 @@ async function runSingleTeammateV1(
         + "workspace and cannot serve this host's Todo queue. Drop the todo binding and dispatch without it.",
       );
     }
-    // A placement is a routing decision like a named backend, and legacy mode
-    // can serve neither. Falling through would run the placed task on this
-    // machine under the default backend, so it is refused by name instead.
-    if (modelRegistryContext === undefined
-      && options.backendRegistry === undefined
-      && (backendRegistryConfigSync(options.baseCwd).mode ?? "legacy") === "legacy") {
+    // Placement is opt-in only while the host has a live route resolver. The
+    // reserved registry entry is overlaid later for this dispatch alone; no
+    // provider means there is no transport authority and must fail closed.
+    if (options.fabricRouteResolverOf === undefined) {
       return rejectAndPublish(
-        `Teammate task carries a Fabric placement, but .pi/teammate-backends.json is in legacy execution `
-        + `mode; set mode "backend-registry" and register "${FABRIC_BACKEND}" — refusing to run a placed `
-        + "task on this machine",
+        "Teammate task carries a Fabric placement, but this dispatch has no live Fabric route resolver provider; "
+        + "refusing to run a placed task on this machine",
       );
     }
   }
@@ -1009,6 +1268,16 @@ async function runSingleTeammateV1(
         ?? modelRegistrationPlan(modelRegistryContext.authority, params, agentConfig);
       rejectionModel = registrationPlan.candidates[0]?.modelRegistrationId ?? rejectionModel;
       if (!modelRegistryContext.resolutionsByCorrelationId.has(correlationId)) {
+        const registry = params.placement === undefined
+          ? modelRegistryContext.registry
+          : options.backendRegistry ?? dispatchFabricPlacementRegistrySync(
+              options.baseCwd,
+              () => {
+                throw new Error("model-registration preflight never starts a run");
+              },
+              options.fabricRouteResolverOf!,
+              options.remoteManagerOf,
+            );
         await preflightModelRegistrationPlan(
           modelRegistryContext,
           correlationId,
@@ -1016,6 +1285,8 @@ async function runSingleTeammateV1(
           cwd,
           registrationPlan,
           options,
+          1,
+          registry,
         );
       }
       candidates = registrationPlan.candidates.map((candidate) => candidate.modelRegistrationId);
@@ -1586,15 +1857,22 @@ async function runSingleTeammateV1(
         // the workspace document decides, which is what makes `mode:
         // "backend-registry"` in `.pi/teammate-backends.json` actually switch
         // the dispatch path rather than only describe an intent.
-        const registry = modelRegistryContext?.registry
-          ?? options.backendRegistry
-          ?? dispatchRegistrySync(
-            options.baseCwd,
-            () => ({ hostOptions: attemptOptions, cwd, replyTo }),
-            options.remoteManagerOf,
-            undefined,
-            options.fabricRouteResolverOf,
-          );
+        const registry = params.placement !== undefined
+          ? options.backendRegistry ?? dispatchFabricPlacementRegistrySync(
+              options.baseCwd,
+              () => ({ hostOptions: attemptOptions, cwd, replyTo }),
+              options.fabricRouteResolverOf!,
+              options.remoteManagerOf,
+            )
+          : modelRegistryContext?.registry
+            ?? options.backendRegistry
+            ?? dispatchRegistrySync(
+                options.baseCwd,
+                () => ({ hostOptions: attemptOptions, cwd, replyTo }),
+                options.remoteManagerOf,
+                undefined,
+                options.fabricRouteResolverOf,
+              );
         if (registry === undefined) {
           // A `cli/<tool>` model is served by a registered backend and by
           // nothing else. Legacy mode resolves no registry, so falling through
@@ -1642,31 +1920,25 @@ async function runSingleTeammateV1(
             : modelRegistryContext?.resolutionsByCorrelationId
               .get(correlationId)
               ?.get(registrationCandidate.modelRegistrationId);
-          const { backend, config, capabilities } = preflightResolution
-            ?? await registry.resolve(spec, spec.backend);
-          resolvedCapabilities = capabilities;
-          // Adjudicate here too, not only in `runGraph`. Five production call
-          // sites dispatch a single teammate directly, and a task whose backend
-          // cannot serve a required capability was reaching the model anyway:
-          // the field was dropped in silence, so the transcript looked like a
-          // successful run that simply never used the queue. Rejecting before
-          // `backend.start` keeps the promise adjudication makes — the missing
-          // capability surfaces without burning a model turn.
-          const capabilityErrors = validateBackendCapabilities(
-            [{ spec, ...(spec.name === undefined ? {} : { name: spec.name }) }],
-            () => ({ name: backend.name, capabilities }),
-          ).errors;
-          if (capabilityErrors.length > 0) {
-            // The resolved backend does not vary with the model candidate, so
-            // no later candidate can serve this task either. Settling the trial
-            // permit is left to the `finally` below, which is reached with
-            // `settled` still false and releases a HALF_OPEN acquisition
-            // exactly once. Releasing here as well called `releaseCandidate`
-            // twice, and that method re-opens the circuit rather than handing
-            // an unspent permit back — a backend whose capabilities do not
-            // match the task was charging a model's health for it.
-            return rejectAndPublish(capabilityErrors.join("\n"));
+          let prepared: PreparedBackendAttempt;
+          try {
+            prepared = await prepareBackendAttemptOnce(
+              registry,
+              spec,
+              spec.backend,
+              preflightResolution,
+            );
+          } catch (error) {
+            if (error instanceof BackendCapabilityAdmissionError) {
+              // The resolved backend does not vary with the model candidate, so
+              // no later candidate can serve this task either. Settling the
+              // trial permit is left to the `finally` below.
+              return rejectAndPublish(error.message);
+            }
+            throw error;
           }
+          const { config, capabilities } = prepared;
+          resolvedCapabilities = capabilities;
           await applyTodoPromptContext();
           if (options.signal?.aborted) return cancelAtBoundary("while Todo prompt context resolved");
           spec = registrationCandidate === undefined
@@ -1701,9 +1973,9 @@ async function runSingleTeammateV1(
           if (bindings !== undefined) {
             bindings.set(correlationId, { hostOptions: attemptOptions, cwd, replyTo });
           }
-          let run: import("pi-maestro-backend-core/v1/backend").BackendRun;
+          let run: BackendRun;
           try {
-            run = await backend.start(spec, backendOptions);
+            run = await prepared.start(spec, backendOptions);
           } catch (error) {
             bindings?.delete(correlationId);
             throw error;
@@ -1731,7 +2003,7 @@ async function runSingleTeammateV1(
           }
           try {
             attempt = await run.outcome;
-            if (backend.name !== PI_SUBPROCESS) {
+            if (prepared.backendName !== PI_SUBPROCESS) {
               void attempt.reclamation.then((outcome) => {
                 try {
                   options.onReclamationOutcome?.(
@@ -1755,7 +2027,7 @@ async function runSingleTeammateV1(
           // Recorded by the dispatch rather than by the backend: a backend that
           // forgot to name itself would otherwise be indistinguishable from the
           // legacy path, which names nothing because no backend served it.
-          attempt.result.backend = backend.name;
+          attempt.result.backend = prepared.backendName;
           // Emulation is recorded per run, so a consumer reading a structured
           // value can tell whether it came from a native contract or from
           // host-side extraction. Derived from the same adjudication the graph
@@ -1763,7 +2035,7 @@ async function runSingleTeammateV1(
           const emulated = adjudicateTask(
             { spec, ...(spec.name === undefined ? {} : { name: spec.name }) },
             0,
-            backend.name,
+            prepared.backendName,
             capabilities,
           ).emulated;
           if (emulated.length > 0) {
@@ -1775,7 +2047,7 @@ async function runSingleTeammateV1(
               ...emulated.map((capability) => ({
                 capability,
                 support: "emulated" as const,
-                note: `served by host-side compensation in backend "${backend.name}"`,
+                note: `served by host-side compensation in backend "${prepared.backendName}"`,
               })),
             ];
           }
@@ -2213,6 +2485,15 @@ export async function runGraph(
     return publishGraphRejection("Circular dependency detected in task graph", deps);
   }
 
+  const hasFabricPlacement = tasks.some((task) => task.placement !== undefined);
+  if (hasFabricPlacement && options.fabricRouteResolverOf === undefined) {
+    return publishGraphRejection(
+      "Teammate graph carries a Fabric placement, but this dispatch has no live Fabric route resolver provider; "
+      + "refusing to run a placed task on this machine",
+      deps,
+    );
+  }
+
   let graphModelRegistryContext = options.modelRegistryDispatch as MutableModelRegistryDispatchContext | undefined;
   try {
     const authority = captureModelRegistryAuthority(options);
@@ -2246,11 +2527,22 @@ export async function runGraph(
           outputSchema: task.outputSchema,
           todos: task.todos,
           briefing: task.briefing,
+          placement: task.placement,
         };
         const taskCorrelationId = taskCorrelationIds[index]!;
         const plan = graphModelRegistryContext!.plansByCorrelationId.get(taskCorrelationId)
           ?? modelRegistrationPlan(graphModelRegistryContext!.authority, params, agentConfig);
         if (graphModelRegistryContext!.resolutionsByCorrelationId.has(taskCorrelationId)) return [];
+        const registry = task.placement === undefined
+          ? graphModelRegistryContext!.registry
+          : options.backendRegistry ?? dispatchFabricPlacementRegistrySync(
+              options.baseCwd,
+              () => {
+                throw new Error("model-registration graph preflight never starts a run");
+              },
+              options.fabricRouteResolverOf!,
+              options.remoteManagerOf,
+            );
         return preflightModelRegistrationPlan(
           graphModelRegistryContext!,
           taskCorrelationId,
@@ -2259,6 +2551,7 @@ export async function runGraph(
           plan,
           options,
           tasks.length,
+          registry,
         );
       }));
       for (const warning of warningGroups.flat()) {
@@ -2288,73 +2581,95 @@ export async function runGraph(
   // Capability adjudication sits beside the structural checks, not at dispatch.
   // Registry-mode candidates were all adjudicated above; the frozen
   // legacy/backend-registry path keeps its existing primary-only check.
-  let graphRegistry: BackendRegistry | undefined;
-  try {
-    graphRegistry = graphModelRegistryContext === undefined
-      ? options.backendRegistry
-        ?? dispatchRegistrySync(
-          options.baseCwd,
-          () => {
-            throw new Error("capability adjudication never starts a run");
-          },
-          options.remoteManagerOf,
-          undefined,
-          options.fabricRouteResolverOf,
-        )
-      : undefined;
-  } catch (cause) {
-    // A malformed or unloadable registration is a graph-level rejection, not a
-    // throw out of runGraph: every other validation failure settles each task
-    // so the caller and the UI see a result rather than a pending row.
-    return publishGraphRejection(
-      `Teammate backend registry could not be loaded: ${String(cause)}`,
-      deps,
-    );
-  }
-  if (graphRegistry !== undefined) {
-    const registry = graphRegistry;
-    const adjudicated = tasks.map((task) => ({
+  if (graphModelRegistryContext === undefined) {
+    let placementlessRegistry: BackendRegistry | undefined;
+    let placedRegistry: BackendRegistry | undefined;
+    try {
+      placementlessRegistry = options.backendRegistry ?? dispatchRegistrySync(
+        options.baseCwd,
+        () => {
+          throw new Error("capability adjudication never starts a run");
+        },
+        options.remoteManagerOf,
+        undefined,
+        options.fabricRouteResolverOf,
+      );
+      placedRegistry = hasFabricPlacement
+        ? options.backendRegistry ?? dispatchFabricPlacementRegistrySync(
+            options.baseCwd,
+            () => {
+              throw new Error("capability adjudication never starts a run");
+            },
+            options.fabricRouteResolverOf!,
+            options.remoteManagerOf,
+          )
+        : undefined;
+    } catch (cause) {
+      // A malformed or unloadable registration is a graph-level rejection, not a
+      // throw out of runGraph: every other validation failure settles each task
+      // so the caller and the UI see a result rather than a pending row.
+      return publishGraphRejection(
+        `Teammate backend registry could not be loaded: ${String(cause)}`,
+        deps,
+      );
+    }
+
+    const adjudicated: Array<{
+      spec: TeammateRunSpec;
+      name?: string;
+      registry: BackendRegistry;
+    }> = [];
+    for (const task of tasks) {
+      const registry = task.placement === undefined ? placementlessRegistry : placedRegistry;
+      if (registry === undefined) continue;
       // NormalizedTask holds the prompt in `prompt`; without this the
       // adjudicated spec would carry an empty task while dispatch sends the
       // real one, and any routing rule reading it would disagree with dispatch.
-      spec: backendSpecOf(
+      const spec = backendSpecOf(
         { ...task, task: task.prompt },
         task.cwd ?? options.baseCwd,
         task.model,
         remoteLocationRouting(task.cwd),
-      ),
-      ...(task.name === undefined ? {} : { name: task.name }),
-    }));
-    let backends;
-    try {
-      backends = await Promise.all(adjudicated.map(async ({ spec }) => {
-        // Same selector dispatch will use; adjudicating the default while
-        // dispatch runs a task-named backend would check the wrong table.
-        const { backend, capabilities } = await registry.resolve(spec, spec.backend);
-        return { name: backend.name, capabilities };
-      }));
-    } catch (cause) {
-      return publishGraphRejection(
-        `Teammate backend could not be resolved for this graph: ${String(cause)}`,
-        deps,
       );
-    }
-    const verdict = validateBackendCapabilities(adjudicated, (_task, index) => backends[index]!);
-    if (verdict.errors.length > 0) {
-      return publishGraphRejection(verdict.errors.join("\n"), deps);
-    }
-    for (const warning of verdict.warnings) {
-      options.onProgress?.({
-        agent: "teammate",
-        status: "running",
-        recentTools: [],
-        toolCount: 0,
-        tokens: 0,
-        durationMs: 0,
-        lastActivityAt: Date.now(),
-        startedAt: Date.now(),
-        lastMessage: warning,
+      adjudicated.push({
+        spec,
+        ...(task.name === undefined ? {} : { name: task.name }),
+        registry,
       });
+    }
+    if (adjudicated.length > 0) {
+      let backends;
+      try {
+        backends = await Promise.all(adjudicated.map(async ({ spec, registry }) => {
+          // Each task is resolved against the same registry its execution path
+          // uses: placementless legacy tasks do not inherit a graph peer's
+          // Fabric overlay.
+          const { backend, capabilities } = await registry.resolve(spec, spec.backend);
+          return { name: backend.name, capabilities };
+        }));
+      } catch (cause) {
+        return publishGraphRejection(
+          `Teammate backend could not be resolved for this graph: ${String(cause)}`,
+          deps,
+        );
+      }
+      const verdict = validateBackendCapabilities(adjudicated, (_task, index) => backends[index]!);
+      if (verdict.errors.length > 0) {
+        return publishGraphRejection(verdict.errors.join("\n"), deps);
+      }
+      for (const warning of verdict.warnings) {
+        options.onProgress?.({
+          agent: "teammate",
+          status: "running",
+          recentTools: [],
+          toolCount: 0,
+          tokens: 0,
+          durationMs: 0,
+          lastActivityAt: Date.now(),
+          startedAt: Date.now(),
+          lastMessage: warning,
+        });
+      }
     }
   }
 
@@ -2595,6 +2910,7 @@ export async function runGraph(
           outputSchema: task.outputSchema,
           todos: task.todos,
           briefing: task.briefing,
+          placement: task.placement,
         },
         {
           ...graphRunOptions,

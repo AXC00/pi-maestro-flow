@@ -7,9 +7,12 @@
  *
  * Supports single, parallel (tasks[]), and chain (chain[]) execution modes.
  */
-import type { SingleResult, AgentProgress, TeammateExecutionProvenance } from "../shared/types.ts";
+import type { SingleResult, AgentProgress, AgentTerminalStatus, TeammateExecutionProvenance } from "../shared/types.ts";
 export * from "./execution-infra.ts";
 import type { NormalizedTask, RunSingleTeammateParams, RunTeammateOptions, RunTeammateParams } from "./execution-infra.ts";
+import type { AttemptOutcome, BackendCapabilities, BackendRun } from "pi-maestro-backend-core/v1/backend";
+import type { BackendRegistry } from "pi-maestro-backend-core/v1/registry";
+import type { TeammateRunSpec } from "pi-maestro-backend-core/v1/spec";
 export { TOOL_EXECUTION_HEARTBEAT_MS, resolveAgentCacheRetention, hasRpcTurnSidecar, sendRpcMessage, sendChildIpcMessage, dispatchChildIpcMessage, } from "./pi-subprocess-attempt.ts";
 export type { RpcMessageMode } from "./pi-subprocess-attempt.ts";
 export declare function hostRegistryResultProvenance(result: SingleResult): TeammateExecutionProvenance | undefined;
@@ -31,6 +34,32 @@ export declare function hostRegistryResultProvenance(result: SingleResult): Team
  * @internal Exported for backend-seam regression tests.
  */
 export declare function projectBackendProgress(data: Record<string, unknown>, agent: string, startedAt: number): AgentProgress;
+interface FabricSourceRuntimeOptions {
+    readonly backendRegistry?: BackendRegistry;
+}
+/**
+ * Start one source-local backend attempt for the public Fabric runtime port.
+ * This path deliberately omits orchestration, fallback, publication and any
+ * remote/Fabric backend wiring.
+ *
+ * @internal Public consumers use createFabricTeammateRuntimePort().
+ */
+export declare function startFabricSourceBackendAttempt(input: {
+    placement: import("pi-maestro-fabric-core/v1/placement").TeammatePlacementV1;
+    spec: TeammateRunSpec;
+    correlationId: string;
+    baseCwd: string;
+    signal: AbortSignal;
+    onChildEvent?: (event: Record<string, unknown>) => void;
+    onTurnComplete?: (result: SingleResult, terminalStatus?: AgentTerminalStatus) => void;
+}, runtimeOptions?: FabricSourceRuntimeOptions): Promise<{
+    acceptedBackend: string;
+    acceptedModel?: string;
+    acceptedCapabilities: BackendCapabilities;
+    outcome: Promise<AttemptOutcome>;
+    send: BackendRun["send"];
+    abort: BackendRun["abort"];
+}>;
 export declare function runSingleTeammate(params: RunSingleTeammateParams, options: RunTeammateOptions): Promise<SingleResult>;
 export declare function normalizeGraphConcurrency(concurrency: number, taskCount: number): number;
 export declare function runGraph(tasks: NormalizedTask[], concurrency: number, options: RunTeammateOptions): Promise<SingleResult[]>;

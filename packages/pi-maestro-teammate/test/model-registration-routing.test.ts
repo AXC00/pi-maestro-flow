@@ -99,6 +99,20 @@ function authority(overrides: Partial<ModelRegistryManifestV2> = {}): DispatchAu
   ).dispatch;
 }
 
+function fabricPlacement() {
+  return {
+    version: "fabric.placement.v1" as const,
+    placementId: "placement-model-registry",
+    routeId: "route-model-registry",
+    workspaceBindingId: "binding-model-registry",
+    endpointId: "endpoint-model-registry",
+    connectionGeneration: 1,
+    workspaceGeneration: 1,
+    endpointGeneration: 1,
+    deadlineAt: Date.now() + 60_000,
+  };
+}
+
 interface ProbeEvent {
   kind: "resolve" | "start";
   deployment: string | undefined;
@@ -592,6 +606,45 @@ test("registry dispatch preflights every candidate and uses canonical telemetry 
   assert.equal(snapshot.deployments.find((entry) => entry.model === "dep-b")?.state, "CLOSED");
   assert.equal(snapshot.routes.every((entry) => entry.model.startsWith("registry/")), true);
   assert.equal(snapshot.routes.some((entry) => entry.model.startsWith("adapter/")), false);
+});
+
+test("placed model-registry dispatch keeps adapter translation while forcing the Fabric backend", async () => {
+  const projection = authority();
+  const events: ProbeEvent[] = [];
+  const fabric = probeBackend("fabric", events, (spec, options) =>
+    resultOf(spec, options, 0, "placed model translated"));
+  const result = await runSingleTeammate({
+    agent: "general",
+    task: "translate the placed model",
+    model: "registry/primary",
+    placement: fabricPlacement(),
+  }, {
+    baseCwd: process.cwd(),
+    backendRegistry: probeRegistry(events, { fabric }),
+    modelRegistryAuthority: projection,
+    fabricRouteResolverOf: () => ({
+      async prepare() { throw new Error("injected registry owns this test route"); },
+    }),
+    enableRetryBackoff: false,
+  });
+
+  assert.deepEqual(events, [
+    {
+      kind: "resolve",
+      deployment: "fabric",
+      model: "adapter/primary",
+      task: "translate the placed model",
+    },
+    {
+      kind: "start",
+      deployment: "fabric",
+      model: "adapter/primary",
+      task: "translate the placed model",
+    },
+  ]);
+  assert.equal(result.exitCode, 0);
+  assert.equal(result.backend, "probe-fabric");
+  assert.equal(result.model, "registry/primary");
 });
 
 test("model-registry replaces provenance while backend-registry strips untrusted provenance from result projections", async () => {

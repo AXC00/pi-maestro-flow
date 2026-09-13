@@ -30,7 +30,8 @@ import {
 import { FabricHttpChannelServer } from "./fabric/http-channel-server.ts";
 import { FabricAgentEndpointBridge } from "./fabric/agent-endpoint.ts";
 import { McpEndpointBridge, type FabricMcpSourceRegistration } from "./fabric/mcp-endpoint.ts";
-import { GatewayFabricControlSupport, type GatewayFabricControlRuntime } from "./fabric/control-support.ts";
+import { GATEWAY_FABRIC_CONTROL_LIMITS, GatewayFabricControlSupport, type GatewayFabricControlRuntime } from "./fabric/control-support.ts";
+import { createGatewayFabricComposition, type GatewayFabricComposition } from "./fabric/composition.ts";
 import { GatewayFabricDeviceService } from "./fabric/device-service.ts";
 import { GatewayFabricWorkspaceService } from "./fabric/workspace-service.ts";
 import { GatewayFabricEndpointService } from "./fabric/endpoint-service.ts";
@@ -134,6 +135,7 @@ export class GatewayRuntime {
   readonly operationReceipts: GatewayOperationReceiptStore;
   readonly fabricStore: GatewayFabricStore;
   readonly fabricEvents: GatewayFabricEventAdapter;
+  readonly fabricComposition?: GatewayFabricComposition;
   readonly fabricControlRuntime?: GatewayFabricControlRuntime;
   readonly fabricDevice: GatewayFabricDeviceService;
   readonly fabricWorkspace: GatewayFabricWorkspaceService;
@@ -250,7 +252,12 @@ export class GatewayRuntime {
     if (this.fabricEvents.store !== this.fabricStore || this.fabricEvents.journal !== this.teammate.eventJournal) {
       throw new Error("Gateway Fabric event adapter must use the runtime Fabric store and event journal");
     }
-    this.fabricControlRuntime = options.fabricControlRuntime;
+    this.fabricComposition = options.fabricControlRuntime !== undefined || !config.fabric.enabled
+      ? undefined
+      : createGatewayFabricComposition(this.fabricStore, {
+        limits: { ...GATEWAY_FABRIC_CONTROL_LIMITS, ...config.fabric.limits },
+      });
+    this.fabricControlRuntime = options.fabricControlRuntime ?? this.fabricComposition;
     const fabricControl = new GatewayFabricControlSupport(this.fabricControlRuntime, this.policy, this.registry);
     this.fabricAgentEndpoint = options.fabricAgentEndpoint ?? (options.fabricAgentEndpointIds === undefined ? undefined : new FabricAgentEndpointBridge({
       support: fabricControl,

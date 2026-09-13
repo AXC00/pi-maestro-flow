@@ -167,7 +167,7 @@ function deferred(): { promise: Promise<void>; resolve(): void } {
   return { promise: new Promise<void>((done) => { resolve = done; }), resolve: () => resolve() };
 }
 
-test("durable connection allocation survives manager restart and fences before physical close", async () => {
+test("durable connection allocation survives manager restart while physical close is independent", async () => {
   const first = await createFixture();
   const entered = deferred();
   const release = deferred();
@@ -179,7 +179,8 @@ test("durable connection allocation survives manager restart and fences before p
   };
   const closing = first.connections.disconnect(first.connectionId, first.generation);
   await entered.promise;
-  assert.deepEqual(first.closes, []);
+  assert.equal(first.connections.get(first.connectionId)?.state, "closed", "memory is fenced before cleanup awaits");
+  assert.deepEqual(first.closes, ["explicit disconnect"], "owner close does not wait for durable cleanup");
   release.resolve();
   await closing;
   assert.equal(first.closes.length, 1);

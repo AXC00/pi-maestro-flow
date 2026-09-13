@@ -411,6 +411,78 @@ export function dispatchRegistrySync(
 }
 
 /**
+ * Build the registry used by an already-admitted source-local Fabric attempt.
+ *
+ * Source execution still honours the operator's selected default deployment,
+ * but it must traverse the backend seam even when the project retains legacy
+ * mode. This does not change ordinary dispatch mode: only the explicit source
+ * runtime calls this helper.
+ */
+export function dispatchSourceAttemptRegistrySync(
+  workspaceRoot: string,
+  extrasOf: (spec: TeammateRunSpec, options: BackendRunOptions) => PiSubprocessRunExtras,
+  globalFilePath: string = getGlobalBackendRegistryPath(),
+): TeammateBackendRegistry {
+  const config = backendRegistryConfigSync(workspaceRoot, globalFilePath);
+  return new TeammateBackendRegistry(
+    { ...config, mode: "backend-registry" },
+    backendLoader(extrasOf),
+  );
+}
+
+/**
+ * Add the reserved Fabric deployment for one placed origin dispatch only.
+ *
+ * The overlay is never persisted and is never used for a placementless task.
+ * An operator may explicitly register the reserved name to the same module,
+ * but may not redirect it to a different implementation.
+ */
+export function dispatchFabricPlacementRegistrySync(
+  workspaceRoot: string,
+  extrasOf: (spec: TeammateRunSpec, options: BackendRunOptions) => PiSubprocessRunExtras,
+  fabricRouteResolverOf: () => FabricBackendRouteResolver,
+  remoteManagerOf?: () => RemoteManagerPort,
+  globalFilePath: string = getGlobalBackendRegistryPath(),
+): TeammateBackendRegistry {
+  let config = backendRegistryConfigSync(workspaceRoot, globalFilePath);
+  if (config.mode === "model-registry") {
+    const pair = modelRegistryPairSync(workspaceRoot);
+    if (pair === undefined) {
+      config = backendRegistryConfigSync(workspaceRoot, globalFilePath);
+    } else {
+      const backends = Object.create(null) as BackendRegistryConfig["backends"];
+      for (const [deploymentId, deployment] of pair.dispatch.deploymentsById) {
+        backends[deploymentId] = deployment.registration;
+      }
+      config = {
+        mode: "backend-registry",
+        default: pair.dispatch.defaultDeployment,
+        backends,
+      };
+    }
+  }
+  const registered = config.backends[FABRIC_BACKEND];
+  if (registered !== undefined && registered.module !== FABRIC_BACKEND) {
+    throw new Error(
+      `teammate backend registration ${JSON.stringify(FABRIC_BACKEND)} is reserved for placed Fabric dispatches; `
+      + `operator configuration maps it to conflicting module ${JSON.stringify(registered.module)}`,
+    );
+  }
+  const overlay: BackendRegistryConfig = {
+    mode: "backend-registry",
+    default: config.default,
+    backends: {
+      ...config.backends,
+      [FABRIC_BACKEND]: registered ?? { module: FABRIC_BACKEND },
+    },
+  };
+  return new TeammateBackendRegistry(
+    overlay,
+    backendLoader(extrasOf, remoteManagerOf, fabricRouteResolverOf),
+  );
+}
+
+/**
  * Resolve a registration's module to something the registry can narrow.
  *
  * The return type is `unknown` rather than `TeammateBackend`: a module
