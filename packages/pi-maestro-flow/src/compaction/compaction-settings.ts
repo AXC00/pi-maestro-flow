@@ -733,6 +733,7 @@ async function patchSettingsFile(path: string, patch: CompactionConfigPatch): Pr
   const compaction = normalizeCompactionRecord(isRecord(root.compaction) ? { ...root.compaction } : {});
   if (patch.enabled !== undefined) compaction.enabled = patch.enabled;
   if (patch.model !== undefined) compaction.model = patch.model;
+  if (patch.payloadLimitBytes !== undefined) compaction.payloadLimitBytes = patch.payloadLimitBytes;
   if (patch.reserveTokens !== undefined || patch.keepRecentTokens !== undefined) {
     const hard = isRecord(compaction.hard) ? { ...compaction.hard } : {};
     if (patch.reserveTokens !== undefined) {
@@ -809,6 +810,11 @@ async function replaceKnownFieldsInSettingsFile(path: string, values: Compaction
   }
   if (Object.keys(hard).length === 0) delete compaction.hard;
   else compaction.hard = hard;
+  // Payload byte ceiling: undefined means "no ceiling" — clear the field so a
+  // user who unsets the limit in the TUI gets a clean removal, not a stale
+  // persisted value.
+  if (values.payloadLimitBytes === undefined) delete compaction.payloadLimitBytes;
+  else compaction.payloadLimitBytes = values.payloadLimitBytes;
   if (values.soft !== undefined) {
     const soft: Record<string, unknown> = {};
     for (const [key, value] of Object.entries(values.soft)) {

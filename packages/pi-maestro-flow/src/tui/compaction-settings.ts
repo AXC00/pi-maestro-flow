@@ -113,6 +113,7 @@ const CATALOGS = {
     "editor.title": "Edit",
     "editor.current": "Current value",
     "editor.newValue": "New value",
+    "editor.bytes": "bytes",
     "editor.tokens": "tokens",
     "editor.configThreshold": "Configured threshold",
     "editor.configReserve": "Configured reserve",
@@ -268,6 +269,7 @@ const CATALOGS = {
     "editor.title": "修改",
     "editor.current": "当前值",
     "editor.newValue": "新值",
+    "editor.bytes": "字节",
     "editor.tokens": "Token",
     "editor.configThreshold": "配置阈值",
     "editor.configReserve": "配置预留",
@@ -698,7 +700,7 @@ export class CompactionSettingsOverlay implements Component, Focusable {
       headerLine(this.params.theme, `${this.t("editor.title")}${this.t(itemLabel(item))}`, [this.scopeLabel(this.scope)], inner),
       rule(inner),
       fit(`${this.t("editor.current")} · ${this.itemValue(item)}`, inner),
-      this.params.theme.fg("accent", fit(`› ${this.t("editor.newValue")} · ${this.formattedEditValue()} ${this.t("editor.tokens")}`, inner)),
+      this.params.theme.fg("accent", fit(`› ${this.t("editor.newValue")} · ${this.formattedEditValue()} ${item === "payloadLimitBytes" ? this.t("editor.bytes") : this.t("editor.tokens")}`, inner)),
     ];
     if (item === "threshold") {
       const capacity = this.linkedThreshold();
