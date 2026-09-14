@@ -189,10 +189,14 @@ soft.imageBudget: {
 ```
 
 - **下限 1200**：小截图不被低估，token 压力行为向后兼容。
-- **上限 16384**：病态/超大 payload 不爆炸（50MB base64 ≈ 16K token，而非数百万）。
+- **无上限**：token 估算随体积单调增长；不把传输层限制（如 AI Toolbox 16MiB）硬编码进估算器——
+  外部约束由 `imageBudget` 承载，估算只做物理近似（base64→解码字节→token）。
 - **仍将 base64 从普通 JSON 文本序列化中剥离**（lightweight copy），绝不按 `/4` 算文本 token。
 - document 块仍固定 2000，不套用图片算法。
 - 该值仅是**本地压力启发式**，不等于 provider 账单。
+
+> 注：曾尝试为单图估算加硬 cap（16384）以对齐 16MiB 代理上限，但那把外部约束
+> 写进了估算器。估算器应只随体积增长，外部体积限制统一由 `imageBudget` 承担。
 
 ### 图片字节预算 prune（新增独立 pass）
 
@@ -213,7 +217,10 @@ soft.imageBudget: {
 
 - **pi-maestro-flow**：只能对**已在上下文**的历史图片做字节降级与更准确的 token 估算；
   它不拥有“图片进上下文前的 resize”。
-- **pi-coding-agent**（companion，后续独立 PR）：`read` 工具已在 `image-resize` 路径将图片缩到
-  2000×2000 上限，但 flow 侧无法拦截其输出；更高分辨率截图/非 read 来源需在 agent core 的
-  canonical preprocessing 收紧 max encoded bytes 或调低目标尺寸。
+- **上游 TODO（earendil-works/pi · packages/coding-agent）**：`read` 工具在
+  `image-resize-core` 已有 Photon JPEG 路径，但早退条件 `尺寸≤2000 && base64<4.5MB`
+  会让合规的 PNG 截图（如 1920×1080 / 2443KB）**原样返回、不转 JPEG**。
+  实测同图 JPEG q85 仅 302KB（约 8 倍节省）。上游修复方向：尺寸/字节合规时
+  对无损格式（PNG/BMP/TIFF/WebP）尝试 JPEG 再编码，若显著更小（<60%）则采用，
+  保持宽高比与坐标语义。流侧无法拦截 read 输出，此项必须在上游完成。
 - 摘要请求**始终剥图**（`[image]`/`[image:route]` 占位，零图片上传），本特性不改变该语义。

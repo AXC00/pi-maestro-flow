@@ -193,14 +193,22 @@ test("estimateMessageTokens estimates images proportionally to base64 size with 
   assert.ok(large < 10_000, `2MB image must stay bounded, got ${large}`);
 });
 
-test("estimateMessageTokens caps image estimate for pathological payloads", () => {
+test("estimateMessageTokens grows image estimate with payload size without a transport cap", () => {
   const huge = "A".repeat(50_000_000); // 50MB base64
   const tokens = estimateMessageTokens({
     role: "user",
     content: [{ type: "image", data: huge, mimeType: "image/png" }],
     timestamp: 1,
   } as never);
-  assert.ok(tokens >= 1200 && tokens < 20_000, `pathological image stays capped, got ${tokens}`);
+  // No transport ceiling is baked into the estimator: a bigger payload keeps
+  // costing more, while still never being counted as text tokens.
+  const medium = estimateMessageTokens({
+    role: "user",
+    content: [{ type: "image", data: "A".repeat(2_000_000), mimeType: "image/png" }],
+    timestamp: 1,
+  } as never);
+  assert.ok(tokens > medium, `larger payload must estimate higher (${tokens} vs ${medium})`);
+  assert.ok(tokens < 100_000, `50MB payload stays bounded by decoded-bytes ratio, got ${tokens}`);
   assert.ok(tokens < 10_000_000, `never counts base64 as text tokens, got ${tokens}`);
 });
 

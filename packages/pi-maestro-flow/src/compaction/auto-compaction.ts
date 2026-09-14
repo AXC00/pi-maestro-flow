@@ -97,8 +97,6 @@ const RELEVANCE_TOTAL_SAMPLE_CHARS = 512_000;
 const ESTIMATED_IMAGE_TOKENS = 1200;
 /** Decoded bytes per token for the size-aware image heuristic. */
 const IMAGE_TOKEN_BYTES_PER_TOKEN = 512;
-/** Hard ceiling for one image's token estimate; guards malformed payloads. */
-const IMAGE_TOKEN_CAP = 16384;
 /** Fixed token estimate per document block. A base64 PDF in source.data must
  * not reach the JSON text estimator — a 1MB PDF is ~1.33M base64 chars →
  * ~325k estimated tokens, vs the ~2000 the API actually charges. Same order as
@@ -4303,8 +4301,10 @@ export function estimateMessageTokens(message: AgentMessage): number {
 /**
  * Size-aware per-image token heuristic for local pressure accounting. Each
  * image is floored independently so a small thumbnail in a mixed message is
- * never subsidized by a large screenshot, and a hard cap bounds per-image
- * cost even for pathological payloads.
+ * never subsidized by a large screenshot. The estimate grows monotonically
+ * with decoded bytes; transport-body limits (e.g. a 16MiB proxy cap) are an
+ * external constraint carried by `imageBudget`, NOT by this estimator — no
+ * hard cap is baked in here.
  *
  * This is a *pressure estimate*, not a provider billing contract.
  */
@@ -4314,10 +4314,7 @@ export function estimateImageTokens(imageSizes: readonly number[]): number {
   for (const bytes of imageSizes) {
     if (bytes <= 0) continue;
     const decodedApprox = Math.ceil(bytes * 3 / 4);
-    total += Math.min(
-      IMAGE_TOKEN_CAP,
-      Math.max(ESTIMATED_IMAGE_TOKENS, Math.ceil(decodedApprox / IMAGE_TOKEN_BYTES_PER_TOKEN)),
-    );
+    total += Math.max(ESTIMATED_IMAGE_TOKENS, Math.ceil(decodedApprox / IMAGE_TOKEN_BYTES_PER_TOKEN));
   }
   return total;
 }
