@@ -29,7 +29,7 @@ import {
   type MessageRecord,
   type CompactionSettings,
   estimateMessageTokens,
-  measureImageBytes,
+  estimatePayloadBytes,
   pruneToolResult,
   assistantUsage,
   latestProviderUsageEpoch,
@@ -221,7 +221,8 @@ export function computeContextSignals(input: {
   estimatedTokens: number;
   contextWindow: number;
   thresholdTokens: number;
-  imageBudget?: { maxBytesPerImage: number; maxTotalBytes: number; enabled: boolean };
+  /** Optional payload byte ceiling; when set, payload signals are computed. */
+  payloadLimitBytes?: number;
 }): ContextSignals {
   const { messages, estimatedTokens, contextWindow, thresholdTokens } = input;
   const fullnessRatio = contextWindow > 0 ? estimatedTokens / contextWindow : 0;
@@ -236,16 +237,10 @@ export function computeContextSignals(input: {
     redundantFraction,
     cacheHitRatio: latestCacheHitRatio(messages),
   };
-  const budget = input.imageBudget;
-  if (budget?.enabled) {
-    const measured = measureImageBytes(messages);
-    signals.imageBytes = measured.imageBytes;
-    signals.imageCount = measured.imageCount;
-    signals.largestImageBytes = measured.largestImageBytes;
-    signals.imageBudgetBytes = budget.maxTotalBytes;
-    signals.imageBudgetExceeded =
-      measured.imageBytes > budget.maxTotalBytes
-      || measured.imageCount > 0 && measured.largestImageBytes > budget.maxBytesPerImage;
+  if (input.payloadLimitBytes !== undefined) {
+    signals.payloadBytes = estimatePayloadBytes(messages);
+    signals.payloadLimitBytes = input.payloadLimitBytes;
+    signals.payloadLimitExceeded = signals.payloadBytes > input.payloadLimitBytes;
   }
   return signals;
 }
@@ -260,9 +255,9 @@ export function decideContextAction(band: ContextPressureBand, signals: ContextS
   if (signals.prunableFraction > 0) reasons.push(`prunable:${Math.round(signals.prunableFraction * 100)}%`);
   if (signals.redundantFraction && signals.redundantFraction > 0) reasons.push(`redundant:${Math.round(signals.redundantFraction * 100)}%`);
   if (signals.cacheHitRatio !== undefined) reasons.push(`cache:${Math.round(signals.cacheHitRatio * 100)}%`);
-  if (signals.imageBudgetExceeded) {
-    const imageMb = signals.imageBytes !== undefined ? (signals.imageBytes / (1024 * 1024)).toFixed(1) : "?";
-    reasons.push(`image-bytes:${imageMb}MB`);
+  if (signals.payloadLimitExceeded) {
+    const mb = signals.payloadBytes !== undefined ? (signals.payloadBytes / (1024 * 1024)).toFixed(1) : "?";
+    reasons.push(`payload-bytes:${mb}MB`);
   }
   return { band, action, reasons };
 }

@@ -108,20 +108,6 @@ export interface LosslessCompactionSettings {
   enabled: boolean;
 }
 
-export interface ImageBudgetCompactionConfigPatch {
-  enabled?: boolean;
-  /** Soft budget in bytes a single image may contribute to a request body. */
-  maxBytesPerImage?: number;
-  /** Soft budget in bytes for the aggregate image payload of one request. */
-  maxTotalBytes?: number;
-}
-
-export interface ImageBudgetCompactionSettings {
-  enabled: boolean;
-  maxBytesPerImage: number;
-  maxTotalBytes: number;
-}
-
 /**
  * Explicit new-context compaction is enabled by default and remains separate
  * from the threshold-triggered automatic summary compaction path.
@@ -145,7 +131,6 @@ export interface SoftCompactionConfigPatch {
   relevance?: RelevanceCompactionConfigPatch;
   crossTurnDedup?: CrossTurnDedupConfigPatch;
   lossless?: LosslessCompactionConfigPatch;
-  imageBudget?: ImageBudgetCompactionConfigPatch;
 }
 
 export interface SoftCompactionSettings {
@@ -162,21 +147,7 @@ export interface SoftCompactionSettings {
   /** Optional for source compatibility; resolved defaults provide this group. */
   crossTurnDedup?: CrossTurnDedupSettings;
   lossless: LosslessCompactionSettings;
-  /** Optional for source compatibility; resolved defaults provide this group. */
-  imageBudget?: ImageBudgetCompactionSettings;
 }
-
-/**
- * Default image byte budgets. These are local guardrails, not provider billing
- * contracts: a single image above `maxBytesPerImage` or an aggregate above
- * `maxTotalBytes` is eligible for budget-driven prune before request sending.
- * They are intentionally aligned below the 16MiB local proxy gateway cap.
- */
-export const DEFAULT_IMAGE_BUDGET: ImageBudgetCompactionSettings = {
-  enabled: true,
-  maxBytesPerImage: 4 * 1024 * 1024,
-  maxTotalBytes: 16 * 1024 * 1024,
-};
 
 /**
  * Balanced soft-layer conditions; equivalent to the historical hardcoded ratios.
@@ -211,7 +182,6 @@ export function createDefaultSoftCompaction(): SoftCompactionSettings {
       minChars: DEFAULT_DEDUP_MIN_CHARS,
     },
     lossless: { enabled: true },
-    imageBudget: { ...DEFAULT_IMAGE_BUDGET },
   };
 }
 
@@ -222,11 +192,20 @@ export interface CompactionConfigPatch {
   keepRecentTokens?: number;
   /** Compaction summary model as `provider/id`; undefined follows the active session model. */
   model?: string;
+  /**
+   * Optional payload byte ceiling for the estimate request body. When set, the
+   * compaction layer evicts the OLDEST eligible messages (oldest-first,
+   * images first among equals) before sending so the body stays under the
+   * limit. Undefined = no ceiling (default). This is an environment
+   * constraint (e.g. a local proxy gateway's 16MiB cap), applied only when
+   * explicitly configured via /maestro-compaction.
+   */
+  payloadLimitBytes?: number;
   soft?: SoftCompactionConfigPatch;
   newContext?: NewContextCompactionConfigPatch;
 }
 
-export const COMPACTION_FIELDS = ["enabled", "reserveTokens", "keepRecentTokens", "model", "newContext"] as const;
+export const COMPACTION_FIELDS = ["enabled", "reserveTokens", "keepRecentTokens", "model", "newContext", "payloadLimitBytes"] as const;
 
 export type CompactionSettingSource = "project" | "user" | "default";
 
@@ -236,6 +215,8 @@ export interface EffectiveCompactionSettings {
   keepRecentTokens: number;
   /** Configured compaction model (`provider/id`); undefined follows the active session model. */
   model?: string;
+  /** Optional payload byte ceiling; undefined = no ceiling (default). */
+  payloadLimitBytes?: number;
   soft: SoftCompactionSettings;
   /** Explicit new-context mode gate; defaults on and never affects automatic compaction. */
   newContext: NewContextCompactionSettings;
@@ -285,6 +266,8 @@ function readRawCompaction(path: string): CompactionConfigPatch {
     const kr = positiveInt(hard?.keepRecentTokens) ?? positiveInt(c.keepRecentTokens);
     if (kr !== undefined) patch.keepRecentTokens = kr;
     if (typeof c.model === "string" && c.model.trim().length > 0) patch.model = c.model.trim();
+    const payloadLimit = positiveNumber(c.payloadLimitBytes);
+    if (payloadLimit !== undefined) patch.payloadLimitBytes = payloadLimit;
     const soft = readRawSoft(c.soft);
     if (soft) patch.soft = soft;
     const newContext = readRawNewContext(c.newContext);
@@ -322,8 +305,6 @@ function readRawSoft(value: unknown): SoftCompactionConfigPatch | undefined {
   if (crossTurnDedup) soft.crossTurnDedup = crossTurnDedup;
   const lossless = readRawLossless(value.lossless);
   if (lossless) soft.lossless = lossless;
-  const imageBudget = readRawImageBudget(value.imageBudget);
-  if (imageBudget) soft.imageBudget = imageBudget;
   return Object.keys(soft).length > 0 ? soft : undefined;
 }
 
@@ -387,17 +368,6 @@ function readRawLossless(value: unknown): LosslessCompactionConfigPatch | undefi
   return Object.keys(lossless).length > 0 ? lossless : undefined;
 }
 
-function readRawImageBudget(value: unknown): ImageBudgetCompactionConfigPatch | undefined {
-  if (!isRecord(value)) return undefined;
-  const imageBudget: ImageBudgetCompactionConfigPatch = {};
-  if (typeof value.enabled === "boolean") imageBudget.enabled = value.enabled;
-  const perImage = positiveInt(value.maxBytesPerImage);
-  if (perImage !== undefined) imageBudget.maxBytesPerImage = perImage;
-  const total = positiveInt(value.maxTotalBytes);
-  if (total !== undefined) imageBudget.maxTotalBytes = total;
-  return Object.keys(imageBudget).length > 0 ? imageBudget : undefined;
-}
-
 function ratioNumber(value: unknown): number | undefined {
   return typeof value === "number" && Number.isFinite(value) && value > 0 && value < 1 ? value : undefined;
 }
@@ -432,12 +402,14 @@ export function resolveEffectiveCompactionSettings(
     model: "default",
     soft: "default",
     newContext: "default",
+    payloadLimitBytes: "default",
   };
 
   let enabled = true;
   let reserveTokens = DEFAULT_RESERVE_TOKENS;
   let keepRecentTokens = DEFAULT_KEEP_RECENT_TOKENS;
   let model: string | undefined;
+  let payloadLimitBytes: number | undefined;
   const soft: SoftCompactionSettings = createDefaultSoftCompaction();
   const newContext: NewContextCompactionSettings = { enabled: DEFAULT_NEW_CONTEXT_ENABLED };
 
@@ -446,6 +418,7 @@ export function resolveEffectiveCompactionSettings(
     if (patch.reserveTokens !== undefined) { reserveTokens = patch.reserveTokens; source.reserveTokens = src; }
     if (patch.keepRecentTokens !== undefined) { keepRecentTokens = patch.keepRecentTokens; source.keepRecentTokens = src; }
     if (patch.model !== undefined) { model = patch.model; source.model = src; }
+    if (patch.payloadLimitBytes !== undefined) { payloadLimitBytes = patch.payloadLimitBytes; source.payloadLimitBytes = src; }
     if (patch.newContext?.enabled !== undefined) {
       newContext.enabled = patch.newContext.enabled;
       source.newContext = src;
@@ -487,21 +460,11 @@ export function resolveEffectiveCompactionSettings(
       if (patch.soft.lossless !== undefined) {
         if (patch.soft.lossless.enabled !== undefined) soft.lossless.enabled = patch.soft.lossless.enabled;
       }
-      if (patch.soft.imageBudget !== undefined) {
-        const imageBudget = soft.imageBudget ?? (soft.imageBudget = { ...DEFAULT_IMAGE_BUDGET });
-        if (patch.soft.imageBudget.enabled !== undefined) imageBudget.enabled = patch.soft.imageBudget.enabled;
-        if (patch.soft.imageBudget.maxBytesPerImage !== undefined) {
-          imageBudget.maxBytesPerImage = patch.soft.imageBudget.maxBytesPerImage;
-        }
-        if (patch.soft.imageBudget.maxTotalBytes !== undefined) {
-          imageBudget.maxTotalBytes = patch.soft.imageBudget.maxTotalBytes;
-        }
-      }
       source.soft = src;
     }
   }
 
-  return { enabled, reserveTokens, keepRecentTokens, model, soft, newContext, source };
+  return { enabled, reserveTokens, keepRecentTokens, model, payloadLimitBytes, soft, newContext, source };
 }
 
 export function validateCompactionPatch(
@@ -525,6 +488,9 @@ export function validateCompactionPatch(
     if (!Number.isSafeInteger(value) || value <= 0) {
       errors.push(`${field} must be a positive safe integer`);
     }
+  }
+  if (patch.payloadLimitBytes !== undefined && !isPositiveFiniteNumber(patch.payloadLimitBytes)) {
+    errors.push(`payloadLimitBytes must be a positive finite number`);
   }
 
   const rt = patch.reserveTokens;
@@ -588,20 +554,6 @@ export function validateCompactionPatch(
     if (soft.crossTurnDedup?.minChars !== undefined && !positiveInt(soft.crossTurnDedup.minChars)) {
       errors.push(`soft.crossTurnDedup.minChars must be a positive safe integer`);
     }
-    if (soft.imageBudget !== undefined) {
-      const imgBudget = soft.imageBudget;
-      for (const field of ["maxBytesPerImage", "maxTotalBytes"] as const) {
-        const value = imgBudget[field];
-        if (value === undefined) continue;
-        if (!isPositiveFiniteNumber(value)) {
-          errors.push(`soft.imageBudget.${field} must be a positive finite number`);
-        }
-      }
-      if (imgBudget.maxBytesPerImage !== undefined && imgBudget.maxTotalBytes !== undefined
-        && imgBudget.maxBytesPerImage >= imgBudget.maxTotalBytes) {
-        errors.push(`soft.imageBudget.maxBytesPerImage must be less than maxTotalBytes`);
-      }
-    }
   }
 
   if (contextWindow === undefined) {
@@ -655,24 +607,14 @@ export function validateEffectiveCompactionSettings(settings: EffectiveCompactio
   if (soft.crossTurnDedup?.minChars !== undefined && !positiveInt(soft.crossTurnDedup.minChars)) {
     errors.push(`soft.crossTurnDedup.minChars must be a positive safe integer`);
   }
-  const imgBudget = soft.imageBudget;
-  if (imgBudget !== undefined) {
-    for (const field of ["maxBytesPerImage", "maxTotalBytes"] as const) {
-      const value = imgBudget[field];
-      if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) {
-        errors.push(`soft.imageBudget.${field} must be a positive finite number`);
-      }
-    }
-    if (imgBudget.maxBytesPerImage !== undefined && imgBudget.maxTotalBytes !== undefined
-      && imgBudget.maxBytesPerImage >= imgBudget.maxTotalBytes) {
-      errors.push(`soft.imageBudget.maxBytesPerImage must be less than maxTotalBytes`);
-    }
-  }
   if (!Number.isSafeInteger(settings.reserveTokens) || settings.reserveTokens <= 0) {
     errors.push(`reserveTokens must be a positive safe integer`);
   }
   if (!Number.isSafeInteger(settings.keepRecentTokens) || settings.keepRecentTokens <= 0) {
     errors.push(`keepRecentTokens must be a positive safe integer`);
+  }
+  if (settings.payloadLimitBytes !== undefined && !isPositiveFiniteNumber(settings.payloadLimitBytes)) {
+    errors.push(`payloadLimitBytes must be a positive finite number`);
   }
   if (settings.model !== undefined && (typeof settings.model !== "string" || !settings.model.includes("/"))) {
     errors.push(`model must be a "provider/id" reference`);

@@ -142,7 +142,7 @@ export const MAX_OFF_BRANCH_PRUNE_BYTES = 128 * 1024;
 
 export type CompactionSettings = Pick<
   EffectiveCompactionSettings,
-  "enabled" | "reserveTokens" | "keepRecentTokens" | "model"
+  "enabled" | "reserveTokens" | "keepRecentTokens" | "model" | "payloadLimitBytes"
 > & { soft?: EffectiveCompactionSettings["soft"] };
 
 export interface ContextEstimate {
@@ -174,7 +174,7 @@ export interface PruneManifestEntry {
   refCallId?: string;
 }
 
-export type PruneLevel = "pruned" | "spill" | "minimal" | "lossless" | "dedup" | "image";
+export type PruneLevel = "pruned" | "spill" | "minimal" | "lossless" | "dedup" | "payload";
 
 interface PersistedPruneEntry {
   callId: string;
@@ -227,16 +227,12 @@ export interface ContextSignals {
   /** Fraction of estimated tokens occupied by stale duplicate tool outputs. */
   redundantFraction?: number;
   cacheHitRatio: number | undefined;
-  /** UTF-8 bytes of all image payloads in the current context. */
-  imageBytes?: number;
-  /** Number of image blocks in the current context. */
-  imageCount?: number;
-  /** Bytes of the single largest image payload in the current context. */
-  largestImageBytes?: number;
-  /** Effective aggregate image byte budget. */
-  imageBudgetBytes?: number;
-  /** True when imageBytes or largestImageBytes exceeds its budget. */
-  imageBudgetExceeded?: boolean;
+  /** Estimated request-body bytes of the current context (text + base64). */
+  payloadBytes?: number;
+  /** Effective payload ceiling; present when a limit is configured. */
+  payloadLimitBytes?: number;
+  /** True when payloadBytes exceeds the configured ceiling. */
+  payloadLimitExceeded?: boolean;
 }
 
 export interface VelocitySample {
@@ -2941,21 +2937,19 @@ export function applyContextPressurePolicy(
   }
 
   if (!settings.enabled || (!compactionPending && !initiallyCritical && !velocityEscalate && (!soft.enabled || initial < nudgeTokens))) {
-    // Image byte budget runs independently of token pressure: a session with
+    // Payload byte limit runs independently of token pressure: a session with
     // huge screenshots can sit far below the token nudge band while its base64
-    // payload would already trip a local proxy cap. Only record prunes here if
-    // the budget is actually exceeded AND there are eligible images to drop.
-    if (settings.enabled && soft.imageBudget?.enabled) {
-      const measured = measureImageBytes(messages);
-      const budget = soft.imageBudget;
-      const overBudget = measured.imageBytes > budget.maxTotalBytes
-        || (measured.imageCount > 0 && measured.largestImageBytes > budget.maxBytesPerImage);
-      if (overBudget) {
-        // Unlike token-driven pruning, the image byte budget is a transport
-        // guardrail: screenshots that just entered the window are exactly what
-        // accumulates to 16MiB and must be discarded even though they are
-        // inside keepRecentTokens. The hard protection boundary is the current
-        // user message (its images and everything after it are never touched).
+    // payload would already trip a local proxy cap. This is an explicit,
+    // opt-in ceiling — undefined means no ceiling (default). When it is set,
+    // reclaim bytes oldest-first (images first among equals) until the
+    // estimated body fits.
+    if (settings.enabled && settings.payloadLimitBytes !== undefined) {
+      const limitBytes = settings.payloadLimitBytes;
+      const initialBytes = estimatePayloadBytes(messages);
+      if (initialBytes > limitBytes) {
+        // The hard protection boundary is the current user message: its
+        // images and everything after it are the live instruction and are
+        // never touched.
         let lastUserIndex = -1;
         for (let index = messages.length - 1; index >= 0; index--) {
           if ((messages[index] as MessageRecord).role === "user") {
@@ -2964,17 +2958,17 @@ export function applyContextPressurePolicy(
           }
         }
         const frontGuard = lastUserIndex >= 0 ? lastUserIndex : 0;
-        const imageResult = runImageBudgetPrune({
+        const payloadResult = runPayloadLimitPrune({
           messages,
           pruneManifest,
           frontierStart: frontGuard,
-          budget: { enabled: true, maxBytesPerImage: budget.maxBytesPerImage, maxTotalBytes: budget.maxTotalBytes },
+          limitBytes,
         });
-        if (imageResult.pruned) {
-          transformed = imageResult.transformed;
-          prunedToolResults += imageResult.replaced;
-          savedTokens += imageResult.savedTokens;
-          const reason = `image-bytes:${(measured.imageBytes / (1024 * 1024)).toFixed(1)}MB`;
+        if (payloadResult.pruned) {
+          transformed = payloadResult.transformed;
+          prunedToolResults += payloadResult.replaced;
+          savedTokens += payloadResult.savedTokens;
+          const reason = `payload-bytes:${(initialBytes / (1024 * 1024)).toFixed(1)}MB>${(limitBytes / (1024 * 1024)).toFixed(1)}MB`;
           return {
             messages: transformed,
             band: "normal",
@@ -3275,7 +3269,7 @@ function getRecordedPrune(manifest: PruneManifest, callId: string): PruneManifes
 
 function isPruneLevel(value: unknown): value is PruneLevel {
   return value === "pruned" || value === "spill" || value === "minimal" || value === "lossless" || value === "dedup"
-    || value === "image";
+    || value === "payload";
 }
 
 /**
@@ -3313,12 +3307,11 @@ function restorePruneReplacement(message: AgentMessage, persisted: PersistedPrun
     if (!persisted.spillPath) return undefined;
     return minimalSpillReplacement(message, persisted.spillPath);
   }
-  if (persisted.level === "image") {
+  if (persisted.level === "payload") {
     // Image replacement is deterministic (imagePruneReplacement); availability
     // of the original does not change the text. Recompute is recovery.
     return imagePruneReplacement(message);
-  }
-  // hydrateRestoredPrunes validates spill liveness and downgrades dead paths
+  }  // hydrateRestoredPrunes validates spill liveness and downgrades dead paths
   // to level "pruned" before reaching here, so a persisted spill entry with no
   // path (cleaned tmpdir, failed write persisted by an older build) degrades
   // to the plain placeholder rather than the pathless spill text, which would
@@ -4210,43 +4203,6 @@ function finiteNumber(value: unknown): number | undefined {
  */
 const messageTokenMemo = new WeakMap<object, number>();
 
-/**
- * Byte accounting for image payloads, deliberately separate from token
- * estimation: a 3.2MB base64 screenshot costs ~34800 tokens via the fixed
- * per-image estimator, yet occupies 3.2MB on the wire and can trip a local
- * 16MiB proxy gateway cap long before token pressure ever prunes it. This
- * measurement feeds the independent image-byte budget.
- *
- * Only image blocks with a string `data` field are counted; missing or
- * non-string data contributes 0 bytes (the token estimator still floors at
- * the per-image minimum). The returned object is stable and allocation-free
- * for the common no-image case.
- */
-export function measureImageBytes(messages: AgentMessage[]): {
-  imageBytes: number;
-  imageCount: number;
-  largestImageBytes: number;
-} {
-  let imageBytes = 0;
-  let imageCount = 0;
-  let largestImageBytes = 0;
-  for (const message of messages) {
-    const content = (message as MessageRecord).content;
-    if (!Array.isArray(content)) continue;
-    for (const block of content) {
-      if (!block || typeof block !== "object") continue;
-      if ((block as { type?: unknown }).type !== "image") continue;
-      const data = (block as { data?: unknown }).data;
-      if (typeof data !== "string") continue;
-      const bytes = Buffer.byteLength(data, "utf8");
-      imageBytes += bytes;
-      imageCount++;
-      if (bytes > largestImageBytes) largestImageBytes = bytes;
-    }
-  }
-  return { imageBytes, imageCount, largestImageBytes };
-}
-
 export function estimateMessageTokens(message: AgentMessage): number {
   const key = message as unknown as object;
   const memoized = messageTokenMemo.get(key);
@@ -4303,8 +4259,8 @@ export function estimateMessageTokens(message: AgentMessage): number {
  * image is floored independently so a small thumbnail in a mixed message is
  * never subsidized by a large screenshot. The estimate grows monotonically
  * with decoded bytes; transport-body limits (e.g. a 16MiB proxy cap) are an
- * external constraint carried by `imageBudget`, NOT by this estimator — no
- * hard cap is baked in here.
+ * external constraint carried by `payloadLimitBytes`, NOT by this estimator —
+ * no hard cap is baked in here.
  *
  * This is a *pressure estimate*, not a provider billing contract.
  */
@@ -4905,6 +4861,15 @@ export function pruneToolResult(message: AgentMessage): AgentMessage | undefined
  * Purely derived from stable message fields, so recomputing it for a restored
  * prune (imagePruneReplacement) yields byte-identical placeholder text.
  */
+/**
+ * Deterministic replacement for a message whose image blocks are evicted by
+ * the payload limit. Text blocks and metadata survive; each image block is
+ * replaced with a structured marker carrying mime and byte size so the model
+ * still knows an image was present and roughly how heavy it was.
+ *
+ * Purely derived from stable message fields, so recomputing it for a restored
+ * prune yields byte-identical placeholder text.
+ */
 export function imagePruneReplacement(message: AgentMessage): AgentMessage | undefined {
   const record = message as MessageRecord;
   const content = record.content;
@@ -4922,7 +4887,7 @@ export function imagePruneReplacement(message: AgentMessage): AgentMessage | und
         : "image";
       replaced.push({
         type: "text",
-        text: `[image:${mime} (${bytes}B, pruned by image byte budget)]`,
+        text: `[image:${mime} (${bytes}B, evicted by payload limit)]`,
       });
     } else {
       replaced.push({ ...block });
@@ -4946,8 +4911,42 @@ export function imageBytesOfMessage(message: AgentMessage): number {
   return total;
 }
 
-/** Result of the image-budget prune pass. */
-export interface ImageBudgetPruneResult {
+/**
+ * Estimated UTF-8 byte size of the request body a message array would produce.
+ *
+ * This is byte accounting, deliberately separate from token estimation: an
+ * image costs a bounded number of tokens but its base64 occupies bytes on the
+ * wire and can trip a transport cap long before token pressure matters. The
+ * estimate serializes without image data duplication and adds the base64
+ * payloads back in, so it stays linear and cheap.
+ */
+export function estimatePayloadBytes(messages: AgentMessage[]): number {
+  let total = 0;
+  for (const message of messages) {
+    const content = (message as MessageRecord).content;
+    if (!Array.isArray(content)) {
+      total += Buffer.byteLength(JSON.stringify(message), "utf8");
+      continue;
+    }
+    const lightweight: Array<Record<string, unknown>> = [];
+    for (const block of content) {
+      if (!block || typeof block !== "object") continue;
+      if (block.type === "image") {
+        const data = block.data;
+        const bytes = typeof data === "string" ? Buffer.byteLength(data, "utf8") : 0;
+        lightweight.push({ type: "image", mimeType: block.mimeType });
+        total += bytes;
+      } else {
+        lightweight.push({ ...block });
+      }
+    }
+    total += Buffer.byteLength(JSON.stringify(lightweight), "utf8");
+  }
+  return total;
+}
+
+/** Result of the payload-limit prune pass. */
+export interface PayloadLimitPruneResult {
   pruned: boolean;
   replaced: number;
   savedTokens: number;
@@ -4959,30 +4958,29 @@ export interface ImageBudgetPruneResult {
 }
 
 /**
- * Byte-budget driven prune pass for historical, discardable image payloads.
+ * Payload-limit driven prune pass.
  *
- * Runs independently of token pressure: a screenshot-heavy session can sit at
- * 5% token fullness yet accumulate 13MB of base64 that would trip a local
- * 16MiB proxy gateway cap before token-based pruning ever engaged. This pass
- * reclaims bytes from the OLDEST eligible tool-result images until the image
- * byte budget (per-image and aggregate) is satisfied, and reports reclaimed
- * tokens as well so the caller can still account for pressure relief.
+ * Runs independently of token pressure and reclaims bytes OLDEST-FIRST: the
+ * earliest eligible message is reduced first (image blocks replaced with a
+ * metadata marker, large text outputs folded to a replayable/evictable
+ * placeholder), then the next, until the estimated request body drops below
+ * the configured ceiling. Later, more likely relevant context therefore
+ * survives longest.
  *
- * Eligibility matches the other lossy passes: toolResult messages that are not
- * errors, not protected control outputs, and contain at least one image block.
- * Recent messages (>= frontierStart) and protected call IDs (dedup pointers)
- * are never touched. Selection is oldest-first so newer, more likely relevant
- * screenshots survive.
+ * Eligibility: toolResult messages that are not errors, not protected control
+ * outputs, and not claimed by the manifest. The current user message (and
+ * everything after it) is never touched — it is the live instruction, not
+ * history.
  */
-export function runImageBudgetPrune(input: {
+export function runPayloadLimitPrune(input: {
   messages: AgentMessage[];
   pruneManifest: PruneManifest;
   frontierStart: number;
   protectedCallIds?: ReadonlySet<string>;
-  budget: { enabled: boolean; maxBytesPerImage: number; maxTotalBytes: number };
-}): ImageBudgetPruneResult {
-  const { messages, pruneManifest, frontierStart, protectedCallIds, budget } = input;
-  const empty: ImageBudgetPruneResult = {
+  limitBytes: number;
+}): PayloadLimitPruneResult {
+  const { messages, pruneManifest, frontierStart, protectedCallIds, limitBytes } = input;
+  const empty: PayloadLimitPruneResult = {
     pruned: false,
     replaced: 0,
     savedTokens: 0,
@@ -4991,33 +4989,33 @@ export function runImageBudgetPrune(input: {
     candidates: [],
     transformed: messages,
   };
-  if (!budget.enabled || budget.maxTotalBytes <= 0 || budget.maxBytesPerImage <= 0) return empty;
+  if (!Number.isFinite(limitBytes) || limitBytes <= 0) return empty;
+  const initialBytes = estimatePayloadBytes(messages);
+  if (initialBytes <= limitBytes) return empty;
+
   const claimed = new Set(pruneManifest.keys());
-  // Oldest -> newest eligible image-bearing tool results.
+  // Oldest -> newest eligible reductions.
   const eligible: Array<{ index: number; callId: string; byteCount: number; replacement: AgentMessage; candidate: PruneCandidate }> = [];
-  let totalBytes = 0;
   for (let index = 0; index < frontierStart; index++) {
     const message = messages[index];
     const callId = toolResultCallId(message);
-    if (!callId || claimed.has(callId)) continue;
-    if (protectedCallIds?.has(callId)) continue;
+    if (!callId || claimed.has(callId) || protectedCallIds?.has(callId)) continue;
     const record = message as MessageRecord;
     if (record.isError === true
       || (typeof record.toolName === "string" && PROTECTED_TOOL_NAMES.has(record.toolName.toLowerCase()))) {
       continue;
     }
-    const byteCount = imageBytesOfMessage(message);
-    if (byteCount <= 0) continue;
     const before = estimateMessageTokens(message);
-    const replacement = imagePruneReplacement(message);
+    // Prefer image eviction (largest byte win per message); otherwise fall back
+    // to the existing replayable/bulk tool-result placeholder for large text.
+    const replacement = imagePruneReplacement(message) ?? pruneToolResult(message);
     if (!replacement) continue;
     const after = estimateMessageTokens(replacement);
     if (after >= before) continue;
-    totalBytes += byteCount;
     eligible.push({
       index,
       callId,
-      byteCount,
+      byteCount: estimatePayloadBytes([message]),
       replacement,
       candidate: {
         index,
@@ -5025,48 +5023,39 @@ export function runImageBudgetPrune(input: {
         replacement,
         saved: before - after,
         contentDigest: toolResultDigest(message),
-        level: "image" as PruneLevel,
+        level: "payload" as PruneLevel,
         toolName: typeof record.toolName === "string" ? record.toolName : "tool",
         relevanceText: "",
       },
     });
   }
+  if (eligible.length === 0) return empty;
 
-  let maxSingle = 0;
-  let totalAfter = 0;
-  const perImage = eligible.map((e) => e.byteCount);
-  maxSingle = perImage.length > 0 ? Math.max(...perImage) : 0;
-  totalAfter = totalBytes;
-  if (totalAfter <= budget.maxTotalBytes && maxSingle <= budget.maxBytesPerImage) return empty;
-
-  // Apply oldest-first until both budgets hold.
+  // Apply oldest-first until the estimated payload fits the ceiling.
   const transformed = [...messages];
+  let remainingBytes = initialBytes;
   let reclaimedBytes = 0;
   let reclaimedTokens = 0;
   let applied = 0;
   const appliedCandidates: PruneCandidate[] = [];
   for (const entry of eligible) {
-    totalAfter -= entry.byteCount;
-    const remainingSingle = eligible
-      .slice(applied + 1)
-      .reduce((max, e) => e.byteCount > max ? e.byteCount : max, 0);
-    const stillOver = totalAfter > budget.maxTotalBytes || remainingSingle > budget.maxBytesPerImage;
     transformed[entry.index] = entry.replacement;
     recordPrune(pruneManifest, entry.callId, {
       replacement: entry.replacement,
       savedTokens: entry.candidate.saved,
       introducedAtUsageEpoch: undefined,
       contentDigest: entry.candidate.contentDigest,
-      level: "image" as PruneLevel,
+      level: "payload" as PruneLevel,
     });
+    remainingBytes -= entry.byteCount;
     reclaimedBytes += entry.byteCount;
     reclaimedTokens += entry.candidate.saved;
     applied++;
     appliedCandidates.push(entry.candidate);
-    if (!stillOver) break;
+    if (remainingBytes <= limitBytes) break;
   }
   return {
-    pruned: true,
+    pruned: applied > 0,
     replaced: applied,
     savedTokens: reclaimedTokens,
     savedBytes: reclaimedBytes,
