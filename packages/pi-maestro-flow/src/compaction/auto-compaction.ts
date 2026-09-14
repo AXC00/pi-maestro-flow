@@ -2982,6 +2982,25 @@ export function applyContextPressurePolicy(
             velocity,
           } as ContextPressureResult;
         }
+        // The payload is over the ceiling but nothing reclaimable exists
+        // before the protected current user message — every oversized image
+        // lives in the live instruction itself. Pruning cannot help here:
+        // instead trigger a full compaction (like a manual /compact), which
+        // summarizes the current instruction (including its embedded images)
+        // so the next request fits the payload limit. This is the escape
+        // hatch for the 'protected boundary' case.
+        return {
+          messages: transformed,
+          band: "normal",
+          estimatedTokens: initial,
+          thresholdTokens,
+          prunedToolResults,
+          savedTokens,
+          action: "compact",
+          reasons: [`payload-protected:${(initialBytes / (1024 * 1024)).toFixed(1)}MB`],
+          velocityTracker: nextTracker,
+          velocity,
+        } as ContextPressureResult;
       }
     }
     return pressureResult({ messages: transformed, band: "normal", estimatedTokens: initial, contextWindow, thresholdTokens, prunedToolResults, savedTokens, velocityTracker: nextTracker, velocity });

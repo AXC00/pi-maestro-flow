@@ -132,6 +132,27 @@ test("runPayloadLimitPrune skips already-claimed messages (no double-record)", (
   assert.ok(!second.pruned, "claimed call ID skipped");
 });
 
+test("applyContextPressurePolicy returns action compact when oversize is only in protected current user message", () => {
+  const huge = "A".repeat(50_000_000);
+  const messages = [
+    { role: "user", content: [imageBlock(huge)], timestamp: Date.now() }, // protected
+  ] as never;
+  const result = applyContextPressurePolicy(
+    messages,
+    1_000_000,
+    {
+      enabled: true,
+      reserveTokens: 10_000,
+      keepRecentTokens: 10_000,
+      payloadLimitBytes: 16 * 1024 * 1024,
+      soft: { enabled: true, nudgeRatio: 0.7, pruneRatio: 0.8, pruneTargetRatio: 0.7 },
+    },
+  );
+  assert.equal(result.prunedToolResults, 0, "nothing reclaimable before protected boundary");
+  assert.equal(result.action, "compact", "payload-protected oversize triggers compaction-like action");
+  assert.ok(result.reasons.some((r) => r.startsWith("payload-protected:")), `reasons ${result.reasons}`);
+});
+
 // --- applyContextPressurePolicy integration ---
 
 test("applyContextPressurePolicy prunes at normal token pressure when payloadLimitBytes exceeded", () => {

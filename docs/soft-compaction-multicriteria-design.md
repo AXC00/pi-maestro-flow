@@ -208,6 +208,10 @@ band=normal 也能为超限 payload 发出信号，且**从历史最旧开始逐
 - **保护边界 = 当前 user 消息**（含其图片）及之后内容；不采用 `keepRecentTokens`——刚读入的截图正是
   需要回收的对象。（`keepRecentTokens` 属 token 语义，字节护栏必须独立。）
 - 顺序：**最旧优先**（不受内容类型影响，旧图片/旧大输出一视同仁）。
+- **保护边界 = 当前 user 消息，且当超限全在保护区内时触发压缩**：若无可回收内容（所有超限字节都
+  在当前 user 消息里——例如刚贴的一张巨图），裁剪无法帮忙，policy 返回 `action:"compact"`（类似
+  手动 `/compact`），让摘要压缩把当前指令（含内嵌图片）折叠为占位，从而下次请求体低于上限。
+  这是“不删当前指令”与“不撞墙”之间的逃逸阀。
 - 记录：manifest 新增 `level: "payload"`，persist/restore 支持（`restorePruneReplacement` 按确定性
   replacement 重建字节一致的占位；旧 manifest 无该 level 时安全回退）。
 - 重复评估：候选被 claim，不会二次替换。
