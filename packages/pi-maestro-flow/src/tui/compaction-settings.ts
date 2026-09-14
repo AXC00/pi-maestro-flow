@@ -109,6 +109,7 @@ const CATALOGS = {
     "value.inheritPrefix": "Inherited from",
     "value.unconfigured": "Unconfigured, follows the current session model",
     "value.followSession": "Follow session model",
+    "value.unlimited": "Unlimited (off)",
     "value.reservePrefix": "Reserve",
     "editor.title": "Edit",
     "editor.current": "Current value",
@@ -265,6 +266,7 @@ const CATALOGS = {
     "value.inheritPrefix": "继承自",
     "value.unconfigured": "未配置，跟随当前会话模型",
     "value.followSession": "跟随会话模型",
+    "value.unlimited": "无上限（未启用）",
     "value.reservePrefix": "预留",
     "editor.title": "修改",
     "editor.current": "当前值",
@@ -1028,6 +1030,11 @@ export class CompactionSettingsOverlay implements Component, Focusable {
       return effective.soft[SOFT_MECHANISM_KEYS[item]]?.enabled === true ? this.t("value.on") : this.t("value.off");
     }
     if (item === "compactModel") return effective.model ?? this.t("value.followSession");
+    if (item === "payloadLimitBytes") {
+      return effective.payloadLimitBytes === undefined
+        ? this.t("value.unlimited")
+        : `${formatNumber(effective.payloadLimitBytes)} ${this.t("editor.bytes")}`;
+    }
     if (item === "threshold") {
       const model = this.linkedThreshold();
       return model.usable
