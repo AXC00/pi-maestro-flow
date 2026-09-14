@@ -2917,6 +2917,75 @@ export function applyContextPressurePolicy(
   // later provider response establishes a new usage epoch.
   const initial = Math.max(0, estimateContextTokens(transformed).tokens - applied.pendingSavedTokens);
   const soft = settings.soft ?? DEFAULT_SOFT_COMPACTION;
+
+  // Payload byte limit runs independently of token pressure — a session can
+  // sit far below the token nudge band while its base64 payload already trips
+  // a transport cap. When configured (opt-in; undefined = no ceiling), check
+  // it FIRST so any token-pressure path (low or high) honors the byte budget:
+  // reclaim oldest-first, and if nothing reclaimable exists (all oversize in
+  // the protected current user message) escalate to a full compaction instead
+  // of letting the request hit the wire.
+  if (settings.enabled && settings.payloadLimitBytes !== undefined && !compactionPending) {
+    const limitBytes = settings.payloadLimitBytes;
+    const initialBytes = estimatePayloadBytes(transformed);
+    if (initialBytes > limitBytes) {
+      // The hard protection boundary is the current user message: its
+      // images and everything after it are the live instruction and are
+      // never touched.
+      let lastUserIndex = -1;
+      for (let index = transformed.length - 1; index >= 0; index--) {
+        if ((transformed[index] as MessageRecord).role === "user") {
+          lastUserIndex = index;
+          break;
+        }
+      }
+      const frontGuard = lastUserIndex >= 0 ? lastUserIndex : 0;
+      const payloadResult = runPayloadLimitPrune({
+        messages: transformed,
+        pruneManifest,
+        frontierStart: frontGuard,
+        limitBytes,
+      });
+      const noVelocity: VelocityInfo = { slope: undefined, robustGrowth: false, epochsToCritical: undefined };
+      if (payloadResult.pruned) {
+        transformed = payloadResult.transformed;
+        prunedToolResults += payloadResult.replaced;
+        savedTokens += payloadResult.savedTokens;
+        const reason = `payload-bytes:${(initialBytes / (1024 * 1024)).toFixed(1)}MB>${(limitBytes / (1024 * 1024)).toFixed(1)}MB`;
+        const band: ContextPressureBand = "normal";
+        const estimate = Math.max(0, estimateContextTokens(transformed).tokens);
+        return {
+          messages: transformed,
+          band,
+          estimatedTokens: estimate,
+          thresholdTokens,
+          prunedToolResults,
+          savedTokens,
+          action: "none",
+          reasons: [reason],
+          velocityTracker: EMPTY_VELOCITY_TRACKER,
+          velocity: noVelocity,
+        } as ContextPressureResult;
+      }
+      // Nothing reclaimable before the protected boundary: every oversized
+      // image lives inside the live user instruction. Pruning cannot help;
+      // trigger a full compaction (like a manual /compact) so the summarizer
+      // folds the current instruction and the next request fits the limit.
+      return {
+        messages: transformed,
+        band: "normal",
+        estimatedTokens: initial,
+        thresholdTokens,
+        prunedToolResults,
+        savedTokens,
+        action: "compact",
+        reasons: [`payload-protected:${(initialBytes / (1024 * 1024)).toFixed(1)}MB`],
+        velocityTracker: EMPTY_VELOCITY_TRACKER,
+        velocity: noVelocity,
+      } as ContextPressureResult;
+    }
+  }
+
   const criticalRatio = thresholdTokens / contextWindow;
   const initialRatio = initial / contextWindow;
   const initiallyCritical = initial > thresholdTokens;
@@ -2937,72 +3006,6 @@ export function applyContextPressurePolicy(
   }
 
   if (!settings.enabled || (!compactionPending && !initiallyCritical && !velocityEscalate && (!soft.enabled || initial < nudgeTokens))) {
-    // Payload byte limit runs independently of token pressure: a session with
-    // huge screenshots can sit far below the token nudge band while its base64
-    // payload would already trip a local proxy cap. This is an explicit,
-    // opt-in ceiling — undefined means no ceiling (default). When it is set,
-    // reclaim bytes oldest-first (images first among equals) until the
-    // estimated body fits.
-    if (settings.enabled && settings.payloadLimitBytes !== undefined) {
-      const limitBytes = settings.payloadLimitBytes;
-      const initialBytes = estimatePayloadBytes(messages);
-      if (initialBytes > limitBytes) {
-        // The hard protection boundary is the current user message: its
-        // images and everything after it are the live instruction and are
-        // never touched.
-        let lastUserIndex = -1;
-        for (let index = messages.length - 1; index >= 0; index--) {
-          if ((messages[index] as MessageRecord).role === "user") {
-            lastUserIndex = index;
-            break;
-          }
-        }
-        const frontGuard = lastUserIndex >= 0 ? lastUserIndex : 0;
-        const payloadResult = runPayloadLimitPrune({
-          messages,
-          pruneManifest,
-          frontierStart: frontGuard,
-          limitBytes,
-        });
-        if (payloadResult.pruned) {
-          transformed = payloadResult.transformed;
-          prunedToolResults += payloadResult.replaced;
-          savedTokens += payloadResult.savedTokens;
-          const reason = `payload-bytes:${(initialBytes / (1024 * 1024)).toFixed(1)}MB>${(limitBytes / (1024 * 1024)).toFixed(1)}MB`;
-          return {
-            messages: transformed,
-            band: "normal",
-            estimatedTokens: initial,
-            thresholdTokens,
-            prunedToolResults,
-            savedTokens,
-            action: "none",
-            reasons: [reason],
-            velocityTracker: nextTracker,
-            velocity,
-          } as ContextPressureResult;
-        }
-        // The payload is over the ceiling but nothing reclaimable exists
-        // before the protected current user message — every oversized image
-        // lives in the live instruction itself. Pruning cannot help here:
-        // instead trigger a full compaction (like a manual /compact), which
-        // summarizes the current instruction (including its embedded images)
-        // so the next request fits the payload limit. This is the escape
-        // hatch for the 'protected boundary' case.
-        return {
-          messages: transformed,
-          band: "normal",
-          estimatedTokens: initial,
-          thresholdTokens,
-          prunedToolResults,
-          savedTokens,
-          action: "compact",
-          reasons: [`payload-protected:${(initialBytes / (1024 * 1024)).toFixed(1)}MB`],
-          velocityTracker: nextTracker,
-          velocity,
-        } as ContextPressureResult;
-      }
-    }
     return pressureResult({ messages: transformed, band: "normal", estimatedTokens: initial, contextWindow, thresholdTokens, prunedToolResults, savedTokens, velocityTracker: nextTracker, velocity });
   }
   if (!compactionPending && soft.enabled && !initiallyCritical && !velocityEscalate && initial < pruneTokens) {
