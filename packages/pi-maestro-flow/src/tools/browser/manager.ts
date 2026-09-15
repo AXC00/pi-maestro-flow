@@ -3,7 +3,7 @@ import { createHash } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import type { Browser, CDPSession, CookieParam, ElementHandle, Frame, HTTPRequest, HTTPResponse, KeyInput, Page, Target, WaitForOptions } from "puppeteer-core";
+import type { Browser, CDPSession, CookieParam, Dialog, ElementHandle, Frame, HTTPRequest, HTTPResponse, KeyInput, Page, Target, WaitForOptions } from "puppeteer-core";
 import puppeteer from "puppeteer-core";
 import { PROBE_JS, FIND_LISTS_JS, foldListsJs, monitorStartJs, MONITOR_STOP_JS, optimizeHtmlForTokens, smartTruncate, diffHtml, type HtmlDiff } from "./simplify.ts";
 import { STEALTH_INIT_JS, STEALTH_LAUNCH_ARGS } from "./stealth.ts";
@@ -169,6 +169,31 @@ export interface BrowserManagerLike {
 type GenericPageHandler = (...args: never[]) => unknown;
 type PageEventType = string | symbol;
 
+export async function settleBrowserDialog(
+  dialog: Pick<Dialog, "accept" | "dismiss">,
+  policy: NonNullable<BrowserOpenOptions["dialogs"]>,
+  reportError: (error: unknown) => void = reportBrowserDialogError,
+): Promise<void> {
+  try {
+    if (policy === "accept") await dialog.accept();
+    else await dialog.dismiss();
+  } catch (error) {
+    if (isMissingBrowserDialogError(error)) return;
+    reportError(error);
+  }
+}
+
+function isMissingBrowserDialogError(error: unknown): boolean {
+  return error instanceof Error
+    && error.message.includes("Page.handleJavaScriptDialog")
+    && /No dialog is showing/i.test(error.message);
+}
+
+function reportBrowserDialogError(error: unknown): void {
+  const reason = error instanceof Error ? `${error.name}: ${error.message}` : String(error);
+  console.warn(`[pi-maestro-flow] browser dialog handling failed: ${reason}`);
+}
+
 interface RequestListenerScope {
   cleanup(): void;
 }
@@ -190,7 +215,7 @@ interface PuppeteerEntry extends BaseEntry {
   owned: boolean;
   ownedPage: boolean;
   profileDir?: string;
-  dialogHandler?: (dialog: import("puppeteer-core").Dialog) => Promise<void>;
+  dialogHandler?: (dialog: Dialog) => void;
   requestScope?: RequestListenerScope;
   elementSelectors: Map<number, string>;
   cdpSession?: CDPSession;
@@ -822,8 +847,9 @@ export class BrowserManager implements BrowserManagerLike {
       });
     }
     if (entry.dialogHandler) entry.page.off("dialog", entry.dialogHandler);
-    entry.dialogHandler = options.dialogs
-      ? async (dialog) => { if (options.dialogs === "accept") await dialog.accept(); else await dialog.dismiss(); }
+    const dialogPolicy = options.dialogs;
+    entry.dialogHandler = dialogPolicy
+      ? (dialog) => { void settleBrowserDialog(dialog, dialogPolicy); }
       : undefined;
     if (entry.dialogHandler) entry.page.on("dialog", entry.dialogHandler);
     if (options.url) {
@@ -2252,6 +2278,14 @@ const RUN_PARAM_NAMES = RUN_HELPER_NAMES.map((name) => `__pi_${name}`);
 // yields undefined rather than a boolean. Unmatched errors pass through untouched.
 export function browserRunErrorHint(error: unknown): unknown {
   if (!(error instanceof Error)) return error;
+  if (/^Browser operation timed out after \d+ms\.$/.test(error.message)) {
+    error.message +=
+      "\nBrowser run hint: timeout is the total wall-clock budget for the entire run, not a per-step allowance. " +
+      "Keep the sum of worst-case waits and polling below it with headroom, split long serial cases into separate runs, " +
+      "and wait on stable semantic state instead of incidental exact counts or toast text. " +
+      "Managed/profile/CDP timeouts close the named tab to stop still-running code, so reopen it before retrying.";
+    return error;
+  }
   if (error.name === "ReferenceError") {
     const match = error.message.match(/^([A-Za-z_$][\w$]*) is not defined/);
     if (match) {

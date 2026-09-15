@@ -1,6 +1,6 @@
 import type { AgentToolResult } from "@earendil-works/pi-agent-core";
 import { Text } from "@earendil-works/pi-tui";
-import { toolCallLine, toolResultLine, resultSummary } from "../quiet-render.ts";
+import { toolCallLine, toolResultLine, resultSummary } from "pi-cockpit/src/quiet-tools.ts";
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import {
@@ -61,7 +61,7 @@ export const BrowserParams = Type.Object({
   code: Type.Optional(Type.String({ minLength: 1, description: "Async JavaScript for run, or the six-digit confirmation code for pair" })),
   request_id: Type.Optional(Type.String({ minLength: 1, description: "Pending pairing requestId returned by browser status; required for pair" })),
   topic: Type.Optional(Type.String({ description: "SOP document id for action=guide (see registry index): core | captcha-strategies | automation-antipatterns; omit to list available documents" })),
-  timeout: Type.Optional(Type.Number({ minimum: 1, maximum: 300, description: "Timeout in seconds" })),
+  timeout: Type.Optional(Type.Number({ minimum: 1, maximum: 300, description: "Total wall-clock timeout in seconds for the entire open/run operation" })),
   all: Type.Optional(Type.Boolean({ description: "Close all named tabs" })),
   kill: Type.Optional(Type.Boolean({ description: "Deprecated alias for close; owned browsers are always closed regardless of this flag" })),
 }, {
@@ -109,6 +109,7 @@ export function createBrowserTool(manager: BrowserManagerLike = browserManager):
       "Match the helper to the target: DOM elements → tab.observe()/tab.click()/tab.fill(); canvas / non-DOM / hover-dependent components → tab.cdpClick(x,y); open Shadow DOM → tab.pierce(selector) then tab.cdpClick; cross-origin iframe → tab.evalInFrame(matcher, fn); file upload → tab.uploadFile(selector, paths) or tab.cdp('DOM.setFileInputFiles') for transient inputs; raw CDP domain → tab.cdp(method, params).",
       "Use action:status for live bridge state. By default it starts the optional server in 19222..19231 and reports pendingPairings, authenticatedConnected, drainingCommands, extension tabCount, and named-tab capabilities. Match a pending requestId/code with the popup and approve it with action:pair; pairing only delivers credentials, and the historical verified marker is written after challenge-response reconnect authenticates. PI_BROWSER_BRIDGE_PORT changes the server anchor, but an empty extension cannot read that environment variable, so a custom anchor must also be entered under popup Advanced settings. Caller timeout does not force-stop already-running page JavaScript; lifecycle ownership remains draining until a real terminal.",
       "Call browser open before run, and reuse a stable tab name across related steps.",
+      "Treat timeout as one total wall-clock budget for the whole run, not a per-step allowance. Keep the sum of worst-case waits and polling below it with headroom; run one long case per invocation and split navigation, upload, submit, and terminal polling when needed. Wait on stable semantic state rather than incidental exact counts or toast text. A managed/profile/CDP run that exhausts its outer timeout closes the named tab to stop still-running code, so reopen it before retrying.",
       "Managed/profile/cdp run code receives page (puppeteer-core Page), browser (puppeteer Browser), and tab (high-level helper). Extension entries receive only the limited adapter capabilities listed in the tool description; unsupported properties fail closed.",
       "Top-level const/let/class/function in run code are scoped safely: you may declare any name, even wait, page, assert, display, etc., without a redeclaration error (a reused name shadows that helper inside your code).",
       "page.evaluate()/tab.evaluate() callbacks run in the browser page context, where Node-side variables from your run code are NOT visible. Pass them explicitly: await tab.evaluate((v) => …, v), or compute values inside the callback. tab.click()/type()/fill() return undefined, not a boolean — test existence with tab.observe(), tab.waitFor(), or page.$",

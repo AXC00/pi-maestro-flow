@@ -5,7 +5,7 @@ import * as fs from "node:fs/promises";
 import * as http from "node:http";
 import * as path from "node:path";
 import { BrowserParams, createBrowserTool } from "../src/tools/browser-tool.ts";
-import { BrowserManager, browserRunErrorHint, canonicalizeBrowserOpenOptions, compileRunCode, observeBrowserRunApis, type BrowserManagerLike, type BrowserManagerStatus, type BrowserOpenOptions, type BrowserRunOutput, type BrowserTabInfo } from "../src/tools/browser/manager.ts";
+import { BrowserManager, browserRunErrorHint, canonicalizeBrowserOpenOptions, compileRunCode, observeBrowserRunApis, settleBrowserDialog, type BrowserManagerLike, type BrowserManagerStatus, type BrowserOpenOptions, type BrowserRunOutput, type BrowserTabInfo } from "../src/tools/browser/manager.ts";
 import { STEALTH_INIT_JS, STEALTH_LAUNCH_ARGS } from "../src/tools/browser/stealth.ts";
 
 class FakeBrowserManager implements BrowserManagerLike {
@@ -87,6 +87,31 @@ test("stealth module exports the webdriver/plugins/chrome/permissions patches an
   assert.ok(STEALTH_LAUNCH_ARGS.includes('--disable-blink-features=AutomationControlled'), 'STEALTH_LAUNCH_ARGS must disable AutomationControlled');
 });
 
+test("browser dialog settlement contains the stale CDP dialog race", async () => {
+  const stale = new Error("Protocol error (Page.handleJavaScriptDialog): No dialog is showing");
+  stale.name = "ProtocolError";
+  let reported: unknown;
+
+  await settleBrowserDialog({
+    accept: async () => { throw stale; },
+    dismiss: async () => undefined,
+  }, "accept", (error) => { reported = error; });
+
+  assert.equal(reported, undefined);
+});
+
+test("browser dialog settlement reports unexpected failures", async () => {
+  const failure = new Error("CDP session disconnected");
+  let reported: unknown;
+
+  await settleBrowserDialog({
+    accept: async () => undefined,
+    dismiss: async () => { throw failure; },
+  }, "dismiss", (error) => { reported = error; });
+
+  assert.equal(reported, failure);
+});
+
 test("browser schema preserves legacy actions and adds explicit status/pair surfaces", () => {
   assert.deepEqual((BrowserParams.properties.action as { enum: string[] }).enum, ["open", "close", "run", "guide", "status", "pair"]);
   assert.deepEqual(Object.keys(BrowserParams.properties).sort(), [
@@ -101,6 +126,7 @@ test("browser schema preserves legacy actions and adds explicit status/pair surf
   assert.equal(Check(BrowserParams, { action: "pair" }), false);
   assert.equal(Check(BrowserParams, { action: "pair", request_id: "request", code: "123456" }), true);
   assert.equal(Check(BrowserParams, { action: "pair", request_id: "request", code: "wrong" }), false);
+  assert.match((BrowserParams.properties.timeout as { description?: string }).description ?? "", /total wall-clock/i);
 });
 
 test("browser tool guidelines expose probe/snapshot/diff/monitor helpers", async () => {
@@ -132,6 +158,8 @@ test("browser tool guidelines expose probe/snapshot/diff/monitor helpers", async
   assert.match(joined, /action:status/, "guidelines must identify status as the live bridge probe");
   assert.match(joined, /pendingPairings/, "guidelines must expose pending pairing requests");
   assert.match(joined, /action:pair/, "guidelines must expose one-time pairing approval");
+  assert.match(joined, /total wall-clock budget/, "guidelines must explain the outer timeout budget");
+  assert.match(joined, /closes the named tab/, "guidelines must explain managed timeout cleanup");
   assert.match(joined, /never falls back|no managed-browser fallback/, "guidelines must state that extension fails closed without fallback");
   // Channel stays nested under app; pairing adds only its explicit request id.
   assert.deepEqual(Object.keys(BrowserParams.properties).sort(), [
@@ -304,6 +332,10 @@ test("browser guide returns registry index; topic loads one document", async () 
   assert.match(coreText, /evalInFrame/, "core SOP must mention evalInFrame");
   assert.match(coreText, /cdpClick/, "core SOP must mention cdpClick");
   assert.match(coreText, /attach_user_profile/, "core SOP must mention attach_user_profile");
+  const antipatterns = await tool.execute("guide", { action: "guide", topic: "automation-antipatterns" }, undefined, undefined, ctx);
+  const antipatternText = antipatterns.content.filter((item) => item.type === "text").map((item) => "text" in item ? item.text : "").join("\n");
+  assert.match(antipatternText, /total wall-clock budget/i, "automation SOP must explain the outer timeout budget");
+  assert.match(antipatternText, /empty named-tab status.*expected cleanup/i, "automation SOP must explain managed timeout cleanup");
   // Unknown topic -> error listing available ids
   await assert.rejects(
     () => tool.execute("guide", { action: "guide", topic: "nope" }, undefined, undefined, ctx),
@@ -356,6 +388,15 @@ test("browser run error hints explain evaluate callback scoping", () => {
   // 普通错误原样透传。
   const plain = new Error("boom");
   assert.equal(browserRunErrorHint(plain), plain);
+});
+
+test("browser run error hints explain timeout budgeting and managed-tab cleanup", () => {
+  const timeout = browserRunErrorHint(new Error("Browser operation timed out after 300000ms.")) as Error;
+  assert.match(timeout.message, /total wall-clock budget/);
+  assert.match(timeout.message, /split long serial cases/);
+  assert.match(timeout.message, /stable semantic state/);
+  assert.match(timeout.message, /close the named tab/);
+  assert.match(timeout.message, /reopen it before retrying/);
 });
 
 test("compileRunCode surfaces ReferenceError with the undefined name", async () => {

@@ -195,6 +195,12 @@ const SOP_ANTIPATTERNS = `Puppeteer antipatterns — silent-failure modes to avo
 WAITING
 - Never substitute hardcoded sleeps for state: wait on a selector, network idle, or verify DOM change (tab.snapshot() + tab.diff()). A sleep that "usually works" fails under load.
 - After a click triggers navigation, wait for the navigation or expected DOM change before reading state (run output reports navigated/newTabs).
+- Wait on stable semantic state, not incidental exact counts or one specific toast; if a wait expires, inspect the current page before retrying because the action may already have succeeded.
+
+TIMEOUT BUDGET
+- browser timeout is one total wall-clock budget for the entire run, not a fresh allowance for each awaited step. Keep the sum of worst-case waits and polling below it with headroom.
+- Run one long case per invocation. Split navigation, upload, submit, and terminal polling when their combined worst case approaches the outer timeout.
+- A managed/profile/CDP run that exhausts its outer timeout closes the named tab to stop still-running code. Reopen it before retrying; an empty named-tab status after that timeout is expected cleanup, not proof that Chromium crashed.
 
 CONTEXT HYGIENE
 - Reuse one named browser/tab across related steps; relaunching per step loses profile warmup and CF trust.
