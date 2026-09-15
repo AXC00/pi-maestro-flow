@@ -17,7 +17,8 @@
     "./v1/events": "./src/public/v1/events.ts",
     "./v1/provider": "./src/public/v1/provider.ts",
     "./v1/schema": "./src/public/v1/schema.ts",
-    "./v1/i18n": "./src/public/v1/i18n.ts"
+    "./v1/i18n": "./src/public/v1/i18n.ts",
+    "./ui": "./src/ui/index.ts"
   },
   "files": [
     "src/**/*.ts"
