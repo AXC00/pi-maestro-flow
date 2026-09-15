@@ -1,66 +1,41 @@
 /**
- * Token-usage chart renderers — pure ANSI string functions.
+ * Token-usage chart renderers — pure string functions, now theme-driven.
  *
- * No external chart library: the statusline is plain ANSI concatenation (not
- * an Ink/React pipeline), so we reuse the `█░` block vocabulary and theme
- * colors from constants.ts. Every function is pure (input numbers → string),
- * side-effect free, and unit-testable without a TTY.
+ * The statusline is plain themed ANSI concatenation (not an Ink/React
+ * pipeline), so we keep the `█░` block vocabulary and paint through the Pi
+ * Theme API. Every function is pure (input numbers/string → string),
+ * side-effect free, and unit-testable without a TTY. When no theme is
+ * supplied, a plain fallback is used so tests and non-UI callers stay simple.
  */
 
-import { ansiFg, ansiBg, ANSI_RESET, ANSI_DIM, COLORS, type RGB } from "./constants.ts";
+import type { Theme, ThemeColor } from "@earendil-works/pi-coding-agent";
 import { visibleWidth, truncateToWidth } from "@earendil-works/pi-tui";
+
+// ---------------------------------------------------------------------------
+// Theme fallback
+// ---------------------------------------------------------------------------
+
+type MiniTheme = Pick<Theme, "fg" | "bold">;
+
+const PLAIN_THEME: MiniTheme = {
+	fg: (_color, text) => text,
+	bold: (text) => text,
+};
+
+function dim(theme: MiniTheme, text: string): string {
+	return theme.fg("dim", text);
+}
+
+function resolveTheme(opts?: { theme?: MiniTheme }): MiniTheme {
+	return opts?.theme ?? PLAIN_THEME;
+}
 
 // ---------------------------------------------------------------------------
 // Sparkline
 // ---------------------------------------------------------------------------
-
-const SPARK_GLYPHS = ["▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"] as const;
-
-/**
- * Map a value in [min,max] to one of 8 sparkline glyphs. Values outside the
- * range clamp to the endpoints; a flat series (min===max) renders the mid
- * glyph so a constant line is still visible.
- */
-function sparkGlyph(value: number, min: number, max: number): string {
-	if (!Number.isFinite(value)) return SPARK_GLYPHS[0];
-	if (max === min) return SPARK_GLYPHS[3];
-	const clamped = value < min ? min : value > max ? max : value;
-	const idx = Math.round(((clamped - min) / (max - min)) * (SPARK_GLYPHS.length - 1));
-	return SPARK_GLYPHS[idx];
-}
-
-export interface SparklineOptions {
-	/** Maximum column width in terminal cells. The series is downsampled to fit. */
-	width?: number;
-	/** Foreground color. Defaults to the theme `tokens` color. */
-	color?: RGB;
-	/** Fixed scale; when omitted the series min/max drives the glyph mapping. */
-	max?: number;
-	/** Minimum scale; when omitted the series min drives the glyph mapping. */
-	min?: number;
-}
-
-/**
- * Render a one-line sparkline from a numeric series. Empty or all-non-finite
- * input returns "" so callers can append unconditionally. The series is
- * downsampled to `width` points by even stride sampling (last point always
- * included) so the right edge tracks the most recent value.
- */
-export function renderSparkline(values: readonly number[], opts: SparklineOptions = {}): string {
-	const finite = values.filter((v) => Number.isFinite(v));
-	if (finite.length === 0) return "";
-	const width = Math.max(1, opts.width ?? finite.length);
-	const stride = finite.length <= width ? 1 : Math.ceil(finite.length / width);
-	const sampled: number[] = [];
-	for (let i = 0; i < finite.length; i += stride) sampled.push(finite[i]);
-	if (sampled[sampled.length - 1] !== finite[finite.length - 1]) sampled.push(finite[finite.length - 1]);
-	const trimmed = sampled.slice(0, width);
-	const min = opts.min ?? Math.min(...trimmed);
-	const max = opts.max ?? Math.max(...trimmed);
-	const color = opts.color ?? COLORS.tokens;
-	const glyphs = trimmed.map((v) => sparkGlyph(v, min, max)).join("");
-	return `${ansiFg(color)}${glyphs}${ANSI_RESET}`;
-}
+// The one-line sparkline lives in pi-cockpit/src/usage/sparkline.ts
+// (`renderThemeSparkline`); Flow's statusline consumes that single
+// implementation instead of keeping a second copy here.
 
 // ---------------------------------------------------------------------------
 // Bar chart (horizontal)
@@ -69,7 +44,7 @@ export function renderSparkline(values: readonly number[], opts: SparklineOption
 export interface BarChartItem {
 	label: string;
 	value: number;
-	color?: RGB;
+	color?: ThemeColor;
 }
 
 export interface BarChartOptions {
@@ -79,6 +54,8 @@ export interface BarChartOptions {
 	maxBarWidth?: number;
 	/** Fixed scale; when omitted the largest item drives the bar lengths. */
 	max?: number;
+	/** Theme used to paint the chart. Defaults to plain text. */
+	theme?: MiniTheme;
 }
 
 /**
@@ -88,20 +65,21 @@ export interface BarChartOptions {
  */
 export function renderBarChart(items: readonly BarChartItem[], opts: BarChartOptions = {}): string[] {
 	if (items.length === 0) return [];
+	const theme = resolveTheme(opts);
 	const width = opts.width ?? 60;
 	const labelWidth = Math.min(Math.max(...items.map((i) => visibleWidth(i.label))), 20);
 	const valueText = items.map((i) => formatCompact(i.value));
 	const valueWidth = Math.max(...valueText.map((v) => v.length));
 	const maxBar = opts.maxBarWidth ?? Math.max(8, width - labelWidth - valueWidth - 6);
 	const scaleMax = opts.max ?? Math.max(...items.map((i) => i.value), 0);
-	const palette: RGB[] = [COLORS.ctxOk, COLORS.model, COLORS.milestone, COLORS.phase, COLORS.evol, COLORS.tokens];
+	const palette: ThemeColor[] = ["success", "accent", "warning", "accent", "mdLink", "muted"];
 	const lines: string[] = [];
 	items.forEach((item, idx) => {
 		const bar = scaleMax <= 0 ? "░".repeat(maxBar) : buildBar(item.value / scaleMax, maxBar);
 		const color = item.color ?? palette[idx % palette.length];
 		const label = padEnd(item.label, labelWidth);
 		const value = padStart(formatCompact(item.value), valueWidth);
-		lines.push(`${ANSI_DIM}${label}${ANSI_RESET}  ${ansiFg(color)}${bar}${ANSI_RESET}  ${ANSI_DIM}${value}${ANSI_RESET}`);
+		lines.push(`${dim(theme, label)}  ${theme.fg(color, bar)}  ${dim(theme, value)}`);
 	});
 	return lines;
 }
@@ -121,12 +99,14 @@ export interface LineChartOptions {
 	width?: number;
 	/** Chart area height in rows. */
 	height?: number;
-	/** Foreground color. Defaults to the theme `tokens` color. */
-	color?: RGB;
+	/** Semantic theme color used to paint the marks. Defaults to "accent". */
+	color?: ThemeColor;
 	/** Fixed scale; when omitted the series max drives the vertical mapping. */
 	max?: number;
 	/** Minimum scale; defaults to 0. */
 	min?: number;
+	/** Theme used to paint the chart. Defaults to plain text. */
+	theme?: MiniTheme;
 }
 
 const LINE_FILL = "·";
@@ -139,13 +119,14 @@ const LINE_MARK = "●";
  * the bottom row.
  */
 export function renderLineChart(values: readonly number[], opts: LineChartOptions = {}): string[] {
+	const theme = resolveTheme(opts);
 	const finite = values.filter((v) => Number.isFinite(v));
 	if (finite.length === 0) return [];
 	const width = Math.max(1, opts.width ?? 40);
 	const height = Math.max(1, opts.height ?? 5);
 	const min = opts.min ?? 0;
 	const max = opts.max ?? Math.max(...finite, min + 1);
-	const color = opts.color ?? COLORS.tokens;
+	const color = opts.color ?? "accent";
 	const range = max === min ? 1 : max - min;
 	// Downsample to width points (even stride, last point always kept).
 	const stride = finite.length <= width ? 1 : Math.ceil(finite.length / width);
@@ -164,7 +145,7 @@ export function renderLineChart(values: readonly number[], opts: LineChartOption
 	// Render rows; empty rows collapse to a faint baseline only on the bottom row.
 	const lines: string[] = [];
 	for (let row = 0; row < height; row++) {
-		const cells = grid[row].map((c) => (c === LINE_MARK ? `${ansiFg(color)}${LINE_MARK}${ANSI_RESET}` : `${ANSI_DIM}${LINE_FILL}${ANSI_RESET}`)).join("");
+		const cells = grid[row].map((c) => (c === LINE_MARK ? theme.fg(color, LINE_MARK) : dim(theme, LINE_FILL))).join("");
 		lines.push(cells);
 	}
 	return lines;
@@ -177,7 +158,12 @@ export function renderLineChart(values: readonly number[], opts: LineChartOption
 export interface StackedSegment {
 	label: string;
 	value: number;
-	color: RGB;
+	color: ThemeColor;
+}
+
+export interface StackedBarOptions {
+	/** Theme used to paint the bar. Defaults to plain text. */
+	theme?: MiniTheme;
 }
 
 /**
@@ -185,8 +171,14 @@ export interface StackedSegment {
  * share of `total`, colored per segment. Returns "" when total ≤ 0 or all
  * segments are empty. The bar is exactly `width` cells wide.
  */
-export function renderStackedBar(segments: readonly StackedSegment[], total: number, width: number): string {
+export function renderStackedBar(
+	segments: readonly StackedSegment[],
+	total: number,
+	width: number,
+	opts: StackedBarOptions = {},
+): string {
 	if (total <= 0 || segments.length === 0) return "";
+	const theme = resolveTheme(opts);
 	const clampedWidth = Math.max(1, width);
 	const parts = segments
 		.map((s) => ({ ...s, value: s.value < 0 ? 0 : s.value }))
@@ -198,7 +190,7 @@ export function renderStackedBar(segments: readonly StackedSegment[], total: num
 	parts.forEach((s, idx) => {
 		const cells = idx === parts.length - 1 ? clampedWidth - drawn : Math.round((s.value / sum) * clampedWidth);
 		if (cells <= 0) return;
-		out += `${ansiFg(s.color)}${"█".repeat(cells)}${ANSI_RESET}`;
+		out += theme.fg(s.color, "█".repeat(cells));
 		drawn += cells;
 	});
 	return out;
@@ -220,8 +212,8 @@ export interface HeatmapOptions {
 	cellWidth?: number;
 	/** Spacing between week columns. */
 	gap?: number;
-	/** Foreground color for filled cells. Empty cells are dim. */
-	color?: RGB;
+	/** Semantic theme color for filled cells. Empty cells are dim. */
+	color?: ThemeColor;
 	/** Number of density levels (default 4: ·▒▓█). */
 	levels?: number;
 	/** Show weekday labels on the left (Mon/Wed/Fri). */
@@ -230,6 +222,8 @@ export interface HeatmapOptions {
 	 *  trailing empty weeks, so the heatmap left-aligns and fills the panel
 	 *  instead of leaving blank space on the right. */
 	width?: number;
+	/** Theme used to paint the heatmap. Defaults to plain text. */
+	theme?: MiniTheme;
 }
 
 const HEATMAP_GLYPHS = ["·", "▒", "▓", "█"] as const;
@@ -242,9 +236,10 @@ const HEATMAP_GLYPHS = ["·", "▒", "▓", "█"] as const;
  */
 export function renderHeatmap(cells: readonly HeatmapCell[], opts: HeatmapOptions = {}): string[] {
 	if (cells.length === 0) return [];
+	const theme = resolveTheme(opts);
 	const cellWidth = Math.max(1, opts.cellWidth ?? 2);
 	const gap = Math.max(0, opts.gap ?? 1);
-	const color = opts.color ?? COLORS.tokens;
+	const color = opts.color ?? "accent";
 	const showWeekdays = opts.showWeekdays ?? true;
 	const max = Math.max(...cells.map((c) => c.value), 0);
 	// Build a map of utcMidnight → cell for quick lookup.
@@ -277,7 +272,7 @@ export function renderHeatmap(cells: readonly HeatmapCell[], opts: HeatmapOption
 		let line = "";
 		if (showWeekdays) {
 			// Only show Mon/Wed/Fri labels, others blank for spacing.
-			line = row === 0 || row === 2 || row === 4 ? `${ANSI_DIM}${weekdayLabels[row]}${ANSI_RESET}` : "   ";
+			line = row === 0 || row === 2 || row === 4 ? dim(theme, weekdayLabels[row]) : "   ";
 			line += " ";
 		}
 		for (let w = 0; w < weeks; w++) {
@@ -288,13 +283,13 @@ export function renderHeatmap(cells: readonly HeatmapCell[], opts: HeatmapOption
 			// as the empty glyph so the grid is a solid block filling the width.
 			const beyondSpan = w * 7 + row >= totalDays;
 			if (value === undefined && !beyondSpan) {
-				line += `${ANSI_DIM}${" ".repeat(cellWidth)}${ANSI_RESET}`;
+				line += dim(theme, " ".repeat(cellWidth));
 			} else if (value === undefined || value <= 0) {
-				line += `${ANSI_DIM}${HEATMAP_GLYPHS[0].repeat(cellWidth)}${ANSI_RESET}`;
+				line += dim(theme, HEATMAP_GLYPHS[0].repeat(cellWidth));
 			} else {
 				const level = max <= 0 ? 1 : Math.max(1, Math.ceil((value / max) * (HEATMAP_GLYPHS.length - 1)));
 				const glyph = HEATMAP_GLYPHS[Math.min(level, HEATMAP_GLYPHS.length - 1)];
-				line += `${ansiFg(color)}${glyph.repeat(cellWidth)}${ANSI_RESET}`;
+				line += theme.fg(color, glyph.repeat(cellWidth));
 			}
 			if (w < weeks - 1) line += " ".repeat(gap);
 		}
@@ -304,10 +299,11 @@ export function renderHeatmap(cells: readonly HeatmapCell[], opts: HeatmapOption
 }
 
 /** Render the `Less ▒▓█ More` legend line. */
-export function renderHeatmapLegend(color: RGB = COLORS.tokens): string {
+export function renderHeatmapLegend(color: ThemeColor = "accent", theme?: MiniTheme): string {
+	const t = theme ?? PLAIN_THEME;
 	const glyphs = HEATMAP_GLYPHS.slice(1); // skip the empty `·`
-	const swatches = glyphs.map((g) => `${ansiFg(color)}${g}${ANSI_RESET}`).join("");
-	return `${ANSI_DIM}Less ${ANSI_RESET}${swatches}${ANSI_DIM} More${ANSI_RESET}`;
+	const swatches = glyphs.map((g) => t.fg(color, g)).join("");
+	return `${dim(t, "Less ")}${swatches}${dim(t, " More")}`;
 }
 
 // ---------------------------------------------------------------------------
@@ -322,8 +318,8 @@ export interface SeriesPoint {
 export interface LineSeries {
 	/** Series label shown in the legend. */
 	label: string;
-	/** Color for this series' marks and legend dot. */
-	color: RGB;
+	/** Semantic theme color for this series' marks and legend dot. */
+	color: ThemeColor;
 	/** Points ordered by ts. */
 	points: readonly SeriesPoint[];
 }
@@ -343,6 +339,8 @@ export interface MultiLineChartOptions {
 	 *  band between the cumulative total up to it and up to the previous one,
 	 *  so the chart shows per-model contribution to a daily total. */
 	stacked?: boolean;
+	/** Theme used to paint the chart. Defaults to plain text. */
+	theme?: MiniTheme;
 }
 
 const MULTI_LINE_FILL = " ";
@@ -377,6 +375,7 @@ function interpolateSeriesValue(pts: readonly SeriesPoint[], ts: number): number
  * steep slopes. Returns [] for empty input.
  */
 export function renderMultiLineChart(series: readonly LineSeries[], opts: MultiLineChartOptions = {}): string[] {
+	const theme = resolveTheme(opts);
 	const allPoints = series.flatMap((s) => s.points);
 	if (allPoints.length === 0) return [];
 	const width = Math.max(1, opts.width ?? 60);
@@ -425,7 +424,7 @@ export function renderMultiLineChart(series: readonly LineSeries[], opts: MultiL
 		renderOverlaid(series, grid, chartW, colToTs, valueToPixel);
 	}
 	const lines: string[] = [];
-	if (yTitle) lines.push(`${ANSI_DIM}${yTitle}${ANSI_RESET}`);
+	if (yTitle) lines.push(dim(theme, yTitle));
 	// Render each character row from two pixel rows (top half + bottom half).
 	// Show ~4 evenly spaced y-axis ticks for taller charts, 3 for short ones.
 	const tickRows = height >= 10 ? [0, Math.round(height / 3), Math.round((2 * height) / 3), height - 1] : [0, Math.floor(height / 2), height - 1];
@@ -447,9 +446,9 @@ export function renderMultiLineChart(series: readonly LineSeries[], opts: MultiL
 		for (let col = 0; col < chartW; col++) {
 			const topIdx = grid[topPix][col];
 			const botIdx = grid[botPix][col];
-			cells += renderHalfBlock(topIdx, botIdx, series);
+			cells += renderHalfBlock(topIdx, botIdx, series, theme);
 		}
-		lines.push(`${ANSI_DIM}${tick}${ANSI_RESET} ${cells}`);
+		lines.push(`${dim(theme, tick)} ${cells}`);
 	}
 	// X-axis time labels: pick ~4 evenly spaced timestamps.
 	const xLabelCount = Math.min(4, chartW);
@@ -459,7 +458,7 @@ export function renderMultiLineChart(series: readonly LineSeries[], opts: MultiL
 		xLabels.push({ ts, label: formatXAxisLabel(ts, xFormat) });
 	}
 	const labelLine = buildXAxisLabelLine(xLabels, chartW, yAxisLabelWidth + 1);
-	lines.push(labelLine);
+	lines.push(dim(theme, labelLine));
 	return lines;
 }
 
@@ -537,15 +536,16 @@ function fillVerticalRun(grid: Int16Array[], pix: number, col: number, sIdx: num
 }
 
 /** Render one character cell from its top/bottom half-block series indices. */
-function renderHalfBlock(topIdx: number, botIdx: number, series: readonly LineSeries[]): string {
+function renderHalfBlock(topIdx: number, botIdx: number, series: readonly LineSeries[], theme: MiniTheme): string {
 	const empty = -1;
 	if (topIdx === empty && botIdx === empty) return MULTI_LINE_FILL;
-	if (topIdx === botIdx) return `${ansiFg(series[topIdx].color)}█${ANSI_RESET}`;
-	// Different colors per half, or one half empty: use background/foreground.
-	if (topIdx === empty) return `${ansiFg(series[botIdx].color)}▄${ANSI_RESET}`;
-	if (botIdx === empty) return `${ansiFg(series[topIdx].color)}▀${ANSI_RESET}`;
-	// Two different series in the same cell: top as fg, bottom as bg.
-	return `${ansiFg(series[topIdx].color)}${ansiBg(series[botIdx].color)}▀${ANSI_RESET}`;
+	if (topIdx === botIdx) return theme.fg(series[topIdx].color, "█");
+	// Different colors per half, or one half empty. Theme.fg only paints the
+	// foreground half; the other half becomes the default background. This is
+	// a slight visual simplification of the old raw-RGB fg+bg cell, but it
+	// only affects overlapping non-stacked curves and remains theme-driven.
+	if (topIdx === empty) return theme.fg(series[botIdx].color, "▄");
+	return theme.fg(series[topIdx].color, "▀");
 }
 
 export interface LineLegendOptions {
@@ -554,6 +554,8 @@ export interface LineLegendOptions {
 	 *  greedily wrapped across rows so a legend with many models stays
 	 *  visible instead of overflowing a single line and being truncated. */
 	width?: number;
+	/** Theme used to paint the legend. Defaults to plain text. */
+	theme?: MiniTheme;
 }
 
 /**
@@ -565,7 +567,8 @@ export interface LineLegendOptions {
  */
 export function renderLineLegend(series: readonly LineSeries[], opts: LineLegendOptions = {}): string[] {
 	if (series.length === 0) return [];
-	const sep = `${ANSI_DIM} · ${ANSI_RESET}`;
+	const theme = resolveTheme(opts);
+	const sep = dim(theme, " · ");
 	const sepWidth = 3;
 	// Each item: color + label + visible cell width (● + space + label).
 	const items = series.map((s) => ({
@@ -573,8 +576,8 @@ export function renderLineLegend(series: readonly LineSeries[], opts: LineLegend
 		label: s.label,
 		width: 2 + visibleWidth(s.label),
 	}));
-	const render = (i: { color: RGB; label: string }): string =>
-		`${ansiFg(i.color)}${MULTI_LINE_MARK}${ANSI_RESET} ${i.label}`;
+	const render = (i: { color: ThemeColor; label: string }): string =>
+		`${theme.fg(i.color, MULTI_LINE_MARK)} ${i.label}`;
 	// Without a width budget, join everything into one line.
 	if (opts.width === undefined) {
 		return [items.map(render).join(sep)];
@@ -660,7 +663,7 @@ function buildXAxisLabelLine(
 		out += p.label;
 		cursor = p.col + p.label.length;
 	}
-	return `${ANSI_DIM}${out}${ANSI_RESET}`;
+	return out;
 }
 
 function padEnd(text: string, width: number): string {

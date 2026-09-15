@@ -12,7 +12,15 @@
 
 import type { ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { Key, matchesKey, truncateToWidth, visibleWidth, type Component } from "@earendil-works/pi-tui";
-import { ANSI_DIM, ANSI_BOLD, ANSI_RESET, ANSI_REVERSE, COLORS, type RGB } from "../statusline/constants.ts";
+import type { Theme, ThemeColor } from "@earendil-works/pi-coding-agent";
+import { makeBorderFrame, resolveGlyphs } from "pi-maestro-settings-core/ui";
+import { ANSI_DIM, ANSI_BOLD, ANSI_RESET, ANSI_REVERSE } from "../statusline/constants.ts";
+
+const FRAME_GLYPHS = resolveGlyphs("nerd");
+const FRAME_UTILS = {
+	measure: visibleWidth,
+	clip: (text: string, width: number, ellipsis: string) => truncateToWidth(text, width, ellipsis),
+};
 import {
 	renderHeatmap,
 	renderHeatmapLegend,
@@ -59,14 +67,14 @@ const RANGE_LABEL: Record<StatsRange, string> = {
 const RANGES: StatsRange[] = ["today", "7d", "30d", "all"];
 
 // Per-series palette for the Models line chart.
-const SERIES_PALETTE: RGB[] = [
-	COLORS.model,
-	COLORS.ctxOk,
-	COLORS.milestone,
-	COLORS.phase,
-	COLORS.danger,
-	COLORS.evol,
-	COLORS.tokens,
+const SERIES_PALETTE: ThemeColor[] = [
+	"accent",
+	"success",
+	"warning",
+	"accent",
+	"error",
+	"mdLink",
+	"muted",
 ];
 
 // ---------------------------------------------------------------------------
@@ -77,6 +85,7 @@ interface OverlayParams {
 	cwd: string;
 	requestRender: () => void;
 	done: () => void;
+	theme: Theme;
 }
 
 export class UsageStatsOverlay implements Component {
@@ -130,13 +139,13 @@ export class UsageStatsOverlay implements Component {
 
 		if (this.loading) {
 			lines.push(dim("加载中…"));
-			return frame(lines, safeWidth);
+			return frame(lines, safeWidth, this.params.theme);
 		}
 
 		if (this.records.length === 0) {
 			lines.push(dim("暂无用量记录。每条 assistant 消息自动记录 token 与成本。"));
 			lines.push(dim("发一条消息后按 r 刷新。"));
-			return frame(lines, safeWidth);
+			return frame(lines, safeWidth, this.params.theme);
 		}
 
 		if (this.tab === "overview") {
@@ -150,7 +159,7 @@ export class UsageStatsOverlay implements Component {
 		lines.push(rule(inner));
 		const rangeHint = this.tab === "models" ? " · ↑/↓ 切换范围" : "";
 		lines.push(dim(`Tab 切换标签 · ←/→ 切换标签${rangeHint} · r 刷新 · q/Esc 关闭`));
-		return frame(lines, safeWidth);
+		return frame(lines, safeWidth, this.params.theme);
 	}
 
 	private renderTabBar(inner: number): string {
@@ -207,10 +216,10 @@ export class UsageStatsOverlay implements Component {
 		const heatSeries = daySeries(this.records, "tokens", heatStart, todayMid);
 		const cells: HeatmapCell[] = heatSeries.map((b) => ({ ts: b.ts, value: b.value }));
 		if (cells.length > 0) {
-			for (const line of renderHeatmap(cells, { cellWidth: heatCellWidth, gap: heatGap, color: COLORS.tokens, showWeekdays: true, width: inner })) {
+			for (const line of renderHeatmap(cells, { cellWidth: heatCellWidth, gap: heatGap, color: "accent", showWeekdays: true, width: inner, theme: this.params.theme })) {
 				lines.push(truncateToWidth(line, inner, "…"));
 			}
-			lines.push(renderHeatmapLegend(COLORS.tokens));
+			lines.push(renderHeatmapLegend("muted", this.params.theme));
 		}
 		lines.push(rule(inner));
 		const totals = usageTotals(this.records);
@@ -255,10 +264,10 @@ export class UsageStatsOverlay implements Component {
 			lines.push(dim("无模型数据。"));
 			return;
 		}
-		for (const line of renderMultiLineChart(series, { width: inner, height: 12, yTitle: "Tokens per Day", xFormat: "day", stacked: true })) {
+		for (const line of renderMultiLineChart(series, { width: inner, height: 12, yTitle: "Tokens per Day", xFormat: "day", stacked: true, theme: this.params.theme })) {
 			lines.push(truncateToWidth(line, inner, "…"));
 		}
-		for (const line of renderLineLegend(series, { width: inner })) {
+		for (const line of renderLineLegend(series, { width: inner, theme: this.params.theme })) {
 			lines.push(truncateToWidth(line, inner, "…"));
 		}
 		lines.push(rule(inner));
@@ -358,10 +367,11 @@ export async function showUsageStatsPanel(
 		ctx.ui.notify("/api-manager stats 需要交互式 Pi 会话。", "warning");
 		return;
 	}
-	await ctx.ui.custom<void>((tui, _theme, _keybindings, done) => new UsageStatsOverlay({
+	await ctx.ui.custom<void>((tui, theme, _keybindings, done) => new UsageStatsOverlay({
 		cwd: ctx.cwd,
 		requestRender: () => tui.requestRender(),
 		done: () => done(undefined),
+		theme,
 	}), {
 		overlay: true,
 		overlayOptions: { anchor: "center", width: "90%", maxHeight: "88%" },
@@ -439,16 +449,10 @@ function rule(width: number): string {
 	return "─".repeat(Math.max(0, width));
 }
 
-function frame(rows: readonly string[], width: number): string[] {
-	if (width < 2) return rows.map((row) => fitLine(row, width));
-	const inner = width - 2;
-	const d = (s: string) => `${ANSI_DIM}${s}${ANSI_RESET}`;
-	return [
-		d(`┌${"─".repeat(inner)}┐`),
-		...rows.map((row) => {
-			const fitted = fitLine(row, inner);
-			return `${d("│")}${fitted}${" ".repeat(Math.max(0, inner - visibleWidth(fitted)))}${d("│")}`;
-		}),
-		d(`└${"─".repeat(inner)}┘`),
-	];
+function frame(rows: readonly string[], width: number, theme: Theme): string[] {
+	return makeBorderFrame(rows, width, FRAME_GLYPHS, FRAME_UTILS, {
+		corners: "square",
+		theme,
+		borderColor: "dim",
+	});
 }

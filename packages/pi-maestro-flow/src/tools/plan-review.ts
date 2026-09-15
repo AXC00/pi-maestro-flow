@@ -19,6 +19,13 @@ import {
   truncateToWidth,
   visibleWidth,
 } from "@earendil-works/pi-tui";
+import { makeBorderFrame, resolveGlyphs } from "pi-maestro-settings-core/ui";
+
+const FRAME_GLYPHS = resolveGlyphs("nerd");
+const FRAME_UTILS = {
+  measure: visibleWidth,
+  clip: (text: string, width: number, ellipsis: string) => truncateToWidth(text, width, ellipsis),
+};
 import { runTeammate } from "pi-maestro-teammate/v1/execution";
 import { refreshModelRegistry } from "pi-maestro-teammate/v1/model-routing";
 import { createDirectTeammateRunOptions } from "./direct-teammate.ts";
@@ -150,7 +157,6 @@ export async function pickReviewModel(
       return {
         render(width: number): string[] {
           const inner = Math.max(1, width - 2);
-          const border = (text: string) => theme.fg("dim", text);
           const header = theme.bold("Plan review model");
           const searchLabel = theme.fg("dim", "Search:");
           const searchInputWidth = Math.max(1, inner - visibleWidth("Search: "));
@@ -158,14 +164,10 @@ export async function pickReviewModel(
           const renderedList = list.render(inner);
           const footer = theme.fg("dim", "Type to filter (prefix) · ↑↓ navigate · Enter select · Esc cancel");
           const rows = [header, "", searchLine, "", ...renderedList, "", footer];
-          return [
-            border(`╭${"─".repeat(inner)}╮`),
-            ...rows.map((row) => {
-              const content = truncateToWidth(row, inner, "…");
-              return `${border("│")}${content}${" ".repeat(Math.max(0, inner - visibleWidth(content)))}${border("│")}`;
-            }),
-            border(`╰${"─".repeat(inner)}╯`),
-          ];
+          return makeBorderFrame(rows, width, FRAME_GLYPHS, FRAME_UTILS, {
+            theme,
+            borderColor: "dim",
+          });
         },
         handleInput(data: string): void {
           if (matchesKey(data, Key.escape)) {

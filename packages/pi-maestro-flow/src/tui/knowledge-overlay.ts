@@ -7,11 +7,19 @@ import {
   truncateToWidth,
   visibleWidth,
 } from "@earendil-works/pi-tui";
+import { makeBorderFrame, resolveGlyphs } from "pi-maestro-settings-core/ui";
 import {
   BracketedPasteDecoder,
   removeLastGrapheme,
   sanitizeSingleLineInput,
 } from "./input-text.ts";
+
+const FRAME_GLYPHS = resolveGlyphs("nerd");
+const FRAME_UTILS = {
+  measure: visibleWidth,
+  clip: (text: string, width: number, ellipsis: string) => truncateToWidth(text, width, ellipsis),
+};
+
 import type { KnowledgeReconciliationMatch, KnowledgeResolutionChoice } from "../knowledge/cli-adapter.ts";
 import {
   type CandidateSummary,
@@ -756,15 +764,7 @@ function rule(width: number): string {
 
 function frame(rows: readonly string[], width: number): string[] {
   if (width < 3) return rows.map((row) => fitLine(row, width));
-  const inner = width - 2;
-  return [
-    `╭${"─".repeat(inner)}╮`,
-    ...rows.map((row) => {
-      const content = fitLine(row, inner);
-      return `│${content}${" ".repeat(Math.max(0, inner - visibleWidth(content)))}│`;
-    }),
-    `╰${"─".repeat(inner)}╯`,
-  ];
+  return makeBorderFrame(rows, width, FRAME_GLYPHS, FRAME_UTILS);
 }
 
 function errorMessage(error: unknown): string {

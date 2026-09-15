@@ -8,6 +8,7 @@ import {
   wrapTextWithAnsi,
 } from "@earendil-works/pi-tui";
 import type { Theme } from "@earendil-works/pi-coding-agent";
+import { makeOverlayFrame, resolveGlyphs } from "pi-maestro-settings-core/ui";
 import {
   type GoalDetailEntry,
   type GoalWidgetPhase,
@@ -16,6 +17,12 @@ import {
   goalProgressBar,
   goalVisualState,
 } from "./goal-widget.ts";
+
+const FRAME_GLYPHS = resolveGlyphs("nerd");
+const FRAME_UTILS = {
+  measure: visibleWidth,
+  clip: (text: string, width: number, ellipsis: string) => truncateToWidth(text, width, ellipsis),
+};
 
 export type GoalOverlayAction = "switch" | "stop" | "resume" | "clear";
 
@@ -244,16 +251,7 @@ export class GoalOverlay implements Component, Focusable {
   }
 
   private card(rows: string[], width: number, selectedRows: ReadonlySet<number> = new Set()): string[] {
-    const theme = this.params.theme;
-    const edge = "─".repeat(Math.max(0, width - 2));
-    const border = (glyph: string) => theme.bg("customMessageBg", theme.fg("borderMuted", glyph));
-    const out: string[] = [border(`╭${edge}╮`)];
-    rows.forEach((row, index) => {
-      const bg = selectedRows.has(index) ? "selectedBg" : "customMessageBg";
-      out.push(theme.bg(bg, pad(` ${row}`, width)));
-    });
-    out.push(border(`╰${edge}╯`));
-    return out;
+    return makeOverlayFrame(rows, width, this.params.theme, FRAME_GLYPHS, FRAME_UTILS, { selectedRows });
   }
 
   private move(delta: number): void {

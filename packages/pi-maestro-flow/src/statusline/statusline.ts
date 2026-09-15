@@ -9,7 +9,7 @@
  * Adapted from maestro2/src/hooks/statusline.ts for the Pi Extension ecosystem.
  */
 
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext, Theme, ThemeColor } from "@earendil-works/pi-coding-agent";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { basename, dirname, join } from "node:path";
@@ -22,16 +22,13 @@ import {
 } from "../session/view-model.ts";
 import { EFFORT_STATUS_KEY, formatEffortStatus } from "../effort-display.ts";
 import {
-	ansiFg,
-	ANSI_BOLD,
-	ANSI_RESET,
-	ICONS,
-	GIT_ICONS,
-	COLORS,
+	GLYPHS,
+	STATUSLINE_COLORS,
 	getCtxLevel,
 	getCtxColor,
+	type StatuslineColorKey,
 } from "./constants.ts";
-import { renderSparkline } from "./usage-chart.ts";
+import { renderThemeSparkline } from "pi-cockpit/src/usage/sparkline.ts";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -146,17 +143,21 @@ function cacheSegment(tokens: TokenTotals): string {
 	if (cacheTotal <= 0) return "";
 	const denom = tokens.input + cacheTotal;
 	const hitRate = denom > 0 ? Math.round((tokens.cacheRead / denom) * 100) : 0;
-	return ` ⚡${hitRate}%`;
+	return ` ${GLYPHS.cacheHit}${hitRate}%`;
 }
 
-function buildContextBar(usedPct: number, compact = false): string {
+function colored(theme: Theme, key: StatuslineColorKey, text: string): string {
+	return theme.fg(STATUSLINE_COLORS[key], text);
+}
+
+function buildContextBar(theme: Theme, usedPct: number, compact = false): string {
 	const size = compact ? 5 : 10;
 	const filled = Math.floor((usedPct / 100) * size);
 	const bar = "█".repeat(filled) + "░".repeat(size - filled);
 	const level = getCtxLevel(usedPct);
 	const color = getCtxColor(level);
-	const value = `${ICONS.ctx} ${bar} ${usedPct}%`;
-	return `${ansiFg(color)}${value}${ANSI_RESET}`;
+	const value = `${GLYPHS.ctx} ${bar} ${usedPct}%`;
+	return theme.fg(color, value);
 }
 
 /**
@@ -166,6 +167,7 @@ function buildContextBar(usedPct: number, compact = false): string {
  * (review-standards-004): it never displaces Context/input/output/cache groups.
  */
 function renderUsageSparklineSegment(
+	theme: Theme,
 	series: readonly number[],
 	config: StatsFooterConfig,
 	width: number,
@@ -173,21 +175,16 @@ function renderUsageSparklineSegment(
 	if (!config.enabled || series.length < 2 || width < 100) return "";
 	const sparkWidth = Math.min(config.points, Math.max(4, Math.floor((width - 80) / 4)));
 	if (sparkWidth < 4) return "";
-	const color = COLORS.tokens;
-	return ` ${renderSparkline(series, { width: sparkWidth, color })}`;
+	return ` ${renderThemeSparkline(series, theme, { width: sparkWidth, color: "accent" })}`;
 }
 
-function formatGit(git: GitInfo): string {
+function formatGit(theme: Theme, git: GitInfo): string {
 	const parts: string[] = [];
-	if (git.dirty) parts.push(GIT_ICONS.dirty);
-	if (git.ahead > 0) parts.push(`${GIT_ICONS.ahead}${git.ahead}`);
-	if (git.behind > 0) parts.push(`${GIT_ICONS.behind}${git.behind}`);
+	if (git.dirty) parts.push(GLYPHS.gitDirty);
+	if (git.ahead > 0) parts.push(`${GLYPHS.gitAhead}${git.ahead}`);
+	if (git.behind > 0) parts.push(`${GLYPHS.gitBehind}${git.behind}`);
 	const suffix = parts.length > 0 ? ` ${parts.join("")}` : "";
-	return `${ansiFg(COLORS.git)}${ICONS.git} ${git.branch}${suffix}${ANSI_RESET}`;
-}
-
-function colored(key: keyof typeof COLORS, text: string): string {
-	return `${ansiFg(COLORS[key])}${text}${ANSI_RESET}`;
+	return `${colored(theme, "git", `${GLYPHS.git} ${git.branch}${suffix}`)}`;
 }
 
 function normalizePlanModeStatus(value: string | undefined): PlanModeStatus {
@@ -212,18 +209,20 @@ function approvalInitial(mode: string): string {
 				: mode === "plan" ? "P" : "D";
 }
 
-function approvalColor(mode: string): keyof typeof COLORS {
-	return mode === "YOLO" ? "danger"
-		: mode === "dontAsk" ? "ctxWarn"
-			: mode === "acceptEdits" ? "ctxOk" : "phase";
+function approvalColor(mode: string): ThemeColor {
+	return mode === "YOLO" ? "error"
+		: mode === "dontAsk" ? "warning"
+			: mode === "acceptEdits" ? "success" : "accent";
 }
 
-function renderApprovalMode(mode: string, text: string): string {
-	const emphasis = mode === "YOLO" ? ANSI_BOLD : "";
-	return `${ansiFg(COLORS[approvalColor(mode)])}${emphasis}${text}${ANSI_RESET}`;
+function renderApprovalMode(theme: Theme, mode: string, text: string): string {
+	const color = approvalColor(mode);
+	const value = mode === "YOLO" ? theme.bold(text) : text;
+	return theme.fg(color, value);
 }
 
 function renderPlanModeStatus(
+	theme: Theme,
 	value: string | undefined,
 	approvalValue: string | undefined,
 	width: number,
@@ -236,13 +235,12 @@ function renderPlanModeStatus(
 	const approvalLabel = approval === "YOLO"
 		? approval
 		: width >= 80 ? `APPROVAL ${approval}` : width >= 48 ? approval : approvalInitial(approval);
-	const separator = width >= 80
-		? `${ansiFg(COLORS.separator)} · ${ANSI_RESET}`
-		: `${ansiFg(COLORS.separator)}/${ANSI_RESET}`;
-	return `${colored("phase", modeLabel)}${separator}${renderApprovalMode(approval, approvalLabel)}`;
+	const sepChar = width >= 80 ? " · " : "/";
+	const sep = theme.fg("borderMuted", sepChar);
+	return `${colored(theme, "phase", modeLabel)}${sep}${renderApprovalMode(theme, approval, approvalLabel)}`;
 }
 
-function renderAutoCompactionMode(value: string | undefined, width: number): string {
+function renderAutoCompactionMode(theme: Theme, value: string | undefined, width: number): string {
 	if (!value) return "";
 	const normalized = value.trim().toUpperCase();
 	if (normalized !== "AUTO ON" && normalized !== "AUTO OFF") return "";
@@ -250,7 +248,7 @@ function renderAutoCompactionMode(value: string | undefined, width: number): str
 	const text = disabled
 		? width >= 80 ? "AUTO-COMPACT OFF" : "AUTO OFF"
 		: width >= 80 ? "AUTO-COMPACT ON" : width >= 48 ? "AUTO ON" : "AUTO";
-	return colored(disabled ? "ctxWarn" : "ctxOk", text);
+	return colored(theme, disabled ? "ctxWarn" : "ctxOk", text);
 }
 
 /**
@@ -262,12 +260,12 @@ function renderAutoCompactionMode(value: string | undefined, width: number): str
  *   - enabled, with counters → `EV● s·d·p`
  * Returns "" when the extension never set a status (not loaded).
  */
-export function renderEvolMarker(value: string | undefined): string {
+export function renderEvolMarker(theme: Theme, value: string | undefined): string {
 	if (!value) return "";
 	const counts = /^EVOL ● (\d+·\d+·\d+)/.exec(value)?.[1];
-	if (counts) return colored("evol", `EV● ${counts}`);
-	if (value === "EVOL off") return colored("separator", `EV○`);
-	return colored("evol", `EV●`);
+	if (counts) return colored(theme, "evol", `EV● ${counts}`);
+	if (value === "EVOL off") return colored(theme, "separator", `EV○`);
+	return colored(theme, "evol", `EV●`);
 }
 
 /**
@@ -277,16 +275,16 @@ export function renderEvolMarker(value: string | undefined): string {
  * or `M pending`): review_required shows in danger color (needs resolve), plain
  * pending in phase color. Returns "" when nothing is pending.
  */
-export function renderKnowledgePendingMarker(value: string | undefined): string {
+export function renderKnowledgePendingMarker(theme: Theme, value: string | undefined): string {
 	if (!value) return "";
 	const review = /^(\d+) review/.exec(value)?.[1];
 	const pending = /· (\d+) pending$/.exec(value)?.[1] ?? /^(\d+) pending$/.exec(value)?.[1];
 	if (review) {
 		const total = pending ? `${review}·${pending}` : review;
-		return colored("danger", `KNOW ${total}`);
+		return colored(theme, "danger", `KNOW ${total}`);
 	}
-	if (pending) return colored("phase", `KNOW ${pending}`);
-	return colored("phase", `KNOW ?`);
+	if (pending) return colored(theme, "phase", `KNOW ${pending}`);
+	return colored(theme, "phase", `KNOW ?`);
 }
 
 /**
@@ -297,14 +295,14 @@ export function renderKnowledgePendingMarker(value: string | undefined): string 
  * danger color so a spike is visible at a glance. Returns "" when there are no
  * unread errors (the logger clears the status to undefined).
  */
-export function renderTeammateDiagnosticMarker(value: string | undefined): string {
+export function renderTeammateDiagnosticMarker(theme: Theme, value: string | undefined): string {
 	if (!value) return "";
 	const count = /⚠(\d+)/.exec(value)?.[1];
-	if (count) return colored("danger", `⚠${count}`);
-	return colored("danger", `⚠`);
+	if (count) return colored(theme, "danger", `⚠${count}`);
+	return colored(theme, "danger", `⚠`);
 }
 
-function renderContextPressure(value: string | undefined, width: number): string {
+function renderContextPressure(theme: Theme, value: string | undefined, width: number): string {
 	if (!value) return "";
 	const normalized = value.replace(/^CTX\s+/i, "").trim();
 	// Pruned count carries an optional /<amount> suffix (e.g. -3/-4.2k); trailing
@@ -327,18 +325,20 @@ function renderContextPressure(value: string | undefined, width: number): string
 		: width >= 48
 			? `CTX ${band === "AUTO-PRUNE" ? "PRUNE" : band}${pruned}${ownerLabel}${reasons}`
 			: band === "AUTO-PRUNE" ? `CTX PRUNE${pruned}${ownerLabel}` : `CTX ${band}${pruned}${ownerLabel}`;
-	const color = band === "CRITICAL" || band === "COMPACT" ? COLORS.ctxCrit : band === "AUTO-PRUNE" ? COLORS.ctxAlert : COLORS.ctxWarn;
-	return `${ansiFg(color)}${text}${ANSI_RESET}`;
+	const color = band === "CRITICAL" || band === "COMPACT" ? "error" : band === "AUTO-PRUNE" ? "warning" : "warning";
+	return theme.fg(color, text);
 }
 
-function renderPressureLine(value: string | undefined, width: number, layoutWidth = width): string {
-	return truncateToWidth(renderContextPressure(value, layoutWidth), Math.max(1, width), "…");
+function renderPressureLine(theme: Theme, value: string | undefined, width: number, layoutWidth = width): string {
+	return truncateToWidth(renderContextPressure(theme, value, layoutWidth), Math.max(1, width), "…");
 }
 
-const SEP = `${ansiFg(COLORS.separator)} · ${ANSI_RESET}`;
+function sep(theme: Theme): string {
+	return theme.fg("borderMuted", " · ");
+}
 
-function renderFirstFittingLine(candidates: string[][], width: number): string {
-	const lines = candidates.map((parts) => parts.filter(Boolean).join(SEP));
+function renderFirstFittingLine(candidates: string[][], width: number, separator: string): string {
+	const lines = candidates.map((parts) => parts.filter(Boolean).join(separator));
 	for (const line of lines) {
 		if (visibleWidth(line) <= width) return line;
 	}
@@ -411,6 +411,7 @@ function shortenModel(id: string): string {
 }
 
 function renderLine1(
+	theme: Theme,
 	rs: RuntimeState,
 	activeToolCalls: number,
 	dir: string,
@@ -426,35 +427,36 @@ function renderLine1(
 	layoutWidth = width,
 ): string {
 	const safeWidth = Math.max(1, width);
-	const modeFull = renderPlanModeStatus(modeStatus, approvalStatus, 80);
-	const modeCompact = renderPlanModeStatus(modeStatus, approvalStatus, 48);
-	const modeNarrow = renderPlanModeStatus(modeStatus, approvalStatus, 1);
-	const autoCompactionFull = renderAutoCompactionMode(compactionStatus, 80);
-	const autoCompactionCompact = renderAutoCompactionMode(compactionStatus, 48);
-	const evolText = renderEvolMarker(evolStatus);
-	const knowledgeText = renderKnowledgePendingMarker(knowledgeStatus);
-	const teammateDiagText = renderTeammateDiagnosticMarker(teammateDiagnosticStatus);
-	const autoCompactionNarrow = renderAutoCompactionMode(compactionStatus, 1);
+	const modeFull = renderPlanModeStatus(theme, modeStatus, approvalStatus, 80);
+	const modeCompact = renderPlanModeStatus(theme, modeStatus, approvalStatus, 48);
+	const modeNarrow = renderPlanModeStatus(theme, modeStatus, approvalStatus, 1);
+	const autoCompactionFull = renderAutoCompactionMode(theme, compactionStatus, 80);
+	const autoCompactionCompact = renderAutoCompactionMode(theme, compactionStatus, 48);
+	const evolText = renderEvolMarker(theme, evolStatus);
+	const knowledgeText = renderKnowledgePendingMarker(theme, knowledgeStatus);
+	const teammateDiagText = renderTeammateDiagnosticMarker(theme, teammateDiagnosticStatus);
+	const autoCompactionNarrow = renderAutoCompactionMode(theme, compactionStatus, 1);
 	const effort = formatEffortStatus(effortStatus);
-	const modelText = colored("model", `${ICONS.model} ${shortenModel(rs.model)}${effort ? ` · ${effort}` : ""}`);
+	const modelText = colored(theme, "model", `${GLYPHS.model} ${shortenModel(rs.model)}${effort ? ` · ${effort}` : ""}`);
 	const toolCallText = activeToolCalls > 0
-		? colored("runs", `${ICONS.runs} ${activeToolCalls} call${activeToolCalls > 1 ? "s" : ""}`)
+		? colored(theme, "runs", `${GLYPHS.runs} ${activeToolCalls} call${activeToolCalls > 1 ? "s" : ""}`)
 		: "";
-	const dirText = colored("dir", `${ICONS.dir} ${basename(dir)}`);
-	const dirGitText = rs.git ? `${dirText}  ${formatGit(rs.git)}` : dirText;
+	const dirText = colored(theme, "dir", `${GLYPHS.dir} ${basename(dir)}`);
+	const dirGitText = rs.git ? `${dirText}  ${formatGit(theme, rs.git)}` : dirText;
 	let tokenText = "";
 	if (rs.tokens.input > 0 || rs.tokens.output > 0 || rs.tokens.cacheRead > 0 || rs.tokens.cacheWrite > 0) {
-		const value = `↑${formatTokens(rs.tokens.input)} ↓${formatTokens(rs.tokens.output)} ${ICONS.tokens}${formatTokens(rs.tokens.input + rs.tokens.output)}${cacheSegment(rs.tokens)}`;
-		tokenText = colored("tokens", value) + usageSparkline;
+		const value = `↑${formatTokens(rs.tokens.input)} ↓${formatTokens(rs.tokens.output)} ${GLYPHS.tokens}${formatTokens(rs.tokens.input + rs.tokens.output)}${cacheSegment(rs.tokens)}`;
+		tokenText = colored(theme, "tokens", value) + usageSparkline;
 	}
 	let contextFull = "";
 	let contextCompact = "";
 	if (rs.contextPercent != null) {
 		const usedPct = Math.max(0, Math.min(100, Math.round(rs.contextPercent)));
-		contextFull = buildContextBar(usedPct);
-		contextCompact = buildContextBar(usedPct, true);
+		contextFull = buildContextBar(theme, usedPct);
+		contextCompact = buildContextBar(theme, usedPct, true);
 	}
 
+	const separator = sep(theme);
 	const candidates = layoutWidth >= 80
 		? [
 			[modeFull, modelText, contextFull, autoCompactionFull, evolText, knowledgeText, teammateDiagText, toolCallText, dirGitText, tokenText],
@@ -476,10 +478,10 @@ function renderLine1(
 				[modeNarrow, autoCompactionNarrow, contextCompact],
 				[modeNarrow, contextCompact],
 			];
-	return renderFirstFittingLine(candidates, safeWidth);
+	return renderFirstFittingLine(candidates, safeWidth, separator);
 }
 
-export function renderWorkflowStatusline(view: WorkflowViewModel, width: number, layoutWidth = width): string {
+export function renderWorkflowStatusline(theme: Theme, view: WorkflowViewModel, width: number, layoutWidth = width): string {
 	const safeWidth = Math.max(1, width);
 	const run = view.activeRun;
 	const runText = run
@@ -487,7 +489,7 @@ export function renderWorkflowStatusline(view: WorkflowViewModel, width: number,
 		: "no active run";
 	const status = run ? workflowStatusLabel(run.status, run.attempt) : workflowStatusLabel(view.status);
 	const chain = `✓${view.chain.completed} ▶${view.chain.running} ○${view.chain.pending}`;
-	const session = `⚑ ${view.sessionLabel}`;
+	const session = `${GLYPHS.milestone} ${view.sessionLabel}`;
 	const action = view.recoveryAction ?? view.nextAction;
 	const recovery = action ? `» ${action}` : "";
 
@@ -507,12 +509,12 @@ export function renderWorkflowStatusline(view: WorkflowViewModel, width: number,
 			: "";
 		parts = [session, recovery, status, runText, chain, gates, budget];
 	}
-	return truncateToWidth(parts.filter(Boolean).join(SEP), safeWidth, "…");
+	return truncateToWidth(parts.filter(Boolean).join(sep(theme)), safeWidth, "…");
 }
 
-export function renderSwarmStatusline(value: string | undefined, width: number): string {
+export function renderSwarmStatusline(theme: Theme, value: string | undefined, width: number): string {
 	if (!value?.trim()) return "";
-	return truncateToWidth(colored("runs", value.trim()), Math.max(1, width), "…");
+	return truncateToWidth(colored(theme, "runs", value.trim()), Math.max(1, width), "…");
 }
 
 // ---------------------------------------------------------------------------
@@ -617,7 +619,7 @@ export function installStatusline(
 		footerCtx = ctx;
 		if (!ctx.hasUI || cockpitOwnsFooter) return;
 		const generation = ++footerGeneration;
-		ctx.ui.setFooter((tui, _theme, footerData) => {
+		ctx.ui.setFooter((tui, theme, footerData) => {
 			disposed = false;
 			// Connect invalidate → requestRender
 			invalidateFn = () => tui.requestRender();
@@ -696,17 +698,32 @@ export function installStatusline(
 					const evolStatus = footerData.getExtensionStatuses().get("self-evolve");
 					const knowledgeStatus = footerData.getExtensionStatuses().get("maestro-knowledge-pending");
 					const teammateDiagnosticStatus = footerData.getExtensionStatuses().get("pi-teammate-diagnostic");
-					const usageSparkline = renderUsageSparklineSegment(usageSeries, statsFooterConfig, width);
-					lines.push(renderLine1(rs, activeToolCalls, cwd, liveWidth, modeStatus, approvalStatus, compactionModeStatus, effortStatus, evolStatus, knowledgeStatus, teammateDiagnosticStatus, usageSparkline, width));
+					const usageSparkline = renderUsageSparklineSegment(theme, usageSeries, statsFooterConfig, width);
+					lines.push(renderLine1(
+						theme,
+						rs,
+						activeToolCalls,
+						cwd,
+						liveWidth,
+						modeStatus,
+						approvalStatus,
+						compactionModeStatus,
+						effortStatus,
+						evolStatus,
+						knowledgeStatus,
+						teammateDiagnosticStatus,
+						usageSparkline,
+						width,
+					));
 
-					const pressureLine = renderPressureLine(pressureStatus, liveWidth, width);
+					const pressureLine = renderPressureLine(theme, pressureStatus, liveWidth, width);
 					if (pressureLine) lines.push(pressureLine);
 
-					const swarmLine = renderSwarmStatusline(swarmStatus, liveWidth);
+					const swarmLine = renderSwarmStatusline(theme, swarmStatus, liveWidth);
 					if (swarmLine) lines.push(swarmLine);
 
 					const workflow = deriveWorkflowViewModel(getWorkflowSnapshot());
-					if (workflow) lines.push(renderWorkflowStatusline(workflow, liveWidth, width));
+					if (workflow) lines.push(renderWorkflowStatusline(theme, workflow, liveWidth, width));
 
 					return lines;
 				},

@@ -1,6 +1,13 @@
 import type { AgentToolResult } from "@earendil-works/pi-agent-core";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
+import { makeFrameBorderLine, resolveGlyphs } from "pi-maestro-settings-core/ui";
+
+const FRAME_GLYPHS = resolveGlyphs("nerd");
+const FRAME_UTILS = {
+  measure: visibleWidth,
+  clip: (text: string, width: number, ellipsis: string) => truncateToWidth(text, width, ellipsis),
+};
 import { isTeammateChild, requestTeammateInteraction } from "../permissions/teammate-relay.ts";
 import type { UserAttentionHandler } from "../notify/user-attention.ts";
 import {
@@ -561,22 +568,16 @@ async function showAskWizard(
         return truncateToWidth(text, width, "", true);
       }
 
-      function fillRule(text: string, width: number, ch: string): string {
-        const used = visibleWidth(text);
-        return used >= width ? text : text + ch.repeat(width - used);
-      }
-
       function frameTop(width: number, title: string): string {
-        const inner = Math.max(0, width - 2);
-        return "┌" + truncateToWidth(fillRule(`─ ${title} `, inner, "─"), inner, "") + "┐";
+        return makeFrameBorderLine("top", width, FRAME_GLYPHS, { corners: "square", utils: FRAME_UTILS, title });
       }
 
       function frameBottom(width: number, status: string): string {
-        const inner = Math.max(0, width - 2);
-        if (!status) return "└" + "─".repeat(inner) + "┘";
-        const label = ` ${status} `;
-        const left = Math.max(1, inner - visibleWidth(label) - 1);
-        return "└" + truncateToWidth(fillRule("─".repeat(left) + label, inner, "─"), inner, "") + "┘";
+        return makeFrameBorderLine("bottom", width, FRAME_GLYPHS, {
+          corners: "square",
+          utils: FRAME_UTILS,
+          label: status || undefined,
+        });
       }
 
       function choiceRow(i: number, leftW: number, q: QuestionSpec): string {

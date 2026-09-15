@@ -1,15 +1,38 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext, Theme, ThemeColor } from "@earendil-works/pi-coding-agent";
 import { visibleWidth } from "@earendil-works/pi-tui";
 import { deriveWorkflowViewModel, type WorkflowSnapshotLike } from "../src/session/view-model.ts";
 import { installStatusline, renderWorkflowStatusline } from "../src/statusline/statusline.ts";
-import { ansiFg, ANSI_BOLD, COLORS } from "../src/statusline/constants.ts";
 
 type EventHandler = (event: unknown, ctx: ExtensionContext) => unknown;
 
 function stripAnsi(value: string): string {
   return value.replace(/\x1b\[[0-9;]*m/g, "");
+}
+
+function colorCode(color: ThemeColor): string {
+  return String(color.length % 256);
+}
+
+function makeFakeTheme(): Theme {
+  const fg = (color: ThemeColor, text: string) => `\x1b[38;5;${colorCode(color)}m${text}\x1b[39m`;
+  return {
+    name: "fake",
+    fg,
+    bg: (_color, text) => text,
+    bold: (text) => `\x1b[1m${text}\x1b[22m`,
+    dim: (text) => `\x1b[2m${text}\x1b[22m`,
+    italic: (text) => text,
+    underline: (text) => text,
+    inverse: (text) => text,
+    strikethrough: (text) => text,
+    getFgAnsi: (color) => fg(color, "").slice(0, -3),
+    getBgAnsi: () => "",
+    getColorMode: () => "truecolor",
+    getThinkingBorderColor: () => (s) => s,
+    getBashModeBorderColor: () => (s) => s,
+  } as unknown as Theme;
 }
 
 function assertLiveRows(lines: string[], width: number): void {
@@ -74,6 +97,7 @@ function createHarness(options: {
   let branchEntries = options.branchEntries ?? [];
   let branchReads = 0;
   let branchEntryVisits = 0;
+  const fakeTheme = makeFakeTheme();
   let ctx = {
     cwd: options.cwd ?? "D:\\pi-maestro-flow",
     hasUI: true,
@@ -110,7 +134,7 @@ function createHarness(options: {
             if (force) forcedRenderRequests++;
             lastRequestedRender = component?.render(terminalWidth);
           },
-        }, {}, footerData);
+        }, fakeTheme, footerData);
       },
     },
   } as unknown as ExtensionContext;
@@ -512,8 +536,8 @@ test("statusline links approval mode with ACT, PLAN and READY using width-aware 
     for (const [status, approval, full, compact, narrow] of [
       ["ACT", "APPROVAL default", "[A] ACT · APPROVAL default", "ACT/default", "A/D"],
       ["ACT", "APPROVAL acceptEdits", "[A] ACT · APPROVAL acceptEdits", "ACT/acceptEdits", "A/E"],
-	  ["ACT", "APPROVAL dontAsk", "[A] ACT · APPROVAL dontAsk", "ACT/dontAsk", "A/N"],
-	  ["ACT", "APPROVAL YOLO", "[A] ACT · YOLO", "ACT/YOLO", "A/Y"],
+      ["ACT", "APPROVAL dontAsk", "[A] ACT · APPROVAL dontAsk", "ACT/dontAsk", "A/N"],
+      ["ACT", "APPROVAL YOLO", "[A] ACT · YOLO", "ACT/YOLO", "A/Y"],
       ["PLAN", "APPROVAL default", "[P] PLAN · APPROVAL plan", "PLAN/plan", "P/P"],
       ["READY", "APPROVAL bypassPermissions", "[P] READY · YOLO", "READY/YOLO", "R/Y"],
     ] as const) {
@@ -531,7 +555,9 @@ test("statusline links approval mode with ACT, PLAN and READY using width-aware 
 
     harness.statuses.set("approval-mode", "APPROVAL YOLO");
     const yolo = harness.render(100)[0];
-    assert.ok(yolo.includes(`${ansiFg(COLORS.danger)}${ANSI_BOLD}YOLO`));
+    // YOLO is rendered in error color and bold.
+    const errorWrap = `\x1b[38;5;${colorCode("error")}m\x1b[1mYOLO\x1b[22m\x1b[39m`;
+    assert.ok(yolo.includes(errorWrap), `expected YOLO styled in error+bold, got ${JSON.stringify(yolo)}`);
 
     for (let width = 1; width <= 120; width++) {
       assertLiveRows(harness.render(width), width);
@@ -874,15 +900,16 @@ test("workflow statusline leads with the session label at every width so concurr
   const view = deriveWorkflowViewModel(snapshot);
   assert.ok(view);
   assert.equal(view.sessionLabel, "20260724-companion-goal-final-fixes");
+  const fakeTheme = makeFakeTheme();
 
   for (let width = 1; width <= 120; width++) {
-    const line = renderWorkflowStatusline(view, width);
+    const line = renderWorkflowStatusline(fakeTheme, view, width);
     assert.ok(visibleWidth(line) <= width, `width ${width}: ${visibleWidth(line)} ${line}`);
     if (width >= 3) {
       assert.ok(stripAnsi(line).startsWith("⚑ "), `width ${width} must lead with the session label: ${stripAnsi(line)}`);
     }
   }
 
-  const narrow = stripAnsi(renderWorkflowStatusline(view, 47));
+  const narrow = stripAnsi(renderWorkflowStatusline(fakeTheme, view, 47));
   assert.match(narrow, /^⚑ 20260724-companion-goal-final-fixes/);
 });

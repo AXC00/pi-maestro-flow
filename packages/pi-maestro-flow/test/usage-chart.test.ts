@@ -1,7 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
-	renderSparkline,
 	renderBarChart,
 	renderLineChart,
 	renderStackedBar,
@@ -10,34 +9,10 @@ import {
 	renderMultiLineChart,
 	renderLineLegend,
 } from "../src/statusline/usage-chart.ts";
-import { COLORS } from "../src/statusline/constants.ts";
 
 function stripAnsi(value: string): string {
 	return value.replace(/\x1b\[[0-9;]*m/g, "");
 }
-
-test("renderSparkline returns empty string for empty input", () => {
-	assert.equal(renderSparkline([]), "");
-	assert.equal(renderSparkline([Number.NaN]), "");
-});
-
-test("renderSparkline maps rising series to ascending glyphs", () => {
-	const out = stripAnsi(renderSparkline([0, 1, 2, 3, 4, 5, 6, 7]));
-	assert.equal(out, "▁▂▃▄▅▆▇█");
-});
-
-test("renderSparkline clamps out-of-range values", () => {
-	const out = stripAnsi(renderSparkline([-100, 5, 100], { min: 0, max: 10 }));
-	// -100 clamps to min (▁), 5 maps mid, 100 clamps to max (█)
-	assert.ok(out.startsWith("▁"));
-	assert.ok(out.endsWith("█"));
-	assert.equal(out.length, 3);
-});
-
-test("renderSparkline downsamples to width", () => {
-	const out = stripAnsi(renderSparkline([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11], { width: 4 }));
-	assert.ok(out.length <= 4 + 1, "should be at most width+1 after last-point padding");
-});
 
 test("renderBarChart returns empty array for empty input", () => {
 	assert.deepEqual(renderBarChart([]), []);
@@ -74,14 +49,14 @@ test("renderLineChart produces height rows of equal width", () => {
 
 test("renderStackedBar returns empty when total is zero or no segments", () => {
 	assert.equal(renderStackedBar([], 0, 10), "");
-	assert.equal(renderStackedBar([{ label: "a", value: 1, color: COLORS.tokens }], 0, 10), "");
+	assert.equal(renderStackedBar([{ label: "a", value: 1, color: "accent" }], 0, 10), "");
 });
 
 test("renderStackedBar fills exactly width cells", () => {
 	const out = renderStackedBar(
 		[
-			{ label: "a", value: 3, color: COLORS.tokens },
-			{ label: "b", value: 1, color: COLORS.model },
+			{ label: "a", value: 3, color: "accent" },
+			{ label: "b", value: 1, color: "error" },
 		],
 		4,
 		8,
@@ -133,7 +108,7 @@ test("renderHeatmap expands to fill the target width with a solid block", () => 
 });
 
 test("renderHeatmapLegend contains the Less/More labels and density glyphs", () => {
-	const legend = stripAnsi(renderHeatmapLegend(COLORS.tokens));
+	const legend = stripAnsi(renderHeatmapLegend("muted"));
 	assert.ok(legend.includes("Less"));
 	assert.ok(legend.includes("More"));
 });
@@ -149,7 +124,7 @@ test("renderMultiLineChart returns empty array for empty input", () => {
 test("renderMultiLineChart renders height rows plus a y-title and x-axis line", () => {
 	const series = [{
 		label: "alpha",
-		color: COLORS.tokens,
+		color: "accent",
 		points: [{ ts: Date.UTC(2026, 0, 1), value: 50 }, { ts: Date.UTC(2026, 0, 10), value: 100 }],
 	}];
 	const lines = renderMultiLineChart(series, { width: 50, height: 6, yTitle: "Tokens per Day", xFormat: "day" });
@@ -166,7 +141,7 @@ test("renderMultiLineChart draws a continuous smooth curve between points, not i
 	// not isolated scatter marks.
 	const series = [{
 		label: "alpha",
-		color: COLORS.tokens,
+		color: "accent",
 		points: [{ ts: Date.UTC(2026, 0, 1), value: 0 }, { ts: Date.UTC(2026, 0, 20), value: 100 }],
 	}];
 	const lines = renderMultiLineChart(series, { width: 60, height: 8, xFormat: "day" });
@@ -186,8 +161,8 @@ test("renderMultiLineChart stacked fills a solid area and y-axis sums the series
 	// filled area whose top is the daily sum, and the y-axis max should equal
 	// the largest stack total (not a single series peak).
 	const series = [
-		{ label: "a", color: COLORS.tokens, points: [{ ts: Date.UTC(2026, 0, 1), value: 10 }, { ts: Date.UTC(2026, 0, 5), value: 30 }] },
-		{ label: "b", color: COLORS.model, points: [{ ts: Date.UTC(2026, 0, 1), value: 5 }, { ts: Date.UTC(2026, 0, 5), value: 25 }] },
+		{ label: "a", color: "accent", points: [{ ts: Date.UTC(2026, 0, 1), value: 10 }, { ts: Date.UTC(2026, 0, 5), value: 30 }] },
+		{ label: "b", color: "error", points: [{ ts: Date.UTC(2026, 0, 1), value: 5 }, { ts: Date.UTC(2026, 0, 5), value: 25 }] },
 	];
 	const lines = renderMultiLineChart(series, { width: 60, height: 8, xFormat: "day", stacked: true });
 	// No yTitle → line 0 is the first chart row (top tick = stacked total).
@@ -200,8 +175,8 @@ test("renderMultiLineChart stacked fills a solid area and y-axis sums the series
 
 test("renderLineLegend joins series with colored dots and labels", () => {
 	const legend = stripAnsi(renderLineLegend([
-		{ label: "Opus 4.6", color: COLORS.tokens, points: [] },
-		{ label: "glm-5.2", color: COLORS.model, points: [] },
+		{ label: "Opus 4.6", color: "accent", points: [] },
+		{ label: "glm-5.2", color: "error", points: [] },
 	]).join("\n"));
 	assert.ok(legend.includes("Opus 4.6"));
 	assert.ok(legend.includes("glm-5.2"));
@@ -214,9 +189,9 @@ test("renderLineLegend returns empty array for empty input", () => {
 
 test("renderLineLegend without width joins all series on a single line", () => {
 	const rows = renderLineLegend([
-		{ label: "a", color: COLORS.tokens, points: [] },
-		{ label: "b", color: COLORS.model, points: [] },
-		{ label: "c", color: COLORS.milestone, points: [] },
+		{ label: "a", color: "accent", points: [] },
+		{ label: "b", color: "error", points: [] },
+		{ label: "c", color: "warning", points: [] },
 	]);
 	assert.equal(rows.length, 1);
 	assert.ok(stripAnsi(rows[0]).includes("a"));
@@ -228,7 +203,7 @@ test("renderLineLegend wraps many models across rows within the width", () => {
 	// 12 models with long-ish labels; at width 40 they cannot all fit one line.
 	const series = Array.from({ length: 12 }, (_, i) => ({
 		label: `model-${i}-name`,
-		color: COLORS.tokens,
+		color: "accent",
 		points: [],
 	}));
 	const rows = renderLineLegend(series, { width: 40 });
@@ -249,7 +224,7 @@ test("renderLineLegend truncates an oversized label to its own row", () => {
 	// A single label wider than the whole budget is truncated to fit one row.
 	const series = [{
 		label: "extremely-long-model-identifier-that-overflowsss",
-		color: COLORS.tokens,
+		color: "accent",
 		points: [],
 	}];
 	const rows = renderLineLegend(series, { width: 20 });

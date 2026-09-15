@@ -17,6 +17,13 @@ import {
   truncateToWidth,
   visibleWidth,
 } from "@earendil-works/pi-tui";
+import { makeBorderFrame, resolveGlyphs } from "pi-maestro-settings-core/ui";
+
+const FRAME_GLYPHS = resolveGlyphs("nerd");
+const FRAME_UTILS = {
+  measure: visibleWidth,
+  clip: (text: string, width: number, ellipsis: string) => truncateToWidth(text, width, ellipsis),
+};
 import type {
   RefineRole,
   RefineRoleSpec,
@@ -488,16 +495,10 @@ function frameBox(
   width: number,
   theme: { fg(name: string, text: string): string },
 ): string[] {
-  const inner = Math.max(0, width - 2);
-  const border = (text: string) => theme.fg("dim", text);
-  return [
-    border(`╭${"─".repeat(inner)}╮`),
-    ...rows.map((row) => {
-      const content = truncateToWidth(row, inner, "…");
-      return `${border("│")}${content}${" ".repeat(Math.max(0, inner - visibleWidth(content)))}${border("│")}`;
-    }),
-    border(`╰${"─".repeat(inner)}╯`),
-  ];
+  return makeBorderFrame(rows, width, FRAME_GLYPHS, FRAME_UTILS, {
+    theme,
+    borderColor: "dim",
+  });
 }
 
 function refineMarkdownTheme(theme: {

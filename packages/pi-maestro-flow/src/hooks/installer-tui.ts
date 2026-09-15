@@ -8,7 +8,14 @@ import {
 } from "@earendil-works/pi-tui";
 import type { HookLevel } from "maestro-flow/dist/src/commands/hooks.js";
 import type { SupportedSettingsLocale } from "pi-maestro-settings-core/v1";
+import { makeBorderFrame, resolveGlyphs } from "pi-maestro-settings-core/ui";
 import { getTuiLocale } from "../tui/locale.ts";
+
+const FRAME_GLYPHS = resolveGlyphs("nerd");
+const FRAME_UTILS = {
+  measure: visibleWidth,
+  clip: (text: string, width: number, ellipsis: string) => truncateToWidth(text, width, ellipsis),
+};
 import { sanitizeHookDisplayText } from "./review.ts";
 import {
   MAESTRO_HOOK_LEVELS,
@@ -383,14 +390,9 @@ function rule(width: number): string {
 }
 
 function frame(rows: readonly string[], width: number, theme: InstallerTheme): string[] {
-  if (width < 2) return rows.map((row) => fitLine(row, width));
-  const inner = width - 2;
-  return [
-    theme.fg("dim", `┌${"─".repeat(inner)}┐`),
-    ...rows.map((row) => {
-      const fitted = fitLine(row, inner);
-      return `${theme.fg("dim", "│")}${fitted}${" ".repeat(Math.max(0, inner - visibleWidth(fitted)))}${theme.fg("dim", "│")}`;
-    }),
-    theme.fg("dim", `└${"─".repeat(inner)}┘`),
-  ];
+  return makeBorderFrame(rows, width, FRAME_GLYPHS, FRAME_UTILS, {
+    corners: "square",
+    theme,
+    borderColor: "dim",
+  });
 }

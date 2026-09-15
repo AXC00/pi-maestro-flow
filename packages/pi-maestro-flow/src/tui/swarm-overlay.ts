@@ -1,5 +1,12 @@
 import { Key, type Component, type Focusable, decodeKittyPrintable, matchesKey, truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
+import { makeFrameBorderLine, makeFrameRow, resolveGlyphs } from "pi-maestro-settings-core/ui";
 import type { TeamSwarmMetric, TeamSwarmProjection } from "../swarm/projection.ts";
+
+const FRAME_GLYPHS = resolveGlyphs("nerd");
+const FRAME_UTILS = {
+  measure: visibleWidth,
+  clip: (text: string, width: number, ellipsis: string) => truncateToWidth(text, width, ellipsis),
+};
 
 type SwarmView = "summary" | "topology" | "metrics" | "result";
 const VIEWS: readonly SwarmView[] = ["summary", "topology", "metrics", "result"];
@@ -50,14 +57,14 @@ export class SwarmOverlay implements Component, Focusable {
     const visible = content.slice(offset, offset + contentHeight);
     while (visible.length < contentHeight) visible.push("");
     return [
-      border("top", safeWidth),
-      boxLine(`TEAM SWARM · JSON PROJECTION · ${this.snapshot.status.toUpperCase()}`, inner),
-      boxLine(fit(this.snapshot.objective, inner), inner),
-      border("middle", safeWidth),
-      boxLine(VIEWS.map((view, index) => view === this.view ? `[${index + 1} ${view}]` : `${index + 1} ${view}`).join("  "), inner),
-      ...visible.map((line) => boxLine(line, inner)),
-      boxLine(`Esc close  ←/→ views  ↑/↓ scroll  ${offset + 1}/${maxOffset + 1}`, inner),
-      border("bottom", safeWidth),
+      makeFrameBorderLine("top", safeWidth, FRAME_GLYPHS),
+      makeFrameRow(`TEAM SWARM · JSON PROJECTION · ${this.snapshot.status.toUpperCase()}`, inner, FRAME_GLYPHS, FRAME_UTILS, { leadingSpace: true }),
+      makeFrameRow(fit(this.snapshot.objective, inner), inner, FRAME_GLYPHS, FRAME_UTILS, { leadingSpace: true }),
+      makeFrameBorderLine("middle", safeWidth, FRAME_GLYPHS),
+      makeFrameRow(VIEWS.map((view, index) => view === this.view ? `[${index + 1} ${view}]` : `${index + 1} ${view}`).join("  "), inner, FRAME_GLYPHS, FRAME_UTILS, { leadingSpace: true }),
+      ...visible.map((line) => makeFrameRow(line, inner, FRAME_GLYPHS, FRAME_UTILS, { leadingSpace: true })),
+      makeFrameRow(`Esc close  ←/→ views  ↑/↓ scroll  ${offset + 1}/${maxOffset + 1}`, inner, FRAME_GLYPHS, FRAME_UTILS, { leadingSpace: true }),
+      makeFrameBorderLine("bottom", safeWidth, FRAME_GLYPHS),
     ];
   }
 
@@ -151,5 +158,3 @@ function optionalFixed(value: number | undefined): string { return value === und
 function percent(value: number): string { return `${Math.round(value * 100)}%`; }
 function bar(value: number, length: number): string { const count = Math.max(0, Math.min(length, Math.round(value * length))); return `${"█".repeat(count)}${"░".repeat(length - count)}`; }
 function fit(text: string, width: number): string { return truncateToWidth(text, Math.max(1, width), "…"); }
-function boxLine(content: string, inner: number): string { const clipped = fit(` ${content}`, inner); return `│${clipped}${" ".repeat(Math.max(0, inner - visibleWidth(clipped)))}│`; }
-function border(position: "top" | "middle" | "bottom", width: number): string { const [left, right] = position === "top" ? ["╭", "╮"] : position === "bottom" ? ["╰", "╯"] : ["├", "┤"]; return width <= 1 ? "─".slice(0, width) : `${left}${"─".repeat(width - 2)}${right}`; }
