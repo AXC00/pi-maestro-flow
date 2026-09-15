@@ -10,3 +10,4 @@ export * from "./gateway-session-launch.ts";
 export * from "./guide.ts";
 export * from "./pi-config-sync.ts";
 export * from "./remote-channel.ts";
+export * from "./ssh-bg.ts";

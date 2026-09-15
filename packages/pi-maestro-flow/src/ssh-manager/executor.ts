@@ -17,9 +17,14 @@ const POWERSHELL_MAX_INVOCATION_CHARS = 8_000;
 
 export interface SshExecuteRequest { command: string; cwd?: string; timeout?: number; }
 export interface SshExecuteOptions { signal?: AbortSignal; outputLimitBytes?: number; agentPath?: string; }
+export interface SshSessionOptions { signal?: AbortSignal; agentPath?: string; timeout?: number; }
 export interface SshExecutionResult {
   stdout: string; stderr: string; exitCode: number | null; signal: string | null; durationMs: number;
   effectiveDigest?: string;
+}
+export interface SshCommandSession {
+  openChannel(request: SshExecuteRequest, options?: SshExecuteOptions): Promise<SshCommandChannel>;
+  close(): void;
 }
 export interface SshConnectionTestResult { fingerprint: string; effectiveDigest?: string; }
 export interface SshConnectionSource {
@@ -39,7 +44,7 @@ class ConnectedChain {
   constructor(
     readonly clients: Client[],
     private readonly sockets: Duplex[],
-    readonly target: SshHost,
+    readonly targetShell: SshHost["shell"],
     readonly effectiveDigest?: string,
   ) {}
   get client(): Client { return this.clients[this.clients.length - 1]!; }
@@ -56,11 +61,109 @@ class ConnectedChain {
   }
 }
 
+class SshCommandSessionImpl implements SshCommandSession {
+  private closed = false;
+  private readonly channels = new Set<() => void>();
+
+  constructor(private readonly chain: ConnectedChain) {
+    chain.onFailure(() => this.close());
+  }
+
+  async openChannel(request: SshExecuteRequest, options: SshExecuteOptions = {}): Promise<SshCommandChannel> {
+    const normalized = validateRequest(request, options.outputLimitBytes);
+    if (options.signal?.aborted) throw abortError();
+    if (this.closed) throw new Error("SSH command session is closed");
+    return new Promise<SshCommandChannel>((resolve, reject) => {
+      let settled = false;
+      const timer = setTimeout(() => fail(new Error("SSH command timed out")), normalized.timeout * 1000);
+      const cleanupStartup = (): void => {
+        clearTimeout(timer);
+        options.signal?.removeEventListener("abort", onAbort);
+      };
+      const fail = (error: Error): void => {
+        if (settled) return;
+        settled = true;
+        cleanupStartup();
+        reject(error);
+      };
+      const onAbort = (): void => fail(abortError());
+      options.signal?.addEventListener("abort", onAbort, { once: true });
+      if (options.signal?.aborted) {
+        onAbort();
+        return;
+      }
+      if (this.closed) {
+        fail(new Error("SSH command session is closed"));
+        return;
+      }
+      let remoteCommand: string;
+      try {
+        remoteCommand = buildRemoteCommand(this.chain.targetShell, normalized.command, normalized.cwd);
+      } catch (error) {
+        fail(asError(error));
+        return;
+      }
+      this.chain.client.exec(remoteCommand, (error, channel) => {
+        if (error) {
+          fail(new Error("SSH command could not be started"));
+          return;
+        }
+        if (settled || this.closed) {
+          channel.destroy();
+          return;
+        }
+        settled = true;
+        cleanupStartup();
+        let channelClosed = false;
+        const close = (): void => {
+          if (channelClosed) return;
+          channelClosed = true;
+          this.channels.delete(close);
+          channel.destroy();
+        };
+        this.channels.add(close);
+        channel.once("close", close);
+        resolve({
+          channel,
+          ...(this.chain.effectiveDigest ? { effectiveDigest: this.chain.effectiveDigest } : {}),
+          close,
+        });
+      });
+    });
+  }
+
+  close(): void {
+    if (this.closed) return;
+    this.closed = true;
+    for (const close of [...this.channels]) close();
+    this.chain.cleanup();
+  }
+}
+
 export class SshExecutor {
   constructor(
     private readonly clientFactory: SshClientFactory = () => new Client(),
     private readonly connectionSource?: SshConnectionSource,
   ) {}
+
+  async openSession(hostValue: unknown, options: SshSessionOptions = {}): Promise<SshCommandSession> {
+    const timeout = options.timeout ?? DEFAULT_SSH_TIMEOUT_SECONDS;
+    if (!Number.isInteger(timeout) || timeout < 1 || timeout > MAX_SSH_TIMEOUT_SECONDS) {
+      throw new Error("SSH session timeout must be an integer between 1 and 300 seconds");
+    }
+    if (options.signal?.aborted) throw abortError();
+    const resolved = await this.resolveConnection(hostValue, false, options.agentPath);
+    let chain: ConnectedChain | undefined;
+    try {
+      chain = await this.connect(resolved, timeout, options);
+      return new SshCommandSessionImpl(chain);
+    } catch (error) {
+      chain?.cleanup();
+      throw error;
+    } finally {
+      zeroResolvedKeys(resolved);
+    }
+  }
 
   async testConnection(hostValue: unknown, options: SshExecuteOptions = {}): Promise<SshConnectionTestResult> {
     if (options.signal?.aborted) throw abortError();
@@ -98,7 +201,7 @@ export class SshExecutor {
         if (options.signal?.aborted) { onAbort(); return; }
         active.onFailure(() => fail(new Error("SSH connection or authentication failed")));
         let remoteCommand: string;
-        try { remoteCommand = buildRemoteCommand(active.target.shell, normalized.command, normalized.cwd); }
+        try { remoteCommand = buildRemoteCommand(active.targetShell, normalized.command, normalized.cwd); }
         catch (error) { fail(asError(error)); return; }
         active.client.exec(remoteCommand, (error, channel) => {
           if (error) { fail(new Error("SSH command could not be started")); return; }
@@ -155,7 +258,7 @@ export class SshExecutor {
         options.signal?.addEventListener("abort", onAbort, { once: true });
         if (options.signal?.aborted) { onAbort(); return; }
         active.onFailure(() => finishReject(new Error(stream ? "SSH connection closed before command completed" : "SSH connection or authentication failed")));
-        active.client.exec(buildRemoteCommand(active.target.shell, normalized.command, normalized.cwd), (error, channel) => {
+        active.client.exec(buildRemoteCommand(active.targetShell, normalized.command, normalized.cwd), (error, channel) => {
           if (error) { finishReject(new Error("SSH command could not be started")); return; }
           if (settled) { channel.destroy(); return; }
           stream = channel;
@@ -250,7 +353,7 @@ export class SshExecutor {
     tofuCapture?: (fingerprint: string) => void,
   ): Promise<ConnectedChain> {
     const clients: Client[] = [], sockets: Duplex[] = [];
-    const chain = new ConnectedChain(clients, sockets, resolved.target, resolved.effectiveDigest);
+    const chain = new ConnectedChain(clients, sockets, resolved.target.shell, resolved.effectiveDigest);
     try {
       for (let index = 0; index < resolved.hops.length; index++) {
         if (options.signal?.aborted) throw abortError();

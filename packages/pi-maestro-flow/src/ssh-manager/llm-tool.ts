@@ -6,6 +6,7 @@ import {
   type SshExecuteOptions,
   type SshExecutionResult,
 } from "./executor.ts";
+import { SshBgParams, type SshBgInput } from "./ssh-bg.ts";
 import { SSH_HOST_ID_PATTERN, type SshHost } from "./model.ts";
 import type { SshStartPiInput } from "./gateway-session-launch.ts";
 
@@ -99,14 +100,15 @@ export const SshToolParams = Type.Union([
       description: "Gateway call timeout in seconds (default 30, maximum 300)",
     })),
   }, { additionalProperties: false }),
+  SshBgParams,
 ], {
   type: "object",
-  description: "List unlocked SSH targets, execute a legacy command, or use the built-in Gateway. ensure_gateway may start a non-persistent remote daemon tied to the current local Pi session. targetId selects a provider-owned configured server; omission works only when exactly one #ssh server is attached and errors for none or multiple. Host, authentication, and Gateway command parameters are never accepted. For dynamic Gateway calls, use action=describe tool=<name> to retrieve the authoritative inputSchema before action=call. session.start-pi returns taskId and monitorHandle; pass either value as monitor.handle."
+  description: "List unlocked SSH targets, execute a legacy command, use the built-in Gateway, or manage background jobs. job_start backgrounds immediately; job_run waits up to timeout then detaches; job_exec appends a command on the same SSH TCP session and backgrounds it immediately; job_status, job_wait, job_kill, job_list, and job_close provide job control. targetId selects a provider-owned configured server; omission works only when exactly one #ssh server is attached and errors for none or multiple. Host, authentication, and Gateway command parameters are never accepted. For dynamic Gateway calls, use action=describe tool=<name> to retrieve the authoritative inputSchema before action=call. session.start-pi returns taskId and monitorHandle; pass either value as monitor.handle."
 });
 
 export type SshCommandToolInput = Static<typeof SshCommandToolParams>;
 export type SshToolInput = Static<typeof SshToolParams>;
-export type { SshStartPiInput };
+export type { SshBgInput, SshStartPiInput };
 
 export interface SshHostProvider {
   getHosts(): SshHost[];

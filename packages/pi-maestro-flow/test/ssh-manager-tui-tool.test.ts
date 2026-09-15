@@ -196,6 +196,9 @@ test("LLM SSH tool schema keeps legacy commands and Gateway actions hostless", a
   assert.equal(Value.Check(SshToolParams, { command: "id", action: "status" }), false);
   assert.equal(Value.Check(SshToolParams, { action: "status", host: "alpha.example.test" }), false);
   assert.equal(Value.Check(SshToolParams, { action: "call", tool: "host", auth: {}, password: "secret" }), false);
+  assert.equal(Value.Check(SshToolParams, { action: "job_start", targetId: "alpha-1", command: "sleep 10" }), true);
+  assert.equal(Value.Check(SshToolParams, { action: "job_exec", sessionId: "ssh-session-1", command: "echo next" }), true);
+  assert.equal(Value.Check(SshToolParams, { action: "job_exec", targetId: "alpha-1", sessionId: "ssh-session-1", command: "echo next" }), false);
 
   const provider = { current: [...hosts], getHosts() { return this.current; } };
   const context = createBoundSshToolContext(provider, new SshExecutor(), "alpha-1");

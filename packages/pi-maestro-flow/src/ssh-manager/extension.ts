@@ -9,7 +9,7 @@ import type {
   ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
-import { sanitizeCardText, toolCallLine, toolResultLine } from "../quiet-render.ts";
+import { sanitizeCardText, toolCallLine, toolResultLine } from "pi-cockpit/src/quiet-tools.ts";
 import { getVisibleTasks } from "../tools/todo.ts";
 import {
   SshHostProviderError,
@@ -22,6 +22,7 @@ import type {
 } from "pi-maestro-backend-core/v1/ssh";
 import { EncryptedSshStore, defaultSshManagerStorePath } from "./encrypted-store.ts";
 import { SshExecutor, type SshExecutionResult } from "./executor.ts";
+import { registerSshBg, type SshBgInput, type SshBgManager, type SshBgJobStatus } from "./ssh-bg.ts";
 import {
   SshGatewayCapabilityError,
   SshGatewayClientPool,
@@ -89,6 +90,11 @@ interface SshToolDetails {
   action?: string;
   tool?: string;
   summary?: string;
+  sessionId?: string;
+  jobId?: string;
+  status?: SshBgJobStatus;
+  background?: boolean;
+  outputTail?: string;
   exitCode: number | null;
   signal: string | null;
   durationMs: number;
@@ -124,6 +130,7 @@ export function registerSshManager(
   const remoteChannelBroker = new TeammateRemoteChannelBroker(store, executor);
   const selected = new Map<string, string>();
   let activeContext: ExtensionContext | undefined;
+  let sshBackground: SshBgManager | undefined;
 
   // Launch receipt/cursor persistence advances the encrypted document revision,
   // but must not churn the transport cache. This HMAC changes only when the
@@ -186,10 +193,12 @@ export function registerSshManager(
     void resumeActiveMonitoring().catch(() => undefined);
   };
   const invalidateGatewayHost = async (hostId: string): Promise<void> => {
+    sshBackground?.invalidateHost(hostId);
     await gatewayPool.invalidateHost(hostId);
     await gatewayBootstrap.invalidateHost(hostId);
   };
   const invalidateAllGatewayHosts = async (): Promise<void> => {
+    sshBackground?.invalidateAll();
     await gatewayPool.close();
     await gatewayBootstrap.invalidateAll();
   };
@@ -310,6 +319,15 @@ export function registerSshManager(
     await store.reload();
   };
 
+  sshBackground = registerSshBg(pi, {
+    executor,
+    resolveTarget: async (targetId) => {
+      await refreshStore();
+      const host = resolveExecutionHost(targetId);
+      return { host, fence: connectionFence(host.id) };
+    },
+  }, false);
+
   const prepareAttachmentSelection = async (ctx: ExtensionContext): Promise<boolean> => {
     const wasLocked = store.locked;
     if (!await ensureUnlocked(ctx, store)) return false;
@@ -367,15 +385,17 @@ export function registerSshManager(
     name: "ssh",
     label: "SSH",
     renderShell: "self",
-    description: `Execute a bounded command or use the built-in Pi Maestro Gateway on any configured SSH server after the user unlocks the manager.
+    description: `Execute a bounded command, manage background jobs, or use the built-in Pi Maestro Gateway on any configured SSH server after the user unlocks the manager.
 
-Use action=targets to list provider-owned target ids, then pass targetId on a command or Gateway action. ensure_gateway may start a non-persistent Gateway whose lifetime is tied to the current local Pi session. Omitting targetId works only when exactly one #ssh server is attached and is an error when none or multiple are attached. The tool never accepts host or authentication parameters. Gateway actions and sync_pi_config use fixed remote commands that cannot be overridden. sync_pi_config accepts only fixed categories; the host resolves current-user Pi files internally and never exposes their paths or contents. start_pi snapshots only explicitly selected existing tasks from the current local Pi Todo and launches an independent remote Gateway session; it never synchronizes or completes either Todo authority. Server configuration stays in the encrypted user-level SSH manager. #ssh selection remains independent of teammate and remote-worker routing. Each resolved target decides whether ordinary commands run through bash or PowerShell.`,
-    promptSnippet: "List unlocked SSH targets, start a session-scoped remote Gateway, execute a command, securely sync fixed Pi config categories, launch selected local Todo instructions with start_pi, or use Gateway actions by provider-owned targetId.",
+Use action=targets to list provider-owned target ids, then pass targetId on a command or Gateway action. job_start backgrounds immediately and returns jobId/sessionId; job_run waits up to timeout then detaches; job_exec appends a command on the same SSH TCP session and backgrounds it immediately; job_status, job_wait, job_kill, job_list, and job_close provide job control. ensure_gateway may start a non-persistent Gateway whose lifetime is tied to the current local Pi session. Omitting targetId works only when exactly one #ssh server is attached and is an error when none or multiple are attached. The tool never accepts host or authentication parameters. Gateway actions and sync_pi_config use fixed remote commands that cannot be overridden. sync_pi_config accepts only fixed categories; the host resolves current-user Pi files internally and never exposes their paths or contents. start_pi snapshots only explicitly selected existing tasks from the current local Pi Todo and launches an independent remote Gateway session; it never synchronizes or completes either Todo authority. Server configuration stays in the encrypted user-level SSH manager. #ssh selection remains independent of teammate and remote-worker routing. Each resolved target decides whether ordinary commands run through bash or PowerShell.`,
+    promptSnippet: "List targets, execute foreground commands, manage job_start/job_run/job_exec/job_status/job_wait/job_kill/job_list/job_close background SSH jobs, or use Gateway actions by targetId.",
     promptGuidelines: [
       "Use read-only inspection before mutations unless the user explicitly requested a change.",
       "Use action=guide for local Gateway setup instructions; it does not contact a server.",
       "Use action=targets after unlock and pass only a returned targetId; never invent target ids or connection parameters.",
       "Use action=ensure_gateway only when the remote Gateway is unavailable and a daemon tied to the current local Pi session is acceptable; it never replaces durable remote service setup.",
+      "Use job_start for long-running commands, then pass its sessionId to job_exec or job_start to append commands on the same SSH TCP connection. job_exec always backgrounds immediately; use job_run only when foreground waiting is explicitly desired.",
+      "Use job_wait once or wait for the ssh-bg-complete notification; use job_status only to inspect output and job_kill to stop a job.",
       "For action=call, first use action=describe with the targetId and Gateway tool name; pass the returned tool inputSchema exactly in args. Dynamic call args are intentionally generic at this outer tool boundary.",
       "For session.start-pi, use the returned taskId or monitorHandle as monitor.handle; do not rename it to taskId when calling monitor.",
       "Never read or print private keys, passwords, tokens, credential stores, or host-key material.",
@@ -387,6 +407,10 @@ Use action=targets to list provider-owned target ids, then pass targetId on a co
       params: SshToolInput,
       signal: AbortSignal,
     ) {
+      if (isSshJobInput(params)) {
+        if (!sshBackground) throw new Error("SSH background manager is unavailable");
+        return sshBackground.execute(params, signal);
+      }
       const requestedTargetId = "targetId" in params ? params.targetId : undefined;
       const details = (
         result?: SshExecutionResult,
@@ -711,7 +735,7 @@ Use action=targets to list provider-owned target ids, then pass targetId on a co
         : attachedHosts.length > 1
           ? "Multiple SSH servers are attached, so every SSH call must pass one explicit targetId; omission is an error."
           : "No SSH server is attached, so omitting targetId is an error.";
-      const systemPrompt = `${event.systemPrompt}\n\n<ssh-management-context>\nThe independent encrypted SSH manager is unlocked. Gateway endpoint and credentials remain internal and are never included in this prompt. The agent may access any configured server through the ssh tool by first calling action=targets and then passing a provider-owned targetId. Attached SSH metadata (id, label, and shell only): ${safeAttachments}. ${omissionRule} targetId never contains host or authentication data. ensure_gateway can start a non-persistent remote Gateway tied to this local Pi session and accepts only targetId plus an optional timeout. sync_pi_config accepts only targetId and fixed categories (models, auth, teammate); local paths and contents are resolved and transferred by the host outside model-visible arguments and results. start_pi accepts only local todoIds, an optional objective/agent/timeout, targetId, and requestId; the host reads and sanitizes current local Pi Todo tasks and session identity. Gateway actions always use fixed remote commands and never accept host, authentication, command, remote cwd, sessionId, snapshot, or callback overrides. #ssh attachments do not select or configure teammate routing. Remote Monitor calls use the returned launch receipt and never update local Pi Todo. Never use remote-worker or expose credentials.\n</ssh-management-context>`;
+      const systemPrompt = `${event.systemPrompt}\n\n<ssh-management-context>\nThe independent encrypted SSH manager is unlocked. Gateway endpoint and credentials remain internal and are never included in this prompt. The agent may access any configured server through the ssh tool by first calling action=targets and then passing a provider-owned targetId. Use ssh job_start for long-running remote commands: it returns a jobId and sessionId; job_exec or job_start with that sessionId appends commands on the same SSH TCP connection and backgrounds them. Use job_run only when foreground waiting is explicitly desired. Attached SSH metadata (id, label, and shell only): ${safeAttachments}. ${omissionRule} targetId never contains host or authentication data. ensure_gateway can start a non-persistent remote Gateway tied to this local Pi session and accepts only targetId plus an optional timeout. sync_pi_config accepts only targetId and fixed categories (models, auth, teammate); local paths and contents are resolved and transferred by the host outside model-visible arguments and results. start_pi accepts only local todoIds, an optional objective/agent/timeout, targetId, and requestId; the host reads and sanitizes current local Pi Todo tasks and session identity. Gateway actions always use fixed remote commands and never accept host, authentication, command, remote cwd, sessionId, snapshot, or callback overrides. #ssh attachments do not select or configure teammate routing. Remote Monitor calls use the returned launch receipt and never update local Pi Todo. Never use remote-worker or expose credentials.\n</ssh-management-context>`;
       return { systemPrompt };
     } catch {
       clearSelection(ctx);
@@ -721,6 +745,7 @@ Use action=targets to list provider-owned target ids, then pass targetId on a co
 
   pi.on("session_start", async (_event, ctx) => {
     activeContext = ctx;
+    sshBackground?.initialize();
     completionRouter.setActiveSession(ctx.sessionManager?.getSessionId?.());
     clearSelection(ctx);
     if (!store.locked) scheduleActiveMonitoring();
@@ -731,6 +756,7 @@ Use action=targets to list provider-owned target ids, then pass targetId on a co
     providerRegistration.dispose();
     remoteChannelBroker.close();
     monitor.shutdown();
+    await sshBackground?.close();
     await completionRouter.dispose().catch(() => undefined);
     store.lock();
     await gatewayPool.close();
@@ -1455,6 +1481,10 @@ function formatSshAddress(host: string, port: number): string {
   return `${address}:${port}`;
 }
 
+function isSshJobInput(params: SshToolInput): params is SshBgInput {
+  return "action" in params && typeof params.action === "string" && params.action.startsWith("job_");
+}
+
 function formatSshToolArgument(args: Partial<SshToolInput>, target?: SshToolTargetDetails): string {
   const parts: string[] = [];
   if (target) {
@@ -1464,6 +1494,13 @@ function formatSshToolArgument(args: Partial<SshToolInput>, target?: SshToolTarg
     parts.push(`${label} · ${user}@${formatSshAddress(host, target.port)}`, target.shell);
   }
   if ("action" in args && typeof args.action === "string") {
+    if (args.action.startsWith("job_")) {
+      parts.push(`job ${sanitizeCardText(args.action.slice(4), 32)}`);
+      const record = args as Record<string, unknown>;
+      if (typeof record.jobId === "string") parts.push(sanitizeCardText(record.jobId, 128));
+      if (typeof record.sessionId === "string") parts.push(sanitizeCardText(record.sessionId, 128));
+      return parts.join(" · ");
+    }
     parts.push(args.action === "targets" ? "targets" : `gateway ${sanitizeCardText(args.action, 32)}`);
     if ((args.action === "describe" || args.action === "call") && typeof args.tool === "string") {
       parts.push(sanitizeCardText(args.tool, 128));
@@ -1477,7 +1514,8 @@ function formatSshToolArgument(args: Partial<SshToolInput>, target?: SshToolTarg
 
 function formatSshResultSummary(details: SshToolDetails | undefined, isError: boolean): string {
   const parts: string[] = [];
-  if (details?.summary) parts.push(details.summary);
+  if (details?.jobId && details.status) parts.push(`${details.jobId} · ${details.status}`);
+  else if (details?.summary) parts.push(details.summary);
   else if (typeof details?.exitCode === "number") parts.push(`exit ${details.exitCode}`);
   else if (!details?.signal) parts.push(isError ? "failed" : "exit unknown");
   if (details?.signal) parts.push(`signal ${details.signal}`);

@@ -40,6 +40,7 @@ class FakeClient extends EventEmitter {
   lifecycle?: string[];
   name = "client";
   command: string | undefined;
+  commands: string[] = [];
   output: string | Buffer = "hello";
   errorOutput: string | Buffer = "warning";
   stayPending = false;
@@ -70,6 +71,7 @@ class FakeClient extends EventEmitter {
 
   exec(command: string, callback: (error: Error | undefined, channel: any) => void): this {
     this.command = command;
+    this.commands.push(command);
     const channel = new PassThrough() as PassThrough & { stderr: PassThrough };
     channel.stderr = new PassThrough();
     this.channel = channel;
@@ -132,6 +134,20 @@ test("SSH executor opens a reusable pinned command channel without changing the 
   assert.equal(handle.channel, client.channel);
   handle.close();
   assert.equal(client.channel?.destroyed, true);
+});
+
+test("SSH executor reuses one connected SSH client for multiple session channels", async () => {
+  const client = new FakeClient();
+  client.keepChannelOpen = true;
+  const session = await new SshExecutor(() => client as unknown as Client).openSession(host(), { timeout: 5 });
+  const first = await session.openChannel({ command: "printf first" });
+  const second = await session.openChannel({ command: "printf second", cwd: "/srv" });
+  assert.equal(client.commands.length, 2);
+  assert.match(client.commands[0]!, /printf first/);
+  assert.match(client.commands[1]!, /cd -- .*srv.*printf second/);
+  first.close();
+  second.close();
+  session.close();
 });
 
 test("SSH executor absorbs a late connection reset after command completion", async () => {
