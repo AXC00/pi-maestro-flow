@@ -12,7 +12,7 @@ import { GatewayOwnerStore } from "./owner-store.ts";
 import { canonicalizeWorkspacePath, gatewayConfigPath, gatewayOwnerPath, gatewayTasksRoot, gatewayWorkspaceRegistryPath } from "./state-paths.ts";
 import { TaskJournal, type GatewayTaskJournalRecord } from "./task-journal.ts";
 import { WorkspaceRegistry, type WorkspaceUnregisterOptions } from "./workspace-registry.ts";
-import type { GatewayTunnelPublicState } from "./tunnel/provider.ts";
+import type { GatewayTunnelDoctorReport, GatewayTunnelPublicState } from "./tunnel/provider.ts";
 import type { GatewayPairingIssue } from "./pairing-store.ts";
 import type { FabricConnectorRevocationResult } from "./fabric/pairing-adapter.ts";
 import type { FabricConnectorServiceStatus } from "./fabric/connector-service.ts";
@@ -362,6 +362,19 @@ export class GatewayControlClient {
 
   async tunnelProfileRestart(profile: string, options: { timeoutMs?: number; expectedGeneration?: number } = {}): Promise<GatewayTunnelPublicState> {
     return this.tunnelControl("tunnel-restart", undefined, "default", options, true, profile) as Promise<GatewayTunnelPublicState>;
+  }
+
+  /** Read-only local doctor. It never starts the daemon or invokes providers. */
+  async tunnelDoctor(timeoutMs = STATUS_TIMEOUT_MS): Promise<GatewayTunnelDoctorReport> {
+    const status = await this.status();
+    if (!status.online || !status.owner?.socket) throw new Error("Pi Maestro Gateway is offline. Start it with `pi-maestro-gateway serve`.");
+    return requestGatewayIpcControl({
+      address: status.owner.socket,
+      ownerToken: status.owner.ownerToken,
+      action: "tunnel-doctor",
+      timeoutMs,
+      data: { deadlineAt: Date.now() + timeoutMs },
+    }) as Promise<GatewayTunnelDoctorReport>;
   }
 
   async issueFabricPurposePairing(options: {

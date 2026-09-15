@@ -16,7 +16,14 @@
 import { spawnSync } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
-import { Key, type Component, type Focusable, matchesKey, truncateToWidth } from "@earendil-works/pi-tui";
+import { Key, type Component, type Focusable, matchesKey, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import { makeBorderFrame, resolveGlyphs } from "pi-maestro-settings-core/ui";
+
+const FRAME_GLYPHS = resolveGlyphs("nerd");
+const FRAME_UTILS = {
+  measure: visibleWidth,
+  clip: (text: string, width: number, ellipsis: string) => truncateToWidth(text, width, ellipsis),
+};
 import { readTunnelState, startQuickTunnel as startCloudflareQuickTunnel, stopQuickTunnel as stopCloudflareQuickTunnel, writeGatewayConfigChanges } from "../gateway/workspace-client.ts";
 import { gatewayConfigPath } from "../gateway/state-paths.ts";
 
@@ -869,7 +876,13 @@ function rule(width: number): string {
 }
 
 function frame(rows: readonly string[], width: number): string[] {
-  return [`┌${"─".repeat(Math.max(0, width))}┐`, ...rows.map((row) => `│${row}│`), `└${"─".repeat(Math.max(0, width))}┘`];
+  // This surface's `width` is the inner content width; the frame adds the two
+  // border columns, so convert to the shared helper's outer-width contract.
+  return makeBorderFrame(rows, width + 2, FRAME_GLYPHS, FRAME_UTILS, {
+    corners: "square",
+    clip: false,
+    pad: false,
+  });
 }
 
 function fitSegments(width: number, segments: readonly string[]): string {

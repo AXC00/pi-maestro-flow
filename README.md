@@ -123,7 +123,8 @@ Maestro Flow 自动分类意图并路由：**简单任务**直接执行 · **多
 | **[用户手册](GUIDE.md)** | 深入教程，每个子系统附示例 |
 | **[Smart Search Provider 配置指南](docs/smart-search-provider-config.md)** | 搜索引擎配置 — 双路径架构、Provider API Key、凭证源语法、TUI 操作、配置同步 |
 | **[Teammate Backend 适配器契约](docs/teammate-backend-adapter-contract.md)** | 第三方执行后端接入 — `TeammateBackend` 接口、`.pi/teammate-backends.json` 注册、能力裁决、recovery facts、完整示例 |
-| **[Gateway Tunnel 配置指南](docs/gateway-tunnel-configuration.md)** | 独立配置 TUI、Gateway HTTP/OAuth、Quick/Persistent tunnel profile、OpenSSH Reverse 与服务器 HTTPS 反代 |
+| **[Gateway Tunnel 配置指南](docs/gateway-tunnel-configuration.md)** | 独立配置 TUI、`/gateway tunnel`、MCP access、Quick/Persistent profile、OpenSSH Reverse 与服务器 HTTPS 反代 |
+| **[OpenAI Secure MCP Tunnel 安装指南](packages/pi-maestro-flow/optional/OPENAI-TUNNEL-SETUP.md)** | 实验性外部 `tunnel-client`、环境变量引用、managed-forward MCP access、验证与回滚 |
 | **[Gateway 命令与 MCP 工具边界](docs/gateway-command-mcp-tool-design.md)** | `/gateway` 管理面、Gateway MCP 控制面与模型侧 `mcp` 工具的职责划分 |
 | **[多设备 Fabric 架构](docs/fabric/README.md)** | Endpoint-first、connection-first 的目标架构及 `pi-maestro-fabric-core` Phase 1 契约基线 |
 | **[发布说明](RELEASE.md)** | 版本历史与变更日志 |

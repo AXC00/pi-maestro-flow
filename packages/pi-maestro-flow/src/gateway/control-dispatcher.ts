@@ -26,6 +26,7 @@ export const GATEWAY_CONTROL_ACTIONS = [
   "tunnel-start",
   "tunnel-stop",
   "tunnel-restart",
+  "tunnel-doctor",
 ] as const;
 export type GatewayControlAction = typeof GATEWAY_CONTROL_ACTIONS[number];
 export type GatewayTunnelControlAction = Extract<GatewayControlAction, `tunnel-${string}`>;

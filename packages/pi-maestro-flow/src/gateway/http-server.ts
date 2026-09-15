@@ -6,23 +6,32 @@ import { readFile } from "node:fs/promises";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
 import type { Server as McpServer } from "@modelcontextprotocol/sdk/server/index.js";
-import { GatewayHttpAuth, validateGatewayHttpSecurity } from "./auth.ts";
+import { GatewayHttpAuth, isLoopbackHost, validateGatewayHttpSecurity } from "./auth.ts";
 import { principalHasFabricDataPlane } from "./capabilities.ts";
 import { FABRIC_HTTPS_EVENTS_PATH, FABRIC_HTTPS_EXCHANGE_PATH } from "./fabric/https-transport.ts";
 import { principalKey } from "./principal.ts";
 import type { GatewayPrincipal } from "./contracts.ts";
 import type { GatewayRuntime } from "./runtime.ts";
+import { normalizeGatewayTunnelMcpPath } from "./tunnel/mcp-access.ts";
 
 interface HttpSession {
   transport: StreamableHTTPServerTransport;
   server: McpServer;
   principal: GatewayPrincipal;
+  /** Persisted pairing principal, when this session was pairing-authenticated. */
+  pairingId?: string;
 }
+
+export type GatewayHttpServerMode = "gateway" | "tunnel-ingress";
 
 export interface GatewayHttpServerOptions {
   host?: string;
   port?: number;
   path?: string;
+  /** Tunnel ingress is a loopback-only MCP/OAuth surface; it never serves Fabric routes. */
+  mode?: GatewayHttpServerMode;
+  /** Share OAuth state and authentication with the authoritative Gateway listener. */
+  auth?: GatewayHttpAuth;
 }
 
 export interface GatewayHttpServerHandle {
@@ -32,23 +41,47 @@ export interface GatewayHttpServerHandle {
   readonly path: string;
   readonly url: string;
   readonly secure: boolean;
+  readonly mode: GatewayHttpServerMode;
   setReady(ready: boolean): void;
   close(): Promise<void>;
 }
 
 export async function startGatewayHttpServer(runtime: GatewayRuntime, options: GatewayHttpServerOptions = {}): Promise<GatewayHttpServerHandle> {
-  const host = options.host ?? runtime.config.transport.http.host;
-  const port = options.port ?? runtime.config.transport.http.port;
+  const mode = options.mode ?? "gateway";
+  const host = mode === "tunnel-ingress" ? (options.host ?? "127.0.0.1") : (options.host ?? runtime.config.transport.http.host);
+  const port = mode === "tunnel-ingress" ? (options.port ?? 0) : (options.port ?? runtime.config.transport.http.port);
   const path = normalizeMcpPath(options.path ?? runtime.config.transport.http.path);
+  if (mode === "tunnel-ingress" && !isLoopbackHost(host)) throw new Error("Gateway tunnel ingress must bind a loopback host");
+  if (mode === "tunnel-ingress" && runtime.config.auth.mode === "open") {
+    throw new Error("Gateway tunnel ingress requires authenticated Gateway HTTP");
+  }
   validateGatewayHttpSecurity(runtime.config, host);
-  const auth = new GatewayHttpAuth(runtime.config.auth, runtime.pairingStore, runtime.fabricOriginDataPlaneGrants);
+  const auth = options.auth ?? new GatewayHttpAuth(runtime.config.auth, runtime.pairingStore, runtime.fabricOriginDataPlaneGrants);
   const sessions = new Map<string, HttpSession>();
+  const revokedPairingIds = new Set<string>();
+  const revocationTasks = new Set<Promise<void>>();
+  let revocationSubscriptionActive = true;
+  let unsubscribeRevocations: (() => void) | undefined;
+  let closed = false;
   let ready = true;
-  const tls = runtime.config.transport.http.tls;
-  if (runtime.fabricHttpChannelServer !== undefined && tls?.enabled !== true) {
+
+  const scheduleSessionClose = (id: string, session: HttpSession): void => {
+    const task = closeSession(id, session);
+    revocationTasks.add(task);
+    void task.finally(() => revocationTasks.delete(task)).catch(() => undefined);
+  };
+  async function closeSession(id: string, session: HttpSession): Promise<void> {
+    if (sessions.get(id) === session) sessions.delete(id);
+    await session.transport.close().catch(() => undefined);
+    await session.server.close().catch(() => undefined);
+  }
+  // Tunnel ingress is deliberately plaintext on loopback. Native TLS remains
+  // mandatory for the authoritative Gateway/Fabric listener.
+  const tls = mode === "tunnel-ingress" ? undefined : runtime.config.transport.http.tls;
+  if (mode === "gateway" && runtime.fabricHttpChannelServer !== undefined && tls?.enabled !== true) {
     throw new Error("Gateway Fabric HTTP routes require native HTTPS");
   }
-  if (runtime.fabricEnrollmentHttpServer !== undefined && tls?.enabled !== true) {
+  if (mode === "gateway" && runtime.fabricEnrollmentHttpServer !== undefined && tls?.enabled !== true) {
     throw new Error("Gateway Fabric enrollment routes require native HTTPS");
   }
   const listener = (request: IncomingMessage, response: ServerResponse): void => {
@@ -62,9 +95,23 @@ export async function startGatewayHttpServer(runtime: GatewayRuntime, options: G
   const server: NodeHttpServer = tls?.enabled
     ? createHttpsServer({ cert: await readFile(tls.certFile!), key: await readFile(tls.keyFile!) }, listener)
     : createServer(listener);
+  if (mode === "tunnel-ingress") {
+    // HTTP upgrade requests are never a tunnel ingress capability (in
+    // particular, Connector WSS is confined to the native Fabric listener).
+    server.on("upgrade", (_request, socket) => socket.destroy());
+  }
+  unsubscribeRevocations = runtime.pairingStore.subscribeRevocations((event) => {
+    if (!revocationSubscriptionActive || closed) return;
+    // Keep a bounded fence for sessions racing with authentication/initialization.
+    revokedPairingIds.add(event.pairingId);
+    if (revokedPairingIds.size > 512) revokedPairingIds.delete(revokedPairingIds.values().next().value as string);
+    for (const [id, session] of sessions) {
+      if (session.pairingId === event.pairingId) scheduleSessionClose(id, session);
+    }
+  });
 
   async function handleRequest(request: IncomingMessage, response: ServerResponse): Promise<void> {
-    const baseUrl = publicBaseUrl(runtime, request, host, boundPort(server, port));
+    const baseUrl = publicBaseUrl(runtime, request, host, boundPort(server, port), tls?.enabled === true);
     const url = new URL(request.url ?? "/", baseUrl);
     if (url.pathname === "/healthz" || url.pathname === "/readyz") {
       const healthy = url.pathname === "/healthz" || (ready && runtime.isReady);
@@ -73,7 +120,7 @@ export async function startGatewayHttpServer(runtime: GatewayRuntime, options: G
       response.end(body);
       return;
     }
-    const enrollmentServer = runtime.fabricEnrollmentHttpServer;
+    const enrollmentServer = mode === "gateway" ? runtime.fabricEnrollmentHttpServer : undefined;
     if (enrollmentServer?.handles(url.pathname)) {
       if (!ready || !runtime.isReady || !runtime.fabricAdmissionReady) {
         response.writeHead(503, { "content-type": "application/json", "cache-control": "no-store" });
@@ -83,7 +130,7 @@ export async function startGatewayHttpServer(runtime: GatewayRuntime, options: G
       await enrollmentServer.handle(request, response, url);
       return;
     }
-    const fabricServer = runtime.fabricHttpChannelServer;
+    const fabricServer = mode === "gateway" ? runtime.fabricHttpChannelServer : undefined;
     if (fabricServer?.handles(url.pathname)) {
       if (request.method === "OPTIONS") {
         applyCors(runtime, request, response);
@@ -171,10 +218,21 @@ export async function startGatewayHttpServer(runtime: GatewayRuntime, options: G
       const transport = new StreamableHTTPServerTransport({
         sessionIdGenerator: () => randomUUID(),
         enableJsonResponse: true,
-        onsessioninitialized: (id) => { sessions.set(id, created); },
+        onsessioninitialized: (id) => {
+          if (created.pairingId !== undefined && revokedPairingIds.has(created.pairingId)) {
+            scheduleSessionClose(id, created);
+            return;
+          }
+          sessions.set(id, created);
+        },
       });
       const mcpServer = runtime.createMcpServer(authenticated.principal);
-      created = { transport, server: mcpServer, principal: authenticated.principal };
+      created = {
+        transport,
+        server: mcpServer,
+        principal: authenticated.principal,
+        ...(authenticated.pairingId === undefined ? {} : { pairingId: authenticated.pairingId }),
+      };
       transport.onclose = () => {
         const id = transport.sessionId;
         if (id) sessions.delete(id);
@@ -201,7 +259,11 @@ export async function startGatewayHttpServer(runtime: GatewayRuntime, options: G
   }
 
   await new Promise<void>((resolve, reject) => {
-    const onError = (error: Error): void => reject(error);
+    const onError = (error: Error): void => {
+      revocationSubscriptionActive = false;
+      unsubscribeRevocations?.();
+      reject(error);
+    };
     server.once("error", onError);
     server.listen(port, host, () => {
       server.off("error", onError);
@@ -209,7 +271,6 @@ export async function startGatewayHttpServer(runtime: GatewayRuntime, options: G
     });
   });
   const actualPort = boundPort(server, port);
-  let closed = false;
   return {
     server,
     host,
@@ -217,15 +278,17 @@ export async function startGatewayHttpServer(runtime: GatewayRuntime, options: G
     path,
     url: `${displayOrigin(host, actualPort, tls?.enabled === true)}${path}`,
     secure: tls?.enabled === true,
+    mode,
     setReady(value: boolean): void { ready = value; },
     async close(): Promise<void> {
       ready = false;
       if (closed) return;
       closed = true;
-      await Promise.allSettled([...sessions.values()].map(async (session) => {
-        await session.transport.close().catch(() => undefined);
-        await session.server.close().catch(() => undefined);
-      }));
+      revocationSubscriptionActive = false;
+      unsubscribeRevocations?.();
+      unsubscribeRevocations = undefined;
+      await Promise.allSettled([...revocationTasks]);
+      await Promise.allSettled([...sessions.entries()].map(([id, session]) => closeSession(id, session)));
       sessions.clear();
       server.closeAllConnections();
       await new Promise<void>((resolve) => server.close(() => resolve()));
@@ -234,9 +297,7 @@ export async function startGatewayHttpServer(runtime: GatewayRuntime, options: G
 }
 
 function normalizeMcpPath(value: string): string {
-  const path = value.startsWith("/") ? value : `/${value}`;
-  if (path.length > 1 && path.endsWith("/")) return path.slice(0, -1);
-  return path;
+  return normalizeGatewayTunnelMcpPath(value, "http.path");
 }
 
 function boundPort(server: NodeHttpServer, fallback: number): number {
@@ -248,11 +309,11 @@ function displayOrigin(host: string, port: number, secure = false): string {
   return `${secure ? "https" : "http"}://${host.includes(":") && !host.startsWith("[") ? `[${host}]` : host}:${port}`;
 }
 
-function publicBaseUrl(runtime: GatewayRuntime, request: IncomingMessage, host: string, port: number): string {
+function publicBaseUrl(runtime: GatewayRuntime, request: IncomingMessage, host: string, port: number, secure: boolean): string {
   const configured = runtime.config.auth.oauth?.serverUrl?.replace(/\/$/, "");
   if (configured) return configured;
   const authority = request.headers.host ?? `${host}:${port}`;
-  const protocol = runtime.config.transport.http.tls?.enabled || (runtime.config.server.trustProxyHeaders && request.headers["x-forwarded-proto"] === "https") ? "https" : "http";
+  const protocol = secure || (runtime.config.server.trustProxyHeaders && request.headers["x-forwarded-proto"] === "https") ? "https" : "http";
   return `${protocol}://${authority}`;
 }
 

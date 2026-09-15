@@ -11,9 +11,30 @@ export type GatewayTunnelPublicState = Omit<GatewayTunnelState, "ownerToken">;
 export interface GatewayTunnelProfileDefinition {
   id: string;
   provider: string;
+  /** UI-safe mode label; never contains provider arguments or secrets. */
+  mode?: string;
   lifecycle: "ephemeral" | "persistent";
   enabled: boolean;
   input: Readonly<Record<string, unknown>>;
+}
+
+export interface GatewayTunnelDoctorProfile {
+  profile: string;
+  provider: string;
+  mode?: string;
+  lifecycle: "ephemeral" | "persistent";
+  enabled: boolean;
+  phase: GatewayTunnelPublicState["observed"]["phase"];
+  readiness: boolean;
+  /** Doctor is deliberately state-only: it never invokes provider doctor(). */
+  stateOnly: true;
+}
+
+export interface GatewayTunnelDoctorReport {
+  ok: boolean;
+  bounded: true;
+  sideEffects: false;
+  profiles: GatewayTunnelDoctorProfile[];
 }
 
 export interface GatewayTunnelManagerOptions {
@@ -67,10 +88,45 @@ export class GatewayTunnelManager {
     return [...this.profiles.values()].map((profile) => ({ ...profile, input: structuredClone(profile.input) }));
   }
 
+  /**
+   * Local-only, bounded doctor for operator surfaces. It reads persisted
+   * supervisor state and intentionally does not call provider.doctor(), which
+   * may execute an external binary. No desired state, credentials, or process
+   * lifecycle is changed by this operation.
+   */
+  async doctor(options: { maxProfiles?: number; deadlineAt?: number } = {}): Promise<GatewayTunnelDoctorReport> {
+    const profiles = [...this.profiles.values()].slice(0, Math.min(32, Math.max(1, options.maxProfiles ?? 32)));
+    const results: GatewayTunnelDoctorProfile[] = [];
+    for (const profile of profiles) {
+      if (options.deadlineAt !== undefined && Date.now() >= options.deadlineAt) break;
+      const state = await this.supervisor(profile.provider, profile.id).status();
+      const phase = state?.observed.phase ?? "stopped";
+      results.push({
+        profile: profile.id,
+        provider: profile.provider,
+        ...(profile.mode === undefined ? {} : { mode: profile.mode }),
+        lifecycle: profile.lifecycle,
+        enabled: profile.enabled,
+        phase,
+        readiness: phase === "ready",
+        stateOnly: true,
+      });
+    }
+    return { ok: results.every((entry) => !entry.enabled || entry.readiness), bounded: true, sideEffects: false, profiles: results };
+  }
+
   profile(id: string): GatewayTunnelProfileDefinition {
     const profile = this.profiles.get(id);
     if (!profile) throw controlError("tunnel_profile_unavailable", `Unknown tunnel profile: ${id}`);
     return profile;
+  }
+
+  /** Replace a persisted profile's derived provider input after listener bind. */
+  updateProfileInput(id: string, input: Readonly<Record<string, unknown>>): void {
+    const profile = this.profile(id);
+    const updated = { ...profile, input: structuredClone(input) };
+    this.profiles.set(id, updated);
+    this.supervisorInputs.set(`${profile.provider}\0${profile.id}`, updated.input);
   }
 
   supervisor(providerName: string, instance = "default"): GatewayTunnelSupervisor {
@@ -104,6 +160,13 @@ export class GatewayTunnelManager {
     const profile = data?.profile === undefined ? undefined : this.profile(requiredIdentifier(data.profile, "profile"));
     const provider = profile?.provider ?? requiredIdentifier(data?.provider, "provider");
     const instance = profile?.id ?? (data?.instance === undefined ? "default" : requiredIdentifier(data.instance, "instance"));
+    // A persisted profile is an authorization boundary. Generic provider
+    // lifecycle commands (with or without input) cannot target that instance
+    // and thereby bypass its canonical policy.
+    if (profile === undefined) {
+      const persisted = this.profiles.get(instance);
+      if (persisted?.provider === provider) throw controlError("invalid_arguments", "Persisted tunnel profiles require profile-aware lifecycle commands");
+    }
     const supervisor = this.supervisor(provider, instance);
     const key = `${provider}\0${instance}`;
     const options = operationOptions(data, profile?.input);

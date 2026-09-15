@@ -48,6 +48,7 @@ test("tunnel audience token is accepted only on the loopback child-to-Gateway ho
   }) as IncomingMessage;
   const loopback = await auth.authenticate(request("127.0.0.1"), "http://127.0.0.1/.well-known/oauth-protected-resource");
   assert.equal(loopback.principal?.scopes[0], "gateway.host.status");
+  assert.equal(loopback.pairingId, issued.id);
   assert.match(loopback.principal?.source ?? "", /openai/u);
   const external = await auth.authenticate(request("203.0.113.10"), "https://gateway.example/.well-known/oauth-protected-resource");
   assert.equal(external.status, 401);

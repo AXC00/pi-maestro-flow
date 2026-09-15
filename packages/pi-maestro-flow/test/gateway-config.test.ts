@@ -335,7 +335,7 @@ test("Gateway tunnel guide YAML examples parse and linked entry points resolve",
   const guidePath = join(import.meta.dirname, "../../../docs/gateway-tunnel-configuration.md");
   const guide = await readFile(guidePath, "utf8");
   const examples = [...guide.matchAll(/```yaml\n([\s\S]*?)```/gu)].map((match) => match[1]!);
-  assert.equal(examples.length, 5);
+  assert.equal(examples.length, 6);
   for (const example of examples) assert.equal(parseGatewayConfigDocument(example).config.version, 2);
 
   const gatewayDesign = await readFile(join(import.meta.dirname, "../../../docs/gateway-command-mcp-tool-design.md"), "utf8");

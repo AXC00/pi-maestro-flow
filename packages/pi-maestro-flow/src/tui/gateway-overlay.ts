@@ -10,11 +10,20 @@ import { accessSync, constants, opendirSync, readdirSync, readFileSync, existsSy
 import { homedir } from "node:os";
 import { basename, delimiter, dirname, join } from "node:path";
 import { Key, type Component, type Focusable, matchesKey, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import { makeBorderFrame, resolveGlyphs } from "pi-maestro-settings-core/ui";
+
+const FRAME_GLYPHS = resolveGlyphs("nerd");
+const FRAME_UTILS = {
+  measure: visibleWidth,
+  clip: (text: string, width: number, ellipsis: string) => truncateToWidth(text, width, ellipsis),
+};
 import { locateGateway, readGatewayBearerToken, readTunnelState, readOpenAiTunnelState, restartQuickTunnel, startQuickTunnel, stopQuickTunnel, startOpenAiTunnel, stopOpenAiTunnel, updateGatewayConfigServerURL, restoreGatewayConfig, stopGateway, startGateway, restartGateway, readGatewayControlStatus, listGatewayWorkspaces, startWorkspaceLease, registerGatewayWorkspacePermanent, readGatewayOpsPassword, detectGateway, removeGatewayWorkspaceByPath, readGatewayTasks, readGatewayCollaborativeSessions, readGatewayConfigView, writeGatewayConfigChanges, type TunnelState, type GatewayJournalTask, type GatewayConfigView } from "../gateway/workspace-client.ts";
 import { gatewayConfigPath } from "../gateway/state-paths.ts";
 import type { CollaborativeSessionStateV1, GatewayTodoTaskV1 } from "../gateway/session-contracts.ts";
 import type { GatewayFabricMonitorSnapshotV1 } from "../gateway/fabric/monitor-projection.ts";
 import type { GatewayConfigChanges } from "./gateway-wizard.ts";
+import { GatewayTunnelPanel } from "./gateway-tunnel-panel.ts";
+import { GatewayControlClient } from "../gateway/control-client.ts";
 import {
   GatewayClientError,
   GatewayStreamableHttpClient,
@@ -131,7 +140,7 @@ export interface GatewayOverlayParams {
   /** Compatibility callback retained for embedders; c/C now open the config page in-place. */
   onOpenWizard?: () => void;
   /** Open directly on the requested top-level page. */
-  initialPage?: "home" | "config";
+  initialPage?: "home" | "config" | "tunnel";
   /** Host-native text prompts used by m/n window actions. */
   onComposeWindowMessage?: (
     target: GatewayRuntimeWindow | undefined,
@@ -148,9 +157,11 @@ export interface GatewayOverlayParams {
   getTerminalRows?: () => number;
   /** Endpoint readiness wait for startGateway (ms); tests shorten this. */
   endpointWaitMs?: number;
+  /** Host-native prompt used by the tunnel structured editor. */
+  input?: (title: string, placeholder?: string) => Promise<string | undefined>;
 }
 
-type OverlayMode = "list" | "detail" | "workspace" | "window-list" | "window-detail" | "config" | "collaboration" | "collaboration-detail" | "monitor-detail";
+type OverlayMode = "list" | "detail" | "workspace" | "window-list" | "window-detail" | "config" | "tunnel" | "collaboration" | "collaboration-detail" | "monitor-detail";
 
 function normalizeWorkspacePath(value: string): string {
   let normalized = value.replace(/\\/g, "/");
@@ -536,6 +547,7 @@ export class GatewayOverlay implements Component, Focusable {
   /** Sub-mode within config mode: top menu, or inside a list editor. */
   private configListKey: "commandsAllow" | "commandsConfirm" | "commandsDeny" | "filesAllow" | "filesConfirm" | "filesDeny" | undefined;
   private configListSelected = 0;
+  private readonly tunnelPanel: GatewayTunnelPanel;
   private tunnelProvider: "cloudflare" | "openai" = "cloudflare";
   private snapshot: GatewaySnapshot = {
     refreshing: true, endpoint: "unknown", workspaces: [], cwdRegistered: false, windows: [], thread: [], mcpServers: [],
@@ -579,16 +591,28 @@ export class GatewayOverlay implements Component, Focusable {
   }
 
   constructor(private readonly params: GatewayOverlayParams) {
+    const tunnelConfigView = readGatewayConfigView();
     if (params.initialPage === "config") {
       this.mode = "config";
-      this.configView = readGatewayConfigView() ?? undefined;
+      this.configView = tunnelConfigView ?? undefined;
+    } else if (params.initialPage === "tunnel") {
+      this.mode = "tunnel";
     }
-    if (params.initialRefresh !== false) void this.refresh();
+    this.tunnelPanel = new GatewayTunnelPanel({
+      requestRender: () => this.safeRequestRender(),
+      close: () => { if (this.closed) return; this.mode = "list"; this.safeRequestRender(); },
+      createControlClient: (configPath) => new GatewayControlClient({ cwd: params.cwd, configPath }),
+      initialProfiles: tunnelConfigView?.tunnels.profiles,
+      httpPath: tunnelConfigView?.transport.httpPath,
+      input: params.input,
+    });
+    if (params.initialRefresh !== false && this.mode !== "tunnel") void this.refresh();
   }
 
   invalidate(): void {}
   dispose(): void {
     this.closed = true;
+    this.tunnelPanel.dispose();
     this.stopWindowObserve();
   }
 
@@ -1128,6 +1152,7 @@ export class GatewayOverlay implements Component, Focusable {
   /** Mark the overlay closed so async refresh/render callbacks skip work. */
   markClosed(): void {
     this.closed = true;
+    this.tunnelPanel.dispose();
     this.stopWindowObserve();
     this.params.onFabricProjection?.(undefined);
   }
@@ -1140,6 +1165,7 @@ export class GatewayOverlay implements Component, Focusable {
     if (this.mode === "window-list") return this.renderWindowList(safeWidth);
     if (this.mode === "window-detail") return this.renderWindowDetail(safeWidth);
     if (this.mode === "config") return this.renderConfig(safeWidth);
+    if (this.mode === "tunnel") return this.tunnelPanel.render(safeWidth);
     if (this.mode === "collaboration") return this.renderCollaboration(safeWidth);
     if (this.mode === "collaboration-detail") return this.renderCollaborationDetail(safeWidth);
     if (this.mode === "monitor-detail") return this.renderMonitorDetail(safeWidth);
@@ -1147,6 +1173,10 @@ export class GatewayOverlay implements Component, Focusable {
   }
 
   handleInput(data: string): void {
+    if (this.mode === "tunnel") {
+      this.tunnelPanel.handleInput(data);
+      return;
+    }
     if (matchesKey(data, Key.escape)) {
       if (this.mode === "window-detail") {
         this.stopWindowObserve();
@@ -2223,7 +2253,7 @@ function sanitizeTerminalText(value: string): string {
     .replace(/\x1b\[(?![0-9;]*m)[0-9;?]*[ -/]*[@-~]/g, "")
     // C0/C1 控制:保留 ESC(0x1b,SGR 序列的一部分)与 \t\n;只剥除其余控制符
     .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001a\u001c-\u001f\u007f-\u009f]/g, "")
-    .replace(/\r/g, "");
+    .replace(/[\r\n]+/g, " ");
 }
 
 function windowEventKey(event: GatewayWindowEvent): string {
@@ -2267,8 +2297,11 @@ function rule(width: number): string {
 function frame(rows: readonly string[], width: number): string[] {
   // width is the OUTER width; content rows are │+inner+│, so the horizontal
   // rules must span inner = width-2 to keep all rows the same width.
-  const inner = Math.max(0, width - 2);
-  return [`┌${"─".repeat(inner)}┐`, ...rows.map((row) => `│${row}│`), `└${"─".repeat(inner)}┘`];
+  return makeBorderFrame(rows, width, FRAME_GLYPHS, FRAME_UTILS, {
+    corners: "square",
+    clip: false,
+    pad: false,
+  });
 }
 
 function fitSegments(width: number, segments: readonly string[]): string[] {

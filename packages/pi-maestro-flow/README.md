@@ -101,7 +101,7 @@ pi-maestro-gateway config
 pi-maestro-gateway config --config /secure/gateway.yaml
 ```
 
-The standalone TUI edits the listener, transport switches, command policy, localhost/proxy guards, and log level. It deliberately does not display or modify credentials or tunnel-profile lifecycle. Persistent profiles are managed with `pi-maestro-gateway tunnel profile enable|disable|status|restart`; only one persistent profile may be enabled, and its HTTPS `publicUrl` must match the OAuth server origin. See the [Gateway Tunnel configuration guide](../../docs/gateway-tunnel-configuration.md) for complete Cloudflare Quick/Named, OpenAI Secure, and Managed OpenSSH Reverse examples and server-side TLS/reverse-proxy requirements.
+The standalone TUI edits the listener, transport switches, command policy, localhost/proxy guards, and log level. It deliberately does not display or modify credentials or tunnel-profile lifecycle. Use `/gateway tunnel` for the dedicated profile editor, state-only doctor, safe connection descriptor, and manual lifecycle controls; the CLI equivalent is `pi-maestro-gateway tunnel profile ...`. Persistent profiles are managed with `enable|disable|status|restart`; only one persistent profile may be enabled, and its HTTPS `publicUrl` must match the OAuth server origin. See the [Gateway Tunnel configuration guide](../../docs/gateway-tunnel-configuration.md) and the [OpenAI Secure MCP Tunnel setup](optional/OPENAI-TUNNEL-SETUP.md) for provider-specific examples and requirements.
 
 The MCPX compatibility facade, `/mcpx` command, legacy deep-import files, and `PI_MCPX_BRIDGE`, `MCPX_BIN`, and `MCPX_TUNNEL_*` environment variables have been removed. Existing legacy state is read only by the explicit offline migration command:
 
@@ -120,6 +120,7 @@ Normal Gateway startup does not read legacy state. Calls that can safely replay 
 |---------|-------------|
 | `/permissions` | Inspect and manage permission rules; `/permissions yolo` enables bypass mode |
 | `/gateway` | Open the native Gateway management overlay; `/gateway wizard` opens guided setup |
+| `/gateway tunnel` / `/gateway-tunnel` | Open the dedicated Gateway Tunnel operator page |
 | `/plan`, `Alt+Shift+P` | Enter durable Plan mode |
 | `/plan-model` | Select or disable a dedicated Plan model |
 | `/goal` | Goal lifecycle: `/goal stop`, `/goal resume`, `/goal clear` |

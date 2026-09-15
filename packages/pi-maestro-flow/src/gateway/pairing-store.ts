@@ -55,7 +55,31 @@ export interface GatewayPairingAuthenticationContext {
 export interface GatewayPairingRevokeOptions {
   revokedBy?: string;
   replacementId?: string;
+  /** Human-readable reason carried to in-process revocation listeners. */
+  reason?: string;
 }
+
+export interface GatewayPairingRevocationEvent {
+  /** Pairing id; `pairingId` is retained as an explicit principal spelling. */
+  id: string;
+  pairingId: string;
+  record: GatewayPairingPublicRecord;
+  revokedAt: number;
+  reason: string;
+  replacementId?: string;
+}
+
+export type GatewayPairingRevocationListener = (event: GatewayPairingRevocationEvent) => void | Promise<void>;
+
+export interface GatewayPairingMatchRevokeOptions {
+  audience: string;
+  provider: string;
+  instance: string;
+  reason: string;
+  revokedBy?: string;
+}
+
+const MAX_REVOCATION_LISTENERS = 64;
 
 function hashToken(token: string): Buffer {
   return createHash("sha256").update(token, "utf8").digest();
@@ -69,6 +93,14 @@ function boundedString(value: unknown, label: string, maximum = 256): string | u
   if (typeof value !== "string" || value.trim() === "" || Buffer.byteLength(value, "utf8") > maximum) throw new Error(`${label} is invalid`);
   return value.trim();
 }
+
+/** Canonical form used at every pairing audience boundary (including IPC). */
+export function canonicalizeGatewayPairingAudience(value: unknown): string {
+  const audience = boundedString(value, "pairing audience", 128);
+  if (audience === undefined || /\s|\0/u.test(audience)) throw new Error("pairing audience is invalid");
+  return audience;
+}
+
 function normalizedScopes(value: readonly string[] | undefined, audience: string): string[] {
   const scopes = value === undefined ? (audience === GATEWAY_PRIMARY_AUDIENCE ? ["gateway"] : []) : [...value];
   if (scopes.length > 64 || new Set(scopes).size !== scopes.length || scopes.some((scope) => scope !== "*" && !/^[A-Za-z0-9][A-Za-z0-9.*:_-]{0,127}$/.test(scope))) {
@@ -84,17 +116,33 @@ export class GatewayPairingStore {
   readonly path: string;
   private readonly now: () => number;
   private mutationTail: Promise<void> = Promise.resolve();
+  private readonly revocationListeners = new Set<GatewayPairingRevocationListener>();
 
   constructor(options: { path?: string; now?: () => number } = {}) {
     this.path = options.path ?? gatewayPairingPath();
     this.now = options.now ?? (() => Date.now());
   }
 
+  /** Subscribe to durable revocations. The returned function is idempotent. */
+  subscribeRevocations(listener: GatewayPairingRevocationListener): () => void {
+    if (this.revocationListeners.size >= MAX_REVOCATION_LISTENERS) throw new Error("pairing revocation listener limit reached");
+    this.revocationListeners.add(listener);
+    let subscribed = true;
+    return () => {
+      if (!subscribed) return;
+      subscribed = false;
+      this.revocationListeners.delete(listener);
+    };
+  }
+
+  /** Alias for callers that use event-emitter terminology. */
+  onRevocation(listener: GatewayPairingRevocationListener): () => void { return this.subscribeRevocations(listener); }
+
   async issue(options: GatewayPairingIssueOptions = {}): Promise<GatewayPairingIssue> {
     const ttlMs = options.ttlMs ?? 24 * 60 * 60 * 1000;
     if (!Number.isSafeInteger(ttlMs) || ttlMs < 1 || ttlMs > MAX_TTL_MS) throw new Error("pairing ttlMs is out of range");
     const label = boundedString(options.label, "pairing label");
-    const audience = boundedString(options.audience ?? GATEWAY_PRIMARY_AUDIENCE, "pairing audience", 128)!;
+    const audience = canonicalizeGatewayPairingAudience(options.audience ?? GATEWAY_PRIMARY_AUDIENCE);
     const workspaceId = boundedString(options.workspaceId ?? options.workspace, "pairing workspace", 256);
     const provider = boundedString(options.provider, "pairing provider", 128);
     const instance = boundedString(options.instance, "pairing instance", 256);
@@ -122,8 +170,9 @@ export class GatewayPairingStore {
         ...(label === undefined ? {} : { label }),
         ...(replacesId === undefined ? {} : { replacesId }),
       };
+      let replaced: GatewayPairingRecord | undefined;
       if (replacesId !== undefined) {
-        const replaced = document.pairings.find((entry) => entry.id === replacesId);
+        replaced = document.pairings.find((entry) => entry.id === replacesId);
         if (!replaced) throw new Error("pairing replacement target was not found");
         if (replaced.revokedAt !== undefined) throw new Error("pairing replacement target is already revoked");
         replaced.revokedAt = now;
@@ -131,6 +180,8 @@ export class GatewayPairingStore {
       }
       document.pairings.push(record);
       await this.save(document);
+      // Emit only after the replacement and successor are durable together.
+      if (replaced !== undefined) this.emitRevocation(revocationEvent(replaced, "replacement", record.id));
       return { ...publicRecord(record), token };
     });
   }
@@ -146,24 +197,60 @@ export class GatewayPairingStore {
   async revoke(id: string, options: GatewayPairingRevokeOptions = {}): Promise<boolean> {
     const revokedBy = boundedString(options.revokedBy, "pairing revokedBy", 256);
     const replacementId = boundedString(options.replacementId, "pairing replacementId", 256);
+    const reason = boundedString(options.reason, "pairing reason", 256);
     return this.mutate(async () => {
       const document = await this.load();
       const record = document.pairings.find((entry) => entry.id === id);
       if (!record || record.revokedAt !== undefined) return false;
       if (replacementId !== undefined && !document.pairings.some((entry) => entry.id === replacementId)) throw new Error("pairing replacement was not found");
-      record.revokedAt = this.now();
+      const revokedAt = this.now();
+      record.revokedAt = revokedAt;
       if (revokedBy !== undefined) record.revokedBy = revokedBy;
       if (replacementId !== undefined) record.replacedById = replacementId;
       await this.save(document);
+      this.emitRevocation(revocationEvent(record, reason ?? revokedBy ?? "explicit-revoke", replacementId));
       return true;
     });
+  }
+
+  /** Revoke all active generations at one durable startup fence. */
+  async revokeActiveMatching(options: GatewayPairingMatchRevokeOptions): Promise<GatewayPairingPublicRecord[]> {
+    const audience = canonicalizeGatewayPairingAudience(options.audience);
+    const provider = boundedString(options.provider, "pairing provider", 128)!;
+    const instance = boundedString(options.instance, "pairing instance", 256)!;
+    const reason = boundedString(options.reason, "pairing reason", 256)!;
+    const revokedBy = boundedString(options.revokedBy, "pairing revokedBy", 256);
+    return this.mutate(async () => {
+      const document = await this.load();
+      const now = this.now();
+      const matches = document.pairings.filter((entry) => entry.revokedAt === undefined
+        && entry.expiresAt > now
+        && entry.audience === audience
+        && entry.provider === provider
+        && entry.instance === instance);
+      if (matches.length === 0) return [];
+      for (const record of matches) {
+        record.revokedAt = now;
+        record.revokedBy = revokedBy ?? reason;
+      }
+      await this.save(document);
+      // All events follow one durable save, so consumers can close every old
+      // generation without observing a partially persisted replacement fence.
+      for (const record of matches) this.emitRevocation(revocationEvent(record, reason));
+      return matches.map(publicRecord);
+    });
+  }
+
+  /** Explicit name for the OpenAI startup orphan-recovery operation. */
+  async revokeOpenAiTunnelPairings(instance: string, reason: string): Promise<GatewayPairingPublicRecord[]> {
+    return this.revokeActiveMatching({ audience: "gateway.tunnel", provider: "openai", instance, reason });
   }
 
   async authenticate(token: string, context: GatewayPairingAuthenticationContext = {}): Promise<GatewayPairingPublicRecord | undefined> {
     if (!token) return undefined;
     const candidate = hashToken(token);
     const now = this.now();
-    const expectedAudience = context.audience ?? GATEWAY_PRIMARY_AUDIENCE;
+    const expectedAudience = canonicalizeGatewayPairingAudience(context.audience ?? GATEWAY_PRIMARY_AUDIENCE);
     for (const record of (await this.load()).pairings) {
       if (record.expiresAt <= now || record.revokedAt !== undefined) continue;
       const stored = Buffer.from(record.tokenHash, "hex");
@@ -188,7 +275,7 @@ export class GatewayPairingStore {
       if (!item || typeof item !== "object" || Array.isArray(item)) throw new Error("Invalid Gateway pairing record");
       const entry = item as Record<string, unknown>;
       if (entry.version !== GATEWAY_STATE_VERSION || typeof entry.id !== "string" || typeof entry.tokenHash !== "string" || !/^[a-f0-9]{64}$/.test(entry.tokenHash) || !Number.isSafeInteger(entry.createdAt) || !Number.isSafeInteger(entry.expiresAt)) throw new Error("Invalid Gateway pairing record");
-      const audience = boundedString(entry.audience ?? GATEWAY_PRIMARY_AUDIENCE, "pairing audience", 128)!;
+      const audience = canonicalizeGatewayPairingAudience(entry.audience ?? GATEWAY_PRIMARY_AUDIENCE);
       const scopes = normalizedScopes(Array.isArray(entry.scopes) ? entry.scopes as string[] : undefined, audience);
       const generation = entry.generation ?? 1;
       if (!Number.isSafeInteger(generation) || (generation as number) < 1) throw new Error("Invalid Gateway pairing record");
@@ -203,7 +290,7 @@ export class GatewayPairingStore {
         generation: generation as number,
       };
       for (const key of ["workspaceId", "provider", "instance", "label", "replacesId", "replacedById", "revokedBy"] as const) {
-        const result = boundedString(entry[key], `pairing ${key}`, key === "workspaceId" || key === "instance" ? 256 : 128);
+        const result = boundedString(entry[key], `pairing ${key}`, key === "workspaceId" || key === "instance" || key === "revokedBy" ? 256 : 128);
         if (result !== undefined) normalized[key] = result;
       }
       if (entry.revokedAt !== undefined) {
@@ -213,6 +300,17 @@ export class GatewayPairingStore {
       return normalized;
     });
     return { version: GATEWAY_STATE_VERSION, pairings };
+  }
+
+  private emitRevocation(event: GatewayPairingRevocationEvent): void {
+    for (const listener of [...this.revocationListeners]) {
+      try {
+        const result = listener(structuredClone(event));
+        if (result !== undefined) void Promise.resolve(result).catch(() => undefined);
+      } catch {
+        // Revocation is already durable; one observer must not block others.
+      }
+    }
   }
 
   private async save(document: PairingDocument): Promise<void> {
@@ -227,4 +325,15 @@ export class GatewayPairingStore {
     await previous;
     try { return await operation(); } finally { release(); }
   }
+}
+
+function revocationEvent(record: GatewayPairingRecord, reason: string, replacementId?: string): GatewayPairingRevocationEvent {
+  return {
+    id: record.id,
+    pairingId: record.id,
+    record: publicRecord(record),
+    revokedAt: record.revokedAt ?? Date.now(),
+    reason,
+    ...(replacementId === undefined ? {} : { replacementId }),
+  };
 }

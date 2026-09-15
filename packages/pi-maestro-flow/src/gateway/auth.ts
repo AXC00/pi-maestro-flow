@@ -59,6 +59,8 @@ interface RegisteredClient {
 
 export interface GatewayHttpAuthResult {
   principal?: GatewayPrincipal;
+  /** Present only when this request authenticated with a persisted pairing. */
+  pairingId?: string;
   status?: number;
   message?: string;
   wwwAuthenticate?: string;
@@ -118,12 +120,15 @@ export class GatewayHttpAuth {
       };
     }
     const fingerprint = createHash("sha256").update(token, "utf8").digest("hex").slice(0, 24);
-    return { principal: createGatewayPrincipal("http", pairing ? `pairing:${pairing.id}` : `bearer:${fingerprint}`, {
-      authenticated: true,
-      source: pairing?.provider ? `${remote}:${pairing.provider}` : remote,
-      scopes: pairing?.scopes ?? ["gateway"],
-      ...(pairing?.workspaceId === undefined ? {} : { workspaceId: pairing.workspaceId }),
-    }) };
+    return {
+      principal: createGatewayPrincipal("http", pairing ? `pairing:${pairing.id}` : `bearer:${fingerprint}`, {
+        authenticated: true,
+        source: pairing?.provider ? `${remote}:${pairing.provider}` : remote,
+        scopes: pairing?.scopes ?? ["gateway"],
+        ...(pairing?.workspaceId === undefined ? {} : { workspaceId: pairing.workspaceId }),
+      }),
+      ...(pairing === undefined ? {} : { pairingId: pairing.id }),
+    };
   }
 
   async handleOAuthRoute(request: IncomingMessage, response: ServerResponse, url: URL, baseUrl: string, mcpPath: string): Promise<boolean> {

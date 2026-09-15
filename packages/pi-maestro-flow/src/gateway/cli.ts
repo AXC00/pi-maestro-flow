@@ -9,7 +9,7 @@ import { GatewayOwnerActiveError, GatewayOwnerStore } from "./owner-store.ts";
 import type { GatewayOwnerRecord } from "./contracts.ts";
 import { GATEWAY_OFFLINE_MESSAGE, relayGatewayStdio } from "./stdio-relay.ts";
 import { GatewayResidentService } from "./resident-service.ts";
-import { gatewayTunnelProfileInput, loadGatewayConfig, writeGatewayConfigPatch } from "./config.ts";
+import { loadGatewayConfig, writeGatewayConfigPatch } from "./config.ts";
 import { applyPiConfigStream, serializePiConfigApplyError } from "./pi-config-apply.ts";
 import { GatewayControlClient } from "./control-client.ts";
 import { migrateLegacyGateway } from "./config-migration.ts";
@@ -470,6 +470,17 @@ export async function main(argv = process.argv.slice(2), io: GatewayCliIo = {}):
     }
     if (command === "tunnel") {
       const action = args[0];
+      if (action === "doctor") {
+        const flags = parseTunnelFlags(args.slice(1));
+        if (flags.provider !== undefined || flags.instance !== undefined || flags.expectedGeneration !== undefined
+          || flags.localPort !== undefined || flags.binaryPath !== undefined || flags.experimental
+          || flags.tunnelIdEnv !== undefined || flags.runtimeKeyEnv !== undefined) {
+          throw new Error("tunnel doctor accepts only --config, --timeout-ms and --json");
+        }
+        const value = await createControlClient(flags.configPath).tunnelDoctor(flags.timeoutMs);
+        write(stdout, flags.json ? JSON.stringify(value) : JSON.stringify(value, null, 2));
+        return 0;
+      }
       if (action === "profile") {
         const profileAction = args[1];
         if (!profileAction || !["list", "status", "start", "stop", "restart", "enable", "disable"].includes(profileAction)) throw new Error("Usage: pi-maestro-gateway tunnel profile list|status|start|stop|restart|enable|disable [PROFILE] [--timeout-ms MS] [--generation N] [--json]");
@@ -489,12 +500,9 @@ export async function main(argv = process.argv.slice(2), io: GatewayCliIo = {}):
         if (!profile) throw new Error(`Unknown tunnel profile: ${profileId}`);
         if (profileAction === "status" && flags.expectedGeneration !== undefined) throw new Error("tunnel profile status does not accept --generation");
         const client = createControlClient(flags.configPath);
-        const input = gatewayTunnelProfileInput(profile, config.transport.http);
         const options = {
-          instance: profile.id,
           ...(flags.timeoutMs === undefined ? {} : { timeoutMs: flags.timeoutMs }),
           ...(flags.expectedGeneration === undefined ? {} : { expectedGeneration: flags.expectedGeneration }),
-          input: { ...input },
         };
         if (profileAction === "enable" || profileAction === "disable") {
           if (profile.lifecycle !== "persistent") throw new Error(`tunnel profile ${profileAction} requires a persistent profile`);
@@ -505,7 +513,9 @@ export async function main(argv = process.argv.slice(2), io: GatewayCliIo = {}):
           }
           let state: unknown;
           const gateway = await client.status();
-          if (!enabled && gateway.online) state = await client.tunnelStop(profile.provider, options);
+          if (!enabled && gateway.online) state = typeof client.tunnelProfileStop === "function"
+            ? await client.tunnelProfileStop(profile.id, options)
+            : await client.tunnelStop(profile.provider, { ...options, instance: profile.id });
           const profiles = config.tunnels.profiles.map((candidate) => candidate.id === profile.id ? { ...candidate, enabled } : candidate);
           await writeGatewayConfigPatch(flags.configPath ?? gatewayConfigPath(), {
             tunnels: { profiles } as never,
@@ -519,19 +529,29 @@ export async function main(argv = process.argv.slice(2), io: GatewayCliIo = {}):
           });
           if (enabled) {
             if (gateway.online) await client.restart();
-            state = await client.tunnelStart(profile.provider, options);
+            state = typeof client.tunnelProfileStart === "function"
+              ? await client.tunnelProfileStart(profile.id, options)
+              : await client.tunnelStart(profile.provider, { ...options, instance: profile.id });
           }
           const value = { profile: profile.id, enabled, ...(state === undefined ? {} : { state }) };
           write(stdout, flags.json ? JSON.stringify(value) : JSON.stringify(value, null, 2));
           return 0;
         }
         const value = profileAction === "status"
-          ? await client.tunnelStatus(profile.provider, profile.id, flags.timeoutMs)
+          ? typeof client.tunnelProfileStatus === "function"
+            ? await client.tunnelProfileStatus(profile.id, flags.timeoutMs)
+            : await client.tunnelStatus(profile.provider, profile.id, flags.timeoutMs)
           : profileAction === "start"
-            ? await client.tunnelStart(profile.provider, options)
+            ? typeof client.tunnelProfileStart === "function"
+              ? await client.tunnelProfileStart(profile.id, options)
+              : await client.tunnelStart(profile.provider, { ...options, instance: profile.id })
             : profileAction === "stop"
-              ? await client.tunnelStop(profile.provider, options)
-              : await client.tunnelRestart(profile.provider, options);
+              ? typeof client.tunnelProfileStop === "function"
+                ? await client.tunnelProfileStop(profile.id, options)
+                : await client.tunnelStop(profile.provider, { ...options, instance: profile.id })
+              : typeof client.tunnelProfileRestart === "function"
+                ? await client.tunnelProfileRestart(profile.id, options)
+                : await client.tunnelRestart(profile.provider, { ...options, instance: profile.id });
         write(stdout, flags.json ? JSON.stringify(value) : JSON.stringify(value, null, 2));
         return 0;
       }
@@ -693,6 +713,7 @@ export async function main(argv = process.argv.slice(2), io: GatewayCliIo = {}):
         "  pair create|bootstrap|list|revoke [ID]",
         "  pair create --purpose fabric-enrollment|fabric-rotation --connector-id ID [--generation N] [--ttl SECONDS] --token-out FILE [--config PATH]",
         "  tunnel status|start|stop|restart [PROVIDER] [INSTANCE] [--timeout-ms MS] [--generation N] [--local-port PORT] [--binary PATH] [--json]",
+        "  tunnel doctor [--timeout-ms MS] [--config PATH] [--json] (local, read-only, bounded)",
         "  tunnel profile list|status|start|stop|restart|enable|disable [PROFILE] [--timeout-ms MS] [--generation N] [--config PATH] [--json]",
         "    persisted profiles support Cloudflare Quick/Named, OpenAI Secure, and Managed OpenSSH Reverse modes; legacy provider commands remain compatible",
         "    openai is experimental: explicitly configure env references or pass --experimental --tunnel-id-env NAME --runtime-key-env NAME; no auto-download/provisioning",

@@ -6,7 +6,7 @@ import type { GatewayConfig } from "./config.ts";
 import { gatewayTunnelProfileInput, FABRIC_DEFAULT_AUDIENCE, loadGatewayConfig } from "./config.ts";
 import { GATEWAY_PROTOCOL_VERSION, type GatewayOwnerRecord } from "./contracts.ts";
 import type { GatewayHttpServerHandle } from "./http-server.ts";
-import { isLoopbackHost } from "./auth.ts";
+import { GatewayHttpAuth, isLoopbackHost } from "./auth.ts";
 import { gatewayIpcAddress, startGatewayIpcServer, type GatewayIpcServerHandle } from "./ipc.ts";
 import { GatewayOwnerStore } from "./owner-store.ts";
 import { GatewayRuntime, type GatewayRuntimeOptions } from "./runtime.ts";
@@ -43,6 +43,11 @@ import { GatewayTunnelManager } from "./tunnel/provider.ts";
 import { CloudflareQuickTunnelProvider } from "./tunnel/providers/cloudflare.ts";
 import { OpenAiTunnelProvider } from "./tunnel/providers/openai.ts";
 import { SshReverseTunnelProvider } from "./tunnel/providers/ssh-reverse.ts";
+import {
+  GATEWAY_TUNNEL_AUDIENCE,
+  gatewayTunnelMcpCredentialPolicy,
+} from "./tunnel/mcp-access.ts";
+import { canonicalizeGatewayPairingAudience } from "./pairing-store.ts";
 
 interface FabricTeammateRuntimeSourcePort extends FabricTeammateRuntimePort {
   getSourceAvailability?(request: { readonly cwd: string }): Promise<FabricDeviceSourceAvailability | undefined>;
@@ -87,6 +92,8 @@ export class GatewayDaemon {
   owner?: GatewayOwnerRecord;
   ipc?: GatewayIpcServerHandle;
   http?: GatewayHttpServerHandle;
+  /** Optional loopback-only MCP/OAuth listener used by enabled tunnel profiles. */
+  tunnelHttp?: GatewayHttpServerHandle;
   controlDispatcher?: GatewayControlDispatcher;
   tunnelManager?: GatewayTunnelManager;
   fabricSecurity?: FabricConnectorSecurity;
@@ -109,6 +116,7 @@ export class GatewayDaemon {
     if (this.owner) return this;
     this.stopped = new Promise<void>((resolve) => { this.resolveStopped = resolve; });
     const config = this.options.config ?? await loadGatewayConfig(this.options.configPath);
+    assertGatewayTunnelMcpAccessContracts(config);
     this.config = config;
     const enableHttp = this.options.http ?? config.transport.http.enabled;
     if (config.fabric.enabled && (!enableHttp || config.transport.http.tls?.enabled !== true)) {
@@ -249,15 +257,25 @@ export class GatewayDaemon {
           credentialTtlMs: openAiConfig.credentialTtlMs,
           defaultLocalPort: localTunnelPort,
           mcpPath: config.transport.http.path,
-          issueGatewayCredential: async (request, ttlMs) => runtime.pairingStore.issue({
-            ttlMs,
-            audience: "gateway.tunnel",
-            scopes: ["gateway.host.status"],
-            provider: "openai",
-            instance: request.instance,
-            generation: request.generation,
-            label: `openai-tunnel:${request.instance}`,
-          }),
+          issueGatewayCredential: async (request, ttlMs) => {
+            // Access policy is projected exclusively from the canonical
+            // configured profile. Provider input is deliberately absent from
+            // this lookup, so generic provider/instance overrides cannot
+            // select scopes or workspace.
+            const profile = config.tunnels.profiles.find((candidate) => candidate.provider === "openai" && candidate.mode === "secure" && candidate.id === request.instance);
+            if (profile === undefined) throw new Error("OpenAI Tunnel credentials require a configured Secure profile issuer");
+            const policy = gatewayTunnelMcpCredentialPolicy(profile.mcpAccess);
+            return runtime.pairingStore.issue({
+              ttlMs,
+              audience: GATEWAY_TUNNEL_AUDIENCE,
+              scopes: policy.scopes,
+              provider: "openai",
+              instance: profile.id,
+              generation: request.generation,
+              ...(policy.workspaceId === undefined ? {} : { workspaceId: policy.workspaceId }),
+              label: `openai-tunnel:${request.instance}`,
+            });
+          },
           revokeGatewayCredential: async (id) => { await runtime.pairingStore.revoke(id, { revokedBy: "openai-tunnel-provider" }); },
         }),
         new SshReverseTunnelProvider({ defaultLocalPort: localTunnelPort, mcpPath: config.transport.http.path }),
@@ -265,6 +283,7 @@ export class GatewayDaemon {
       const tunnelProfiles = config.tunnels.profiles.map((profile) => ({
         id: profile.id,
         provider: profile.provider,
+        mode: profile.mode,
         lifecycle: profile.lifecycle,
         enabled: profile.enabled,
         input: gatewayTunnelProfileInput(profile, { port: localTunnelPort, path: config.transport.http.path }),
@@ -276,6 +295,15 @@ export class GatewayDaemon {
         observer: runtime.observer,
       });
       this.tunnelManager = tunnelManager;
+      // OpenAI credentials are process-local and cannot be adopted after a
+      // daemon restart. Fence every configured profile (including disabled
+      // profiles) before recovery may issue a successor generation. Pairing
+      // store mutation serialization leaves credentials issued after this
+      // save untouched.
+      for (const profile of config.tunnels.profiles) {
+        if (profile.provider !== "openai" || profile.mode !== "secure") continue;
+        await runtime.pairingStore.revokeOpenAiTunnelPairings(profile.id, `daemon-startup-recovery:${profile.id}`);
+      }
       const issuePair = async (data: Record<string, unknown> | undefined, bootstrap: boolean): Promise<unknown> => {
         const http = config.transport.http;
         const effectiveHost = this.options.httpHost ?? http.host;
@@ -316,11 +344,18 @@ export class GatewayDaemon {
         if (config.auth.mode === "open") throw new Error("Pairing requires authenticated Gateway HTTP");
         const scopes = data?.scopes;
         if (scopes !== undefined && (!Array.isArray(scopes) || scopes.some((scope) => typeof scope !== "string"))) throw new Error("pairing scopes are invalid");
+        // Canonicalize before the security comparison and before forwarding to
+        // the store. This closes whitespace/newline aliases of tunnel.audience.
+        const audience = data?.audience === undefined ? undefined : canonicalizeGatewayPairingAudience(data.audience);
+        // Tunnel credentials are minted only by the canonical configured
+        // OpenAI profile issuer above. The generic pairing boundary must not
+        // become a policy-injection seam for audience/scopes/workspace.
+        if (audience === GATEWAY_TUNNEL_AUDIENCE) throw new Error("gateway.tunnel credentials require a configured tunnel profile");
         const issued = await runtime.pairingStore.issue({
           ...(data?.ttlMs === undefined ? {} : { ttlMs: Number(data.ttlMs) }),
           ...(data?.label === undefined ? {} : { label: data.label as string }),
           ...(scopes === undefined ? {} : { scopes: scopes as string[] }),
-          ...(data?.audience === undefined ? {} : { audience: data.audience as string }),
+          ...(audience === undefined ? {} : { audience }),
           ...(data?.workspaceId === undefined && data?.workspace === undefined ? {} : { workspaceId: (data.workspaceId ?? data.workspace) as string }),
           ...(data?.provider === undefined ? {} : { provider: data.provider as string }),
           ...(data?.instance === undefined ? {} : { instance: data.instance as string }),
@@ -425,17 +460,32 @@ export class GatewayDaemon {
               assertLivePublicTunnelConfig(config, tunnelManager, data);
               return tunnelManager.control("tunnel-restart", data);
             },
+            "tunnel-doctor": (data: Record<string, unknown> | undefined) => tunnelManager.doctor({ deadlineAt: typeof data?.deadlineAt === "number" ? data.deadlineAt : undefined }),
           } : {}),
           ...this.options.tunnelControlHandlers,
         },
       });
       if (enableHttp) {
         const { startGatewayHttpServer } = await import("./http-server.ts");
+        // Both listeners are views over the same runtime and auth state. The
+        // tunnel listener is created only for an explicitly enabled MCP access
+        // profile, preserving legacy profiles that target the primary listener.
+        const sharedAuth = new GatewayHttpAuth(runtime.config.auth, runtime.pairingStore, runtime.fabricOriginDataPlaneGrants);
         this.http = await startGatewayHttpServer(runtime, {
           host: this.options.httpHost,
           port: this.options.httpPort,
           path: this.options.httpPath,
+          auth: sharedAuth,
         });
+        if (config.tunnels.profiles.some((profile) => profile.mcpAccess?.enabled === true)) {
+          this.tunnelHttp = await startGatewayHttpServer(runtime, {
+            mode: "tunnel-ingress",
+            host: "127.0.0.1",
+            port: 0,
+            path: this.http.path,
+            auth: sharedAuth,
+          });
+        }
         if (config.fabric.enabled) {
           const origin = new URL(this.http.url);
           origin.pathname = "/";
@@ -446,6 +496,16 @@ export class GatewayDaemon {
             : await readFile(config.transport.http.tls.certFile, "utf8");
           this.fabricOriginDataPlaneGrants?.configureHttps({ baseUrl: origin.href, ...(ca === undefined ? {} : { ca }) });
         }
+      } else if (config.tunnels.profiles.some((profile) => profile.mcpAccess?.enabled === true)) {
+        // A tunnel ingress may be the only HTTP surface when explicitly
+        // requested; it remains loopback-only and still shares runtime/auth.
+        const sharedAuth = new GatewayHttpAuth(runtime.config.auth, runtime.pairingStore, runtime.fabricOriginDataPlaneGrants);
+        const { startGatewayHttpServer } = await import("./http-server.ts");
+        this.tunnelHttp = await startGatewayHttpServer(runtime, {
+          mode: "tunnel-ingress", host: "127.0.0.1", port: 0,
+          path: this.options.httpPath ?? runtime.config.transport.http.path,
+          auth: sharedAuth,
+        });
       }
       // Owner IPC is the grant acquisition boundary, so it is published only
       // after the authoritative Fabric HTTPS listener and grant URL are ready.
@@ -498,9 +558,25 @@ export class GatewayDaemon {
         );
         fabricWss.start();
       }
-      // Recovery is fail-soft: an external ingress failure never takes down the
-      // local HTTPS/stdio Gateway.
-      if (tunnelManager) void tunnelManager.recoverAll().catch(() => undefined);
+      // Profiles are finalized only after the listeners publish their actual
+      // bound ports. This prevents a configured port=0 (or a collision) from
+      // leaking an unusable provider input and ensures providers never start
+      // before ingress binding succeeds.
+      if (tunnelManager) {
+        for (const profile of config.tunnels.profiles) {
+          const ingress = profile.mcpAccess?.enabled === true && this.tunnelHttp !== undefined ? this.tunnelHttp : this.http;
+          if (ingress !== undefined) {
+            tunnelManager.updateProfileInput(profile.id, gatewayTunnelProfileInput(profile, { port: ingress.port, path: ingress.path }, {
+              boundPort: ingress.port,
+              forceBoundPort: profile.mcpAccess?.enabled === true,
+            }));
+          }
+        }
+      }
+      // Recovery is asynchronous so an external ingress failure never takes
+      // down the local HTTPS/stdio Gateway. Supervisor state retains verified
+      // ownership failures; do not discard a recovery rejection here.
+      if (tunnelManager) void tunnelManager.recoverAll();
       return this;
     } catch (error) {
       await this.stop().catch(() => undefined);
@@ -517,6 +593,7 @@ export class GatewayDaemon {
       // runtime phase before its first await, so HTTP registration and WSS
       // admission both reject while existing Connector channels drain.
       this.http?.setReady(false);
+      this.tunnelHttp?.setReady(false);
       this.runtime?.fenceFabricAdmission();
       const runtimeQuiesce = this.runtime?.beginQuiesce(deadlineAt);
       const tunnelQuiesce = this.tunnelManager?.closeAll(deadlineAt);
@@ -529,6 +606,8 @@ export class GatewayDaemon {
       this.fabricWss = undefined;
       this.fabricSecurity = undefined;
       await Promise.allSettled([runtimeQuiesce, tunnelQuiesce, connectorQuiesce]);
+      await this.tunnelHttp?.close().catch(() => undefined);
+      this.tunnelHttp = undefined;
       await this.http?.close().catch(() => undefined);
       this.http = undefined;
       await this.ipc?.close().catch(() => undefined);
@@ -735,6 +814,26 @@ function jsonObject(
 function jsonArray<T>(value: JsonValue | undefined, path: string): readonly T[] {
   if (!Array.isArray(value)) throw new FabricContractError("invalid_argument", `${path} must be an array`, path);
   return value as unknown as readonly T[];
+}
+
+function assertGatewayTunnelMcpAccessContracts(config: GatewayConfig): void {
+  for (const profile of config.tunnels.profiles) {
+    const access = profile.mcpAccess;
+    if (access === undefined) continue;
+    if (access.auth.kind === "gateway") {
+      if (access.actions.length > 0) throw new Error(`Tunnel profile ${profile.id} gateway MCP auth cannot define actions/scopes`);
+      if (access.enabled && profile.provider === "openai" && profile.mode === "secure") {
+        throw new Error(`Tunnel profile ${profile.id} OpenAI Secure MCP access requires managed-forward auth`);
+      }
+      continue;
+    }
+    if (profile.provider !== "openai" || profile.mode !== "secure") {
+      throw new Error(`Tunnel profile ${profile.id} managed-forward MCP auth is only supported by OpenAI Secure profiles`);
+    }
+    if (access.enabled && access.actions.length === 0) {
+      throw new Error(`Tunnel profile ${profile.id} enabled managed-forward MCP access requires explicit actions`);
+    }
+  }
 }
 
 function assertLivePublicTunnelConfig(

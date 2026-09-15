@@ -397,6 +397,7 @@ export interface GatewayConfigView {
     confirm: string[];
     deny: string[];
   };
+  transport: { httpPath: string };
   tunnels: {
     openai: {
       enabled: boolean;
@@ -429,6 +430,7 @@ export function readGatewayConfigView(): GatewayConfigView | undefined {
       },
       commands: structuredClone(config.security.commands),
       files: structuredClone(config.security.files),
+      transport: { httpPath: config.transport.http.path },
       tunnels: {
         openai: {
           enabled: config.tunnels.openai.enabled,
@@ -573,8 +575,8 @@ export async function readGatewayTasks(cwd?: string): Promise<GatewayJournalTask
 
 // --- Tunnel endpoint config sync ---
 
-function replaceConfigAtomically(next: string): void {
-  const path = GATEWAY_CONFIG_PATH();
+function replaceConfigAtomically(next: string, targetPath = GATEWAY_CONFIG_PATH()): void {
+  const path = targetPath;
   mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
   const temp = `${path}.gateway-${process.pid}-${randomUUID()}.tmp`;
   try {
@@ -586,9 +588,9 @@ function replaceConfigAtomically(next: string): void {
 }
 
 /** Restore a previously-read config snapshot after a failed tunnel transaction. */
-export function restoreGatewayConfig(raw: string): void {
+export function restoreGatewayConfig(raw: string, targetPath?: string): void {
   if (!raw) throw new Error("config.yaml 快照为空");
-  replaceConfigAtomically(raw);
+  replaceConfigAtomically(raw, targetPath);
 }
 
 /** Update auth.oauth.server_url in the native Gateway config (in place, section-preserving). */

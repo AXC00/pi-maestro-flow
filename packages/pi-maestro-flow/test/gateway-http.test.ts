@@ -18,6 +18,20 @@ async function runtimeFor(root: string, auth: Parameters<typeof createTestGatewa
   return GatewayRuntime.create({ config, cwd: root });
 }
 
+test("tunnel ingress is loopback-only and excludes Fabric paths while sharing OAuth routes", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "gateway-http-tunnel-ingress-"));
+  const runtime = await runtimeFor(root, { mode: "bearer", token: "test-bearer-token" });
+  const server = await startGatewayHttpServer(runtime, { mode: "tunnel-ingress", host: "127.0.0.1", port: 0 });
+  t.after(async () => { await server.close(); await runtime.close(); await rm(root, { recursive: true, force: true }); });
+  assert.equal(server.mode, "tunnel-ingress");
+  assert.equal(server.host, "127.0.0.1");
+  assert.equal(server.secure, false);
+  assert.equal((await fetch(new URL("/.well-known/oauth-authorization-server", server.url))).status, 200);
+  assert.equal((await fetch(new URL("/fabric/v1/connector", server.url), { headers: { authorization: "Bearer test-bearer-token" } })).status, 404);
+  assert.equal((await fetch(server.url, { method: "POST", headers: { authorization: "Bearer test-bearer-token", "content-type": "application/json", accept: "application/json, text/event-stream" }, body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2025-11-25", capabilities: {}, clientInfo: { name: "tunnel", version: "1" } } }) })).status, 200);
+  await assert.rejects(() => startGatewayHttpServer(runtime, { mode: "tunnel-ingress", host: "0.0.0.0", port: 0 }), /loopback/u);
+});
+
 test("rejects open authentication on a non-loopback HTTP listener", async (t) => {
   const root = await mkdtemp(join(tmpdir(), "gateway-http-open-"));
   const runtime = await runtimeFor(root, { mode: "open" });
@@ -175,6 +189,37 @@ test("open HTTP mutation migration is explicit, warns once for legacy access, an
   const restricted = createGatewayPrincipal("http", "restricted", { authenticated: true, scopes: ["unrelated"] });
   assert.equal((await safe.call("host", { action: "status" }, restricted)).error?.code, "capability_denied");
   await safe.close();
+});
+
+test("pairing revocation closes existing MCP event streams", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "gateway-http-revoke-stream-"));
+  const runtime = await runtimeFor(root, { mode: "bearer", token: "configured-secret" });
+  const pairing = await runtime.pairingStore.issue({ audience: "gateway.tunnel", provider: "openai", instance: "profile-a", generation: 1, scopes: ["gateway.host.status"], ttlMs: 60_000 });
+  const server = await startGatewayHttpServer(runtime, { host: "127.0.0.1", port: 0 });
+  t.after(async () => { await server.close(); await runtime.close(); await rm(root, { recursive: true, force: true }); });
+  const headers = { authorization: `Bearer ${pairing.token}`, "content-type": "application/json", accept: "application/json, text/event-stream" };
+  const initialized = await fetch(server.url, {
+    method: "POST", headers,
+    body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2025-11-25", capabilities: {}, clientInfo: { name: "revoke-stream", version: "1" } } }),
+  });
+  assert.equal(initialized.status, 200);
+  const sessionId = initialized.headers.get("mcp-session-id");
+  assert.ok(sessionId);
+  const stream = await fetch(server.url, { headers: { authorization: `Bearer ${pairing.token}`, accept: "text/event-stream", "mcp-session-id": sessionId! } });
+  assert.equal(stream.status, 200);
+  const reader = stream.body!.getReader();
+  const deadline = Date.now() + 2_000;
+  const drained = (async (): Promise<boolean> => {
+    const timeout = Symbol("timeout");
+    while (Date.now() < deadline) {
+      const result = await Promise.race([reader.read(), new Promise<typeof timeout>((resolve) => setTimeout(() => resolve(timeout), 100))]);
+      if (result === timeout) continue;
+      if (result.done) return true;
+    }
+    return false;
+  })();
+  assert.equal(await runtime.pairingStore.revoke(pairing.id, { reason: "test-revoke" }), true);
+  assert.equal(await drained, true, "revocation must close the existing SSE stream");
 });
 
 test("health/readiness expose no secrets and persisted pairing tokens authenticate", async (t) => {

@@ -573,6 +573,24 @@ MCP 服务器在 Pi 配置文件中定义（用户级或项目级）：
 }
 ```
 
+### Gateway Tunnel 公网 MCP
+
+Gateway Tunnel 用于把 Gateway 的 MCP endpoint 安全地放到公网；它与 `/mcp` 管理普通外部 MCP server 是两条不同链路。完整的 Cloudflare Quick/Named、OpenAI Secure、Managed OpenSSH Reverse 配置见 [Gateway Tunnel 配置指南](gateway-tunnel-configuration.md)；实验性 OpenAI client 的安装交互见 [OpenAI Secure MCP Tunnel](../packages/pi-maestro-flow/optional/OPENAI-TUNNEL-SETUP.md)。
+
+Pi 内使用 `/gateway tunnel` 打开专用人工操作面，也可使用 CLI：
+
+```bash
+# Gateway 运行状态和无副作用检查
+pi-maestro-gateway tunnel doctor --config ~/.pi/agent/gateway/config.yaml --json
+
+# 查看/启动一个已配置的 profile
+pi-maestro-gateway tunnel profile list --config ~/.pi/agent/gateway/config.yaml --json
+pi-maestro-gateway tunnel profile status PROFILE --config ~/.pi/agent/gateway/config.yaml --json
+pi-maestro-gateway tunnel profile start PROFILE --config ~/.pi/agent/gateway/config.yaml --json
+```
+
+Persistent profile 的 `enable|disable` 修改持久启用意图；`start|stop|restart` 只操作当前实例。启用公网 MCP access 时使用精确的 `actions` allowlist；OpenAI Secure 才能使用 `auth.kind: managed-forward`，其他 provider 不接受由 profile 代发的窄权限 action。固定公网 URL 为 `public_url + transport.http.path`，Quick URL 则每次启动可能变化。Tunnel 内部的短期 `gateway.tunnel` credential 不等同于公网 MCP 客户端 token，不应复制到客户端配置。
+
 ---
 
 ## 5. 权限系统

@@ -1,7 +1,8 @@
 /** Native Pi agent Gateway configuration reader and writer. */
 import { readFile } from "node:fs/promises";
-import { existsSync, readFileSync } from "node:fs";
-import { isAbsolute } from "node:path";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { createRequire } from "node:module";
+import { dirname, isAbsolute } from "node:path";
 import { isMap, parse as parseYaml, parseDocument, stringify as stringifyYaml } from "yaml";
 import {
   GATEWAY_CONFIG_VERSION,
@@ -14,6 +15,12 @@ import {
   utf8Bytes,
   writeGatewayFileAtomic,
 } from "./state-paths.ts";
+import {
+  normalizeGatewayTunnelMcpAccess,
+  normalizeGatewayTunnelMcpPath,
+  type GatewayTunnelMcpAccessConfig,
+  GatewayTunnelMcpAccessValidationError,
+} from "./tunnel/mcp-access.ts";
 
 export type GatewayAuthMode = "open" | "bearer" | "oauth" | "dual";
 export type GatewayCommandPolicy = "allow" | "confirm" | "deny";
@@ -169,6 +176,8 @@ interface GatewayTunnelProfileBase {
   binaryPath?: string;
   localPort?: number;
   publicUrl?: string;
+  /** Optional, disabled-by-default MCP ingress contract. */
+  mcpAccess?: GatewayTunnelMcpAccessConfig;
 }
 export interface GatewayCloudflareQuickTunnelProfileConfig extends GatewayTunnelProfileBase {
   provider: "cloudflare";
@@ -222,21 +231,31 @@ export interface GatewayTunnelsConfig {
   profiles: GatewayTunnelProfileConfig[];
 }
 
+export interface GatewayTunnelProfileInputOptions {
+  /** Actual listener port, available only after Gateway binding. */
+  boundPort?: number;
+  /** Tunnel ingress profiles must always target their bound loopback listener. */
+  forceBoundPort?: boolean;
+}
+
 export function gatewayTunnelProfileInput(
   profile: GatewayTunnelProfileConfig,
   http: Pick<GatewayTransportConfig["http"], "port" | "path">,
+  options: GatewayTunnelProfileInputOptions = {},
 ): Readonly<Record<string, unknown>> {
+  const localPort = options.forceBoundPort && options.boundPort !== undefined ? options.boundPort : undefined;
+  const port = (configured: number | undefined): number => localPort ?? configured ?? http.port;
   if (profile.provider === "cloudflare" && profile.mode === "quick") {
     return {
       mode: "quick",
-      localPort: profile.localPort ?? http.port,
+      localPort: port(profile.localPort),
       ...(profile.binaryPath ? { binaryPath: profile.binaryPath } : {}),
     };
   }
   if (profile.provider === "cloudflare") {
     return {
       mode: "named",
-      localPort: profile.localPort ?? http.port,
+      localPort: port(profile.localPort),
       publicUrl: profile.publicUrl,
       tunnelId: profile.tunnelId,
       ...(profile.binaryPath ? { binaryPath: profile.binaryPath } : {}),
@@ -246,7 +265,7 @@ export function gatewayTunnelProfileInput(
   if (profile.provider === "ssh") {
     return {
       mode: "reverse",
-      localPort: profile.localPort ?? http.port,
+      localPort: port(profile.localPort),
       mcpPath: http.path,
       publicUrl: profile.publicUrl,
       host: profile.host,
@@ -267,7 +286,7 @@ export function gatewayTunnelProfileInput(
   return {
     mode: "secure",
     experimental: true,
-    localPort: profile.localPort ?? http.port,
+    localPort: port(profile.localPort),
     mcpPath: http.path,
     publicUrl: profile.publicUrl,
     tunnelIdEnv: profile.tunnelIdEnv,
@@ -339,6 +358,16 @@ export class GatewayConfigValidationError extends Error {
 
 const KNOWN_SECTIONS = new Set(["version", "server", "auth", "security", "workspaces", "transport", "limits", "logging", "state", "retention", "tunnels", "fabric"]);
 const MAX_CONFIG_BYTES = 4 * 1024 * 1024;
+const properLockfile = createRequire(import.meta.url)("proper-lockfile") as {
+  lock(filePath: string, options: { realpath: boolean; stale: number; update: number; retries: { retries: number; factor: number; minTimeout: number; maxTimeout: number; randomize: boolean } }): Promise<() => Promise<void>>;
+};
+
+export class GatewayConfigConflictError extends Error {
+  constructor(message = "Gateway config changed concurrently") {
+    super(message);
+    this.name = "GatewayConfigConflictError";
+  }
+}
 
 const DEFAULT_SERVER: GatewayServerConfig = {
   host: "127.0.0.1",
@@ -645,7 +674,7 @@ export function normalizeGatewayConfig(value: unknown): GatewayConfig {
       enabled: bool(httpRaw.enabled, "transport.http.enabled", DEFAULT_TRANSPORT.http.enabled),
       host: httpRaw.host === undefined ? server.host : stringValue(httpRaw.host, "transport.http.host", 255),
       port: integer(httpRaw.port, "transport.http.port", 1, 65535, server.port),
-      path: httpRaw.path === undefined ? DEFAULT_TRANSPORT.http.path : stringValue(httpRaw.path, "transport.http.path", 1024),
+      path: httpRaw.path === undefined ? DEFAULT_TRANSPORT.http.path : normalizeGatewayTunnelMcpPath(httpRaw.path, "transport.http.path"),
       tls,
     },
     ssh: { enabled: bool(sshRaw.enabled, "transport.ssh.enabled", DEFAULT_TRANSPORT.ssh.enabled) },
@@ -781,6 +810,7 @@ export function normalizeGatewayConfig(value: unknown): GatewayConfig {
     knownKeys(item, [
       "id", "enabled", "provider", "mode", "lifecycle", "binaryPath", "binary_path", "localPort", "local_port",
       "publicUrl", "public_url", "tunnelId", "tunnel_id", "credentialsFile", "credentials_file", "tokenFile", "token_file",
+      "mcpAccess", "mcp_access",
       "tunnelIdEnv", "tunnel_id_env", "runtimeKeyEnv", "runtime_key_env", "credentialTtlMs", "credential_ttl_ms",
       "host", "user", "port", "remoteBindHost", "remote_bind_host", "remotePort", "remote_port",
       "localHost", "local_host", "identityFile", "identity_file", "configFile", "config_file",
@@ -823,12 +853,28 @@ export function normalizeGatewayConfig(value: unknown): GatewayConfig {
       || item.connectTimeoutSeconds !== undefined || item.connect_timeout_seconds !== undefined
       || item.serverAliveIntervalSeconds !== undefined || item.server_alive_interval_seconds !== undefined
       || item.serverAliveCountMax !== undefined || item.server_alive_count_max !== undefined;
+    const mcpRaw = item.mcpAccess !== undefined ? item.mcpAccess : item.mcp_access;
+    const normalizeMcp = (): GatewayTunnelMcpAccessConfig | undefined => {
+      if (mcpRaw === undefined) return undefined;
+      try {
+        const result = normalizeGatewayTunnelMcpAccess(mcpRaw, `${path}.mcpAccess`, { provider: String(provider), mode: String(mode), controlledPath: transport.http.path });
+        if (result.publicUrl !== undefined && publicUrl !== undefined && new URL(result.publicUrl).origin !== new URL(publicUrl).origin) {
+          throw new GatewayTunnelMcpAccessValidationError(`${path}.publicUrl must match the tunnel profile publicUrl origin`);
+        }
+        return result;
+      } catch (error) {
+        if (error instanceof GatewayTunnelMcpAccessValidationError) throw new GatewayConfigValidationError(error.message);
+        throw error;
+      }
+    };
     if (provider === "cloudflare" && mode === "quick") {
       if (lifecycle !== "ephemeral") throw new GatewayConfigValidationError(`${path}.lifecycle must be ephemeral for Cloudflare Quick Tunnel`);
       if (publicUrl !== undefined || hasNamedFields || hasOpenAiFields || hasSshFields) {
         throw new GatewayConfigValidationError(`${path} Quick Tunnel cannot define persistent-provider fields`);
       }
-      return { ...common, provider, mode, lifecycle };
+      const mcpAccess = normalizeMcp();
+      if (mcpAccess?.publicUrl !== undefined) throw new GatewayConfigValidationError(`${path}.mcpAccess.publicUrl is not allowed for an ephemeral Quick Tunnel`);
+      return { ...common, provider, mode, lifecycle, ...(mcpAccess === undefined ? {} : { mcpAccess }) };
     }
     if (provider === "cloudflare" && mode === "named") {
       if (lifecycle !== "persistent") throw new GatewayConfigValidationError(`${path}.lifecycle must be persistent for Cloudflare Named Tunnel`);
@@ -840,13 +886,15 @@ export function normalizeGatewayConfig(value: unknown): GatewayConfig {
       const credentialsFile = optionalString(item.credentialsFile ?? item.credentials_file, `${path}.credentialsFile`, 4096);
       const tokenFile = optionalString(item.tokenFile ?? item.token_file, `${path}.tokenFile`, 4096);
       if (Boolean(credentialsFile) === Boolean(tokenFile)) throw new GatewayConfigValidationError(`${path} requires exactly one of credentialsFile or tokenFile`);
-      return { ...common, provider, mode, lifecycle, publicUrl, tunnelId, ...(credentialsFile ? { credentialsFile } : { tokenFile: tokenFile! }) };
+      const mcpAccess = normalizeMcp();
+      return { ...common, provider, mode, lifecycle, publicUrl, tunnelId, ...(credentialsFile ? { credentialsFile } : { tokenFile: tokenFile! }), ...(mcpAccess === undefined ? {} : { mcpAccess }) };
     }
     if (provider === "openai" && mode === "secure") {
       if (lifecycle !== "persistent") throw new GatewayConfigValidationError(`${path}.lifecycle must be persistent for OpenAI Secure Tunnel`);
       if (hasNamedFields) throw new GatewayConfigValidationError(`${path} OpenAI Secure Tunnel cannot define Cloudflare Named fields`);
       if (hasSshFields) throw new GatewayConfigValidationError(`${path} OpenAI Secure Tunnel cannot define SSH fields`);
       if (!publicUrl) throw new GatewayConfigValidationError(`${path}.publicUrl is required`);
+      const mcpAccess = normalizeMcp();
       return {
         ...common,
         provider,
@@ -856,6 +904,7 @@ export function normalizeGatewayConfig(value: unknown): GatewayConfig {
         tunnelIdEnv: environmentName(item.tunnelIdEnv ?? item.tunnel_id_env, `${path}.tunnelIdEnv`, openai.tunnelIdEnv),
         runtimeKeyEnv: environmentName(item.runtimeKeyEnv ?? item.runtime_key_env, `${path}.runtimeKeyEnv`, openai.runtimeKeyEnv),
         credentialTtlMs: integer(item.credentialTtlMs ?? item.credential_ttl_ms, `${path}.credentialTtlMs`, 60_000, 60 * 60_000, openai.credentialTtlMs),
+        ...(mcpAccess === undefined ? {} : { mcpAccess }),
       };
     }
     if (provider === "ssh" && mode === "reverse") {
@@ -882,6 +931,7 @@ export function normalizeGatewayConfig(value: unknown): GatewayConfig {
       for (const [filePath, value] of [[`${path}.identityFile`, identityFile], [`${path}.configFile`, configFile], [`${path}.knownHostsFile`, knownHostsFile]] as const) {
         if (value !== undefined && !isAbsolute(value)) throw new GatewayConfigValidationError(`${filePath} must be an absolute path`);
       }
+      const mcpAccess = normalizeMcp();
       return {
         ...common,
         provider,
@@ -900,6 +950,7 @@ export function normalizeGatewayConfig(value: unknown): GatewayConfig {
         connectTimeoutSeconds: integer(item.connectTimeoutSeconds ?? item.connect_timeout_seconds, `${path}.connectTimeoutSeconds`, 1, 120, 10),
         serverAliveIntervalSeconds: integer(item.serverAliveIntervalSeconds ?? item.server_alive_interval_seconds, `${path}.serverAliveIntervalSeconds`, 5, 300, 15),
         serverAliveCountMax: integer(item.serverAliveCountMax ?? item.server_alive_count_max, `${path}.serverAliveCountMax`, 1, 10, 3),
+        ...(mcpAccess === undefined ? {} : { mcpAccess }),
       };
     }
     throw new GatewayConfigValidationError(`${path} has an unsupported provider/mode combination`);
@@ -1068,9 +1119,30 @@ function canonicalYamlSection(key: string, value: unknown): unknown {
     const profiles = Array.isArray(v.profiles) ? v.profiles.map((profile) => {
       if (!profile || typeof profile !== "object" || Array.isArray(profile)) return profile;
       const p = profile as Record<string, unknown>;
-      const { binaryPath, localPort, publicUrl, tunnelId, credentialsFile, tokenFile, tunnelIdEnv, runtimeKeyEnv, credentialTtlMs, ...rest } = p;
+      const { binaryPath, localPort, publicUrl, tunnelId, credentialsFile, tokenFile, tunnelIdEnv, runtimeKeyEnv, credentialTtlMs, mcpAccess, mcp_access, ...rest } = p;
+      const rawMcp = mcpAccess ?? mcp_access;
+      const mcp = rawMcp && typeof rawMcp === "object" && !Array.isArray(rawMcp)
+        ? (() => {
+          const access = rawMcp as Record<string, unknown>;
+          const { allowedActions, allowed_actions, publicUrl: accessUrl, public_url, auth: rawAuth, ...accessRest } = access;
+          const auth = rawAuth && typeof rawAuth === "object" && !Array.isArray(rawAuth)
+            ? (() => {
+              const authRecord = rawAuth as Record<string, unknown>;
+              const { workspaceId, workspace_id, ...authRest } = authRecord;
+              return { ...authRest, ...(workspaceId === undefined ? (workspace_id === undefined ? {} : { workspace_id }) : { workspace_id: workspaceId }) };
+            })()
+            : rawAuth;
+          return {
+            ...accessRest,
+            ...(allowedActions === undefined ? (allowed_actions === undefined ? {} : { actions: allowed_actions }) : { actions: allowedActions }),
+            ...(accessUrl === undefined ? (public_url === undefined ? {} : { public_url }) : { public_url: accessUrl }),
+            ...(auth === undefined ? {} : { auth }),
+          };
+        })()
+        : rawMcp;
       return {
         ...rest,
+        ...(mcp === undefined ? {} : { mcp_access: mcp }),
         ...(binaryPath === undefined ? {} : { binary_path: binaryPath }),
         ...(localPort === undefined ? {} : { local_port: localPort }),
         ...(publicUrl === undefined ? {} : { public_url: publicUrl }),
@@ -1196,7 +1268,7 @@ function replaceSections(text: string, changed: Record<string, unknown>): string
  * Replace only supplied top-level sections. Unowned sections and comments are
  * copied verbatim from the existing file; omitted fields remain untouched.
  */
-export async function writeGatewayConfigPatch(
+async function writeGatewayConfigPatchUnlocked(
   path: string,
   patch: GatewayConfigPatch,
   cwd = process.cwd(),
@@ -1229,6 +1301,58 @@ export async function writeGatewayConfigPatch(
   const nextText = changed ? document.toString({ lineWidth: 0 }) : existing;
   await writeGatewayFileAtomic(path, nextText, { mode: 0o600, maximumBytes: MAX_CONFIG_BYTES });
   return parseGatewayConfigDocument(nextText, path);
+}
+
+export async function writeGatewayConfigPatch(
+  path: string,
+  patch: GatewayConfigPatch,
+  cwd = process.cwd(),
+): Promise<GatewayConfigDocument> {
+  return withGatewayConfigLock(path, () => writeGatewayConfigPatchUnlocked(path, patch, cwd));
+}
+
+const CONFIG_LOCK_OPTIONS = {
+  realpath: false,
+  stale: 10_000,
+  update: 2_000,
+  retries: { retries: 8, factor: 1.4, minTimeout: 25, maxTimeout: 250, randomize: true },
+};
+
+async function withGatewayConfigLock<T>(path: string, operation: () => Promise<T>): Promise<T> {
+  mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+  if (!existsSync(path)) {
+    try { writeFileSync(path, "", { encoding: "utf8", mode: 0o600, flag: "wx" }); } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+    }
+  }
+  const release = await properLockfile.lock(path, CONFIG_LOCK_OPTIONS);
+  try { return await operation(); }
+  finally { await release(); }
+}
+
+/** Apply a patch only when the exact raw document observed by the caller remains current. */
+export async function writeGatewayConfigPatchIfCurrent(
+  path: string,
+  expectedRaw: string,
+  patch: GatewayConfigPatch,
+  cwd = process.cwd(),
+): Promise<GatewayConfigDocument> {
+  return withGatewayConfigLock(path, async () => {
+    const current = await readGatewayFile(path, MAX_CONFIG_BYTES) ?? "";
+    if (current !== expectedRaw) throw new GatewayConfigConflictError();
+    return writeGatewayConfigPatchUnlocked(path, patch, cwd);
+  });
+}
+
+/** Restore a snapshot only when the committed document is still the expected one. */
+export async function restoreGatewayConfigIfCurrent(path: string, expectedRaw: string, replacementRaw: string): Promise<void> {
+  return withGatewayConfigLock(path, async () => {
+    const current = await readGatewayFile(path, MAX_CONFIG_BYTES) ?? "";
+    if (current !== expectedRaw) throw new GatewayConfigConflictError("Gateway config changed; rollback left newer writer intact");
+    if (utf8Bytes(replacementRaw) > MAX_CONFIG_BYTES) throw new GatewayConfigValidationError(`config exceeds ${MAX_CONFIG_BYTES} bytes`);
+    parseGatewayConfigDocument(replacementRaw, path);
+    await writeGatewayFileAtomic(path, replacementRaw, { mode: 0o600, maximumBytes: MAX_CONFIG_BYTES });
+  });
 }
 
 export async function writeGatewayConfig(path: string, config: GatewayConfig | GatewayConfigPatch): Promise<GatewayConfigDocument> {
