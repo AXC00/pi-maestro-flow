@@ -2929,21 +2929,17 @@ export function applyContextPressurePolicy(
     const limitBytes = settings.payloadLimitBytes;
     const initialBytes = estimatePayloadBytes(transformed);
     if (initialBytes > limitBytes) {
-      // The hard protection boundary is the current user message: its
-      // images and everything after it are the live instruction and are
-      // never touched.
-      let lastUserIndex = -1;
-      for (let index = transformed.length - 1; index >= 0; index--) {
-        if ((transformed[index] as MessageRecord).role === "user") {
-          lastUserIndex = index;
-          break;
-        }
-      }
-      const frontGuard = lastUserIndex >= 0 ? lastUserIndex : 0;
+      // Candidates are toolResult messages only (enforced inside
+      // runPayloadLimitPrune), so the live user instruction — including any
+      // images the user just pasted — is never a prune target by construction.
+      // No positional frontier here: in a single-turn session the only user
+      // message sits at index 0, and a frontier at that index would shield
+      // every tool result behind it (exactly the read-20-screenshots
+      // accumulation this guard exists to relieve).
       const payloadResult = runPayloadLimitPrune({
         messages: transformed,
         pruneManifest,
-        frontierStart: frontGuard,
+        frontierStart: transformed.length,
         limitBytes,
       });
       const noVelocity: VelocityInfo = { slope: undefined, robustGrowth: false, epochsToCritical: undefined };
@@ -4989,10 +4985,13 @@ export interface PayloadLimitPruneResult {
  * the configured ceiling. Later, more likely relevant context therefore
  * survives longest.
  *
- * Eligibility: toolResult messages that are not errors, not protected control
- * outputs, and not claimed by the manifest. The current user message (and
- * everything after it) is never touched — it is the live instruction, not
- * history.
+ * Eligibility: toolResult messages only — user messages (including any
+ * images the user just pasted) are never candidates by construction, nor are
+ * error results, protected control outputs, or entries already claimed by
+ * the manifest. Candidates are scanned across the WHOLE message array:
+ * in a single-turn session the only user message sits at index 0 and every
+ * tool result lives after it, so a positional frontier would shield exactly
+ * the read-many-screenshots accumulation this pass exists to relieve.
  */
 export function runPayloadLimitPrune(input: {
   messages: AgentMessage[];

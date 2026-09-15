@@ -103,17 +103,30 @@ test("runPayloadLimitPrune reclaims oldest eligible messages until payload fits"
   assert.ok(JSON.stringify(survivor.content).includes("C".repeat(10)), "small message intact");
 });
 
-test("runPayloadLimitPrune protects the current user message and errors", () => {
+test("runPayloadLimitPrune protects user messages and error/control results; single-turn toolResults are reclaimable", () => {
   const huge = "A".repeat(50_000_000);
+  // Single-turn shape (the slow-test failure case): the only user message sits
+  // at index 0 and every tool result lives after it — they MUST be eligible.
   const messages = [
-    { role: "toolResult", toolCallId: "err", toolName: "read", content: [imageBlock(huge)], isError: true },
-    { role: "toolResult", toolCallId: "todo", toolName: "todo", content: [imageBlock(huge)] },
-    { role: "user", content: [imageBlock(huge)] }, // current user
+    { role: "user", content: [{ type: "text", text: "read screenshots" }] },
+    { role: "toolResult", toolCallId: "r1", toolName: "read", content: [imageBlock(huge)], isError: false },
+    { role: "toolResult", toolCallId: "r2", toolName: "read", content: [imageBlock(huge)], isError: false },
   ] as never;
   const manifest = new Map();
-  const result = runPayloadLimitPrune({ messages, pruneManifest: manifest, frontierStart: 2, limitBytes: 1024 });
-  assert.ok(!result.pruned, "only protected/error messages remain eligible-free -> nothing pruned");
-  assert.equal(manifest.size, 0);
+  const result = runPayloadLimitPrune({ messages, pruneManifest: manifest, frontierStart: messages.length, limitBytes: 1024 });
+  assert.ok(result.pruned, "single-turn toolResult images must be reclaimable");
+  assert.ok(manifest.has("r1") || manifest.has("r2"), "oldest toolResult pruned first");
+
+  // User messages and error results are never candidates by construction.
+  const protectedOnly = [
+    { role: "user", content: [imageBlock(huge)] },
+    { role: "toolResult", toolCallId: "err", toolName: "read", content: [imageBlock(huge)], isError: true },
+    { role: "toolResult", toolCallId: "todo", toolName: "todo", content: [imageBlock(huge)] },
+  ] as never;
+  const manifest2 = new Map();
+  const result2 = runPayloadLimitPrune({ messages: protectedOnly, pruneManifest: manifest2, frontierStart: protectedOnly.length, limitBytes: 1024 });
+  assert.ok(!result2.pruned, "user image / error / control tool are never touched");
+  assert.equal(manifest2.size, 0);
 });
 
 test("runPayloadLimitPrune does nothing when within limit", () => {
