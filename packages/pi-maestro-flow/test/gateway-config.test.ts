@@ -334,7 +334,7 @@ test("default config is canonical and patch application keeps omitted values", (
 test("Gateway tunnel guide YAML examples parse and linked entry points resolve", async () => {
   const guidePath = join(import.meta.dirname, "../../../docs/gateway-tunnel-configuration.md");
   const guide = await readFile(guidePath, "utf8");
-  const examples = [...guide.matchAll(/```yaml\n([\s\S]*?)```/gu)].map((match) => match[1]!);
+  const examples = [...guide.matchAll(/```yaml\r?\n([\s\S]*?)```/gu)].map((match) => match[1]!);
   assert.equal(examples.length, 6);
   for (const example of examples) assert.equal(parseGatewayConfigDocument(example).config.version, 2);
 
