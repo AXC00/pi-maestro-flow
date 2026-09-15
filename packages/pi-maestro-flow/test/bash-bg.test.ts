@@ -17,7 +17,7 @@ import {
 	registerBashBg,
 	windowsTaskkillFailure,
 } from "../src/tools/bash-bg.ts";
-import { setQuietMode } from "../src/quiet-state.ts";
+import { setQuietMode } from "pi-maestro-settings-core/ui";
 import {
 	observeTargets,
 	registerObservationProvider,
