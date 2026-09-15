@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import test, { afterEach } from "node:test";
 import { visibleWidth } from "@earendil-works/pi-tui";
-import { isQuietMode, setQuietMode } from "../src/quiet-state.ts";
+import { isQuietMode, setQuietMode } from "pi-maestro-settings-core/ui";
 import {
   auxToolCallFallback,
   auxToolResultFallback,

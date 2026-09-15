@@ -51,6 +51,11 @@ export class MaestroStore {
 		return this.value === undefined ? undefined : structuredClone(this.value);
 	}
 
+	/** Live workflow view for hot render paths; not a defensive copy. */
+	workflow(): MaestroWorkflowV1 | null | undefined {
+		return this.value?.workflow;
+	}
+
 	clear(): void {
 		this.value = undefined;
 		this.sessionGeneration = undefined;

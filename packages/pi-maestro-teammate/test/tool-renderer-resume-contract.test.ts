@@ -3,7 +3,7 @@ import { readFileSync } from "node:fs";
 import test, { afterEach } from "node:test";
 import type { ExtensionAPI, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import registerTeammateExtension from "../src/extension/index.ts";
-import { setQuietMode } from "../src/quiet-state.ts";
+import { setQuietMode } from "pi-maestro-settings-core/ui";
 
 // pi renders /resume history BEFORE emitting session_start, so the
 // Cockpit-driven quiet mirror (cockpit:ui-ownership -> setQuietMode) is still

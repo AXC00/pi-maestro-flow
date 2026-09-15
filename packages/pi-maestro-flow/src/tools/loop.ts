@@ -2,7 +2,7 @@ import { SchedulerCore, type SchedulerCoreOptions } from "pi-maestro-teammate/v1
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { getShellConfig } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
-import { sanitizeCardText, toolCallLine, toolResultCard } from "../quiet-render.ts";
+import { sanitizeCardText, toolCallLine, toolResultCard } from "pi-cockpit/src/quiet-tools.ts";
 import type { FlowToolResult } from "./tool-result.ts";
 import { Type } from "typebox";
 import { spawn } from "node:child_process";

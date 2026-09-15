@@ -2191,9 +2191,30 @@ test("native teammate status widget yields while another surface owns agent disp
   assert.match(source, /pi\.events\.on\(COCKPIT_UI_OWNERSHIP_EVENT[\s\S]*?cockpitOwnsAgents = .*?\.agents === true/);
   assert.match(source, /const foregroundToolRuns = new Set<string>\(\)/);
   assert.match(source, /if \(params\.background === false\) \{[\s\S]*?foregroundToolRuns\.add\(correlationId\)[\s\S]*?updateAgentWidget\(\)/);
-  assert.match(source, /if \(foregroundToolRuns\.delete\(correlationId\)\) updateAgentWidget\(\)/);
+  assert.match(source, /if \(foregroundToolRuns\.delete\(correlationId\)\) scheduleAgentWidgetUpdate\(\)/);
   assert.match(source, /function clearAgentWidget\(\): void \{[\s\S]*?if \(!agentWidgetInstalled\) return;[\s\S]*?setWidget\("teammate-agents", undefined\)[\s\S]*?agentWidgetInstalled = false/);
   assert.match(source, /if \(cockpitOwnsAgents \|\| interactivePanelActive \|\| foregroundToolRuns\.size > 0\) \{[\s\S]*?clearAgentWidget\(\)/);
+});
+
+test("native teammate status widget is stable-mounted and renderKey-gated", () => {
+  const source = fs.readFileSync(new URL("../src/extension/index.ts", import.meta.url), "utf-8");
+  // The widget factory is installed once; the render closure reads the mutable
+  // holder instead of capturing a per-update snapshot.
+  assert.match(source, /let widgetAgents: ActiveAgent\[\] = \[\];/);
+  assert.match(source, /render\(width: number\): string\[\] \{\s*\n\s*return renderAgentStatusWidget\(widgetAgents, width, theme\);/);
+  // Render-key gating: identical visual state never re-installs or repaints.
+  assert.match(source, /function agentWidgetRenderKey\(agents: ActiveAgent\[\]\): string/);
+  assert.match(source, /if \(agentWidgetInstalled && key === lastWidgetRenderKey\) return;/);
+  assert.match(source, /if \(!agentWidgetInstalled\) \{[\s\S]*?setWidget\("teammate-agents"/);
+  assert.match(source, /widgetTui\?\.requestRender\?\.\(\);/);
+  // Event bursts coalesce through a single trailing debounce.
+  assert.match(source, /function scheduleAgentWidgetUpdate\(\): void \{\s*\n\s*if \(!widgetCtx \|\| cockpitOwnsAgents \|\| interactivePanelActive \|\| foregroundToolRuns\.size > 0\) return;/);
+  assert.match(source, /pi\.events\.on\(TEAMMATE_STARTED_EVENT, \(\) => \{[\s\S]*?scheduleAgentWidgetUpdate\(\);/);
+  // Locale changes bypass the key cache because labels are not key inputs.
+  assert.match(source, /function invalidateAgentWidget\(\): void \{\s*\n\s*lastWidgetRenderKey = undefined;/);
+  assert.match(source, /SETTINGS_LOCALE_EVENT, \(payload\) => \{[\s\S]*?invalidateAgentWidget\(\);/);
+  // Session teardown resets every piece of widget state.
+  assert.match(source, /widgetCtx = null;\s*\n\s*widgetAgents = \[\];\s*\n\s*widgetTui = null;\s*\n\s*lastWidgetRenderKey = undefined;/);
 });
 
 test("Alt+R delegates the active Agent or Window session list to Cockpit ownership", () => {

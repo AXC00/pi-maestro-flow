@@ -22,6 +22,7 @@ import type {
 	ExtensionAPI,
 	ExtensionContext,
 	ReadToolDetails,
+	Theme,
 	ThemeColor,
 } from "@earendil-works/pi-coding-agent";
 import {
@@ -33,8 +34,9 @@ import {
 	createReadTool,
 	createWriteTool,
 } from "@earendil-works/pi-coding-agent";
-import { Text } from "@earendil-works/pi-tui";
+import { Text, type Component, truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 import { homedir } from "node:os";
+import { quietStatusMark } from "pi-maestro-settings-core/ui";
 import type { CockpitConfig } from "./types.ts";
 import { resolveGlyphs, type IconGlyphs } from "./icons.ts";
 import {
@@ -313,4 +315,168 @@ export function registerQuietTools(pi: ExtensionAPI, getConfig: () => CockpitCon
 			},
 		});
 	}
+}
+
+// ---------------------------------------------------------------------------
+// Shared quiet renderers for Maestro-owned (self-rendering) tools.
+//
+// The built-in tool specs above cover Cockpit's own re-registered tools. Flow
+// and teammate tools render their own compact rows and consume these helpers so
+// every Maestro surface shares one implementation.
+// ---------------------------------------------------------------------------
+
+/**
+ * A structural subset of pi's Theme so both the real Theme and local test
+ * themes satisfy it without contravariance errors.
+ */
+export type QuietTheme = Pick<Theme, "fg"> & Partial<Pick<Theme, "bold">>;
+
+interface ResultLike {
+	content: Array<{ type: string; text?: string }>;
+}
+
+function lineComponent(text: string): Component {
+	return {
+		render(width: number): string[] {
+			const safeWidth = Math.max(1, width);
+			if (safeWidth <= 1) return [];
+			const liveWidth = safeWidth - 1;
+			return text.split("\n").map((line) => truncateToWidth(line, liveWidth, "…"));
+		},
+		invalidate(): void {},
+	};
+}
+
+export function toolCallLine(theme: QuietTheme, name: string, arg = ""): Component {
+	const bold = theme.bold ?? ((text: string) => text);
+	return lineComponent(
+		`  ${theme.fg("warning", quietStatusMark("running"))} ${theme.fg("toolTitle", bold(name))}${arg ? ` ${theme.fg("accent", arg)}` : ""}`,
+	);
+}
+
+export function toolResultLine(
+	theme: QuietTheme,
+	o: {
+		name: string;
+		mark?: string;
+		ok?: boolean;
+		arg?: string;
+		summary?: string;
+		detail?: string;
+		expanded?: boolean;
+	},
+): Component {
+	const bold = theme.bold ?? ((text: string) => text);
+	const mark = o.mark ?? (o.ok === false
+		? theme.fg("error", quietStatusMark("failure"))
+		: theme.fg("success", quietStatusMark("success")));
+	let line = `  ${mark} ${theme.fg("toolTitle", bold(o.name))}${o.arg ? ` ${theme.fg("accent", o.arg)}` : ""}${o.summary ? ` ${theme.fg("dim", `· ${o.summary}`)}` : ""}`;
+	if (o.expanded && o.detail && o.detail.trim()) line += `\n${theme.fg("dim", o.detail)}`;
+	return lineComponent(line);
+}
+
+export function toolResultCard(
+	theme: QuietTheme,
+	o: {
+		name: string;
+		ok?: boolean;
+		arg?: string;
+		summary?: string;
+		rows?: string[];
+		groups?: string[][];
+		maxBodyRows?: number;
+	},
+): Component {
+	const bold = theme.bold ?? ((text: string) => text);
+	const mark = o.ok === false
+		? theme.fg("error", quietStatusMark("failure"))
+		: theme.fg("success", quietStatusMark("success"));
+	return {
+		render(width: number): string[] {
+			const safeWidth = Math.max(1, width);
+			if (safeWidth <= 1) return [];
+			const label = `${mark} ${theme.fg("toolTitle", bold(o.name))}${o.arg ? ` ${theme.fg("accent", o.arg)}` : ""}${o.summary ? ` ${theme.fg("dim", `· ${o.summary}`)}` : ""}`;
+			const cardWidth = safeWidth - 1;
+			if (cardWidth < 6) return [truncateToWidth(label, cardWidth, "…")];
+
+			const innerWidth = cardWidth - 2;
+			const contentWidth = Math.max(1, innerWidth - 2);
+			const fit = (text: string, width: number): string => {
+				const clipped = truncateToWidth(text, width, "…");
+				return `${clipped}${ " ".repeat(Math.max(0, width - visibleWidth(clipped)))}`;
+			};
+			const header = truncateToWidth(` ${label} `, innerWidth, "…");
+			const top = `${theme.fg("dim", "╭")}${header}${theme.fg("dim", `${ "─".repeat(Math.max(0, innerWidth - visibleWidth(header)))}╮`)}`;
+			const groups = o.groups ?? ((o.rows?.length ?? 0) > 0 ? [o.rows ?? []] : []);
+			const body: string[] = [];
+			for (const [index, group] of groups.entries()) {
+				if (index > 0) body.push(theme.fg("dim", `├${ "─".repeat(innerWidth)}┤`));
+				const wrapped = group.flatMap((row) => wrapTextWithAnsi(row || " ", contentWidth));
+				for (const row of wrapped) {
+					body.push(`${theme.fg("dim", "│")} ${fit(row, contentWidth)} ${theme.fg("dim", "│")}`);
+				}
+			}
+			let visibleBody = body;
+			if (o.maxBodyRows !== undefined && body.length > o.maxBodyRows) {
+				const kept = Math.max(0, o.maxBodyRows - 1);
+				const hidden = body.length - kept;
+				visibleBody = [
+					...body.slice(0, kept),
+					`${theme.fg("dim", "│")} ${fit(`… ${hidden} more rows · expand for details`, contentWidth)} ${theme.fg("dim", "│")}`,
+				];
+			}
+			return [
+				top,
+				...visibleBody,
+				theme.fg("dim", `╰${ "─".repeat(innerWidth)}╯`),
+			];
+		},
+		invalidate(): void {},
+	};
+}
+
+/** First non-empty line of a tool result's text content, truncated to maxLen. */
+export function resultFirstLine(result: ResultLike, maxLen = 60): string {
+	const text = result.content.find((c) => c.type === "text" && c.text)?.text ?? "";
+	const line = (text.split("\n").find((l) => l.trim()) ?? "").trim();
+	return line.length > maxLen ? `${line.slice(0, maxLen - 1)}…` : line;
+}
+
+/** Count of non-empty lines in a tool result's text content. */
+export function resultLineCount(result: ResultLike): number {
+	const text = result.content.find((c) => c.type === "text" && c.text)?.text ?? "";
+	return text.split("\n").filter((l) => l.trim()).length;
+}
+
+/**
+ * Generic result summary: a short first line, falling back to a line count.
+ * Keeps any tool's quiet result line meaningful without per-tool logic.
+ */
+export function resultSummary(result: ResultLike, maxLen = 60): string {
+	const first = resultFirstLine(result, maxLen);
+	if (first) return first;
+	const n = resultLineCount(result);
+	return n > 0 ? `${n} lines` : "done";
+}
+
+/** One-line compact JSON of a value, whitespace-collapsed and truncated. For quiet call args. */
+export function compactJson(value: unknown, maxLen = 50): string {
+	let s: string;
+	try {
+		s = typeof value === "string" ? value : JSON.stringify(value);
+	} catch {
+		s = String(value);
+	}
+	if (s === undefined || s === "null") return "";
+	s = s.replace(/\s+/g, " ").trim();
+	return s.length > maxLen ? `${s.slice(0, maxLen - 1)}…` : s;
+}
+
+/** Normalize untrusted custom-message text before it enters a terminal card. */
+export function sanitizeCardText(value: string, maxLen = 4_096): string {
+	const cleaned = value
+		.replace(/[\r\n\t]/g, " ")
+		.replace(/[\u0000-\u001f\u007f]/g, "")
+		.trim();
+	return cleaned.length > maxLen ? `${cleaned.slice(0, maxLen - 1)}…` : cleaned;
 }

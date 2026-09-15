@@ -3,7 +3,7 @@ import type { AgentToolResult } from "@earendil-works/pi-agent-core";
 import { Text } from "@earendil-works/pi-tui";
 import { homedir } from "node:os";
 import { parse, resolve } from "node:path";
-import { toolCallLine, toolResultLine, resultSummary } from "../quiet-render.ts";
+import { toolCallLine, toolResultLine, resultSummary } from "pi-cockpit/src/quiet-tools.ts";
 import { FileFinder, type FileFinderApi } from "@ff-labs/fff-node";
 import { Type } from "typebox";
 import { resolveSearchScopePath } from "./search-scope-guard.ts";

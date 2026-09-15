@@ -37,6 +37,7 @@ import { buildSessionContext, copyToClipboard, getAgentDir } from "@earendil-wor
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import {
   COCKPIT_TODO_TOGGLE_EVENT,
+  COCKPIT_UI_OWNERSHIP_QUERY_EVENT,
   MAESTRO_TODO_STATE_CHANGED_EVENT,
   type CockpitUiOwnershipV1,
 } from "pi-cockpit/v1/events";
@@ -49,9 +50,9 @@ import {
   TodoToolParams,
 } from "./schemas.ts";
 import { altKey } from "../key-labels.ts";
-import { setQuietMode } from "../quiet-state.ts";
+import { resolveGlyphs, setQuietMode } from "pi-maestro-settings-core/ui";
 import { isTodoDurationChartEnabled, setTodoDurationChartEnabled } from "../todo-chart-state.ts";
-import { toolCallLine, toolResultCard, toolResultLine, resultSummary } from "../quiet-render.ts";
+import { toolCallLine, toolResultCard, toolResultLine, resultSummary } from "pi-cockpit/src/quiet-tools.ts";
 import { registerKeybindingsCommand } from "../keybindings-command.ts";
 import { executeExplore, type ExploreParams } from "../tools/explore.ts";
 import { executeDelegate, type DelegateParams } from "../tools/delegate.ts";
@@ -121,6 +122,7 @@ import {
   type TodoActorRef,
   type TodoParams,
   type TodoResultDetails,
+  type TodoTask,
   type TodoTaskSnapshot,
 } from "../tools/todo.ts";
 import { WorkflowBridge, buildTodoMirrorSpecs } from "../session/bridge.ts";
@@ -171,7 +173,8 @@ import {
 } from "../gateway/fabric/origin-runtime.ts";
 import { registerFabricRouteResolverProvider } from "pi-maestro-teammate/v1/fabric-runtime";
 import { startWorkspaceLease, stopWorkspaceLease, registerGatewayWorkspacePermanent, removeGatewayWorkspaceByPath, isGatewayConfigured, isGatewayFabricEnabled } from "../gateway/workspace-client.ts";
-import { TodoOverlay } from "../tui/todo-overlay.ts";
+import { TodoOverlay as CockpitTodoOverlay } from "pi-cockpit/src/todo-overlay.ts";
+import type { TodoItem as CockpitTodoItem } from "pi-cockpit/src/types.ts";
 import { GoalOverlay, type GoalOverlayAction } from "../tui/goal-overlay.ts";
 import { KnowledgeOverlay, type KnowledgeOverlayAction } from "../tui/knowledge-overlay.ts";
 import { KnowledgeCliAdapter, resolveLatestSessionId } from "../knowledge/cli-adapter.ts";
@@ -204,6 +207,7 @@ import {
   getPlanText,
   getPlanArtifactSummary,
   getPlanCompactionSnapshot,
+  getPlanNewContextPayload,
   getPlanHandoffStatus,
   setPlanModeChangeListener,
   type PlanContext,
@@ -274,7 +278,10 @@ import { registerModelAvailability } from "../tools/model-availability.ts";
 import { registerTeammateSessionRouting } from "../tools/teammate-session-routing.ts";
 import { registerResourceTool } from "../tools/resource.ts";
 import { registerSessionHistoryTool } from "../tools/session-history.ts";
-import { registerNewContextTool } from "../tools/new-context.ts";
+import {
+  registerNewContextTool,
+  registerNewContextWithoutLlmCommand,
+} from "../tools/new-context.ts";
 import { isNewContextCompactionEnabled } from "../compaction/compaction-settings.ts";
 import {
   appendTodoContextPressureAdvisory,
@@ -370,6 +377,10 @@ export const MAESTRO_CHILD_TOOL_NAMES = [
   "session_history",
   "new_context",
   "board",
+  "device",
+  "workspace",
+  "endpoint",
+  "route",
   "lsp",
   "browser",
   "computer_use",
@@ -1458,16 +1469,25 @@ export default function registerMaestroExtension(pi: ExtensionAPI): void {
 
   const compactionArbiter = new CompactionArbiter();
   const newContextController = createNewContextController(compactionArbiter, {
-    continueAfterReset() {
-      pi.sendUserMessage(
-        "Continue from the recovery capsule and the active Todo's exact next action. If a required current-session fact is absent, use session_history with scope=current_session.",
-        { deliverAs: "followUp" },
-      );
+    continueAfterReset(_ctx, request) {
+      const message = request.plan
+        ? [
+            "Continue from the recovery capsule.",
+            "A Plan recovery payload is present and is authoritative for the next action.",
+            request.plan.status === "approved"
+              ? "First reload and verify the approved Plan from its source path, then call plan-decompose or continue the active Todo."
+              : "First reload the draft Plan from its source path and continue in Plan mode; do not treat an unapproved draft as an execution authorization.",
+            "If a required current-session fact is absent, use session_history with scope=current_session.",
+          ].join("\n")
+        : "Continue from the recovery capsule and the active Todo's exact next action. If a required current-session fact is absent, use session_history with scope=current_session.";
+      pi.sendUserMessage(message, { deliverAs: "followUp" });
     },
+    getPlanRecoveryPayload: getPlanNewContextPayload,
   });
   const newContextToolSurface = createNewContextToolSurface(pi, () => {
     registerNewContextTool(pi, newContextController, "root");
   });
+  registerNewContextWithoutLlmCommand(pi, newContextController, "root");
   const midTurnAutoCompaction = createMidTurnAutoCompaction(pi, { arbiter: compactionArbiter });
   const state: MaestroState = {
     baseCwd: "",
@@ -1579,6 +1599,17 @@ export default function registerMaestroExtension(pi: ExtensionAPI): void {
 
   function publishMaestroUi(): void {
     if (maestroUiSessionActive) maestroUiPublisher.publish();
+  }
+
+  // Cockpit's footer consumes extension statuses, so the Maestro tool-call count
+  // is published here when Cockpit owns the footer (Flow's own statusline reads
+  // the live state instead).
+  function updateMaestroToolCallStatus(ctx: ExtensionContext): void {
+    const count = state.activeToolCalls.size;
+    ctx.ui.setStatus(
+      "maestro-tool-calls",
+      count > 0 ? `⚙ ${count} call${count > 1 ? "s" : ""}` : undefined,
+    );
   }
 
   // Register dynamic providers from cli-tools.json
@@ -1731,6 +1762,7 @@ The --to flag is MANDATORY. A bare \`maestro delegate codex\` treats "codex" as 
         startedAt: Date.now(),
         correlationId: id,
       });
+      updateMaestroToolCallStatus(ctx);
 
       try {
         switch (action) {
@@ -1772,6 +1804,7 @@ The --to flag is MANDATORY. A bare \`maestro delegate codex\` treats "codex" as 
         }
       } finally {
         state.activeToolCalls.delete(id);
+        updateMaestroToolCallStatus(ctx);
       }
     },
 
@@ -2115,6 +2148,7 @@ When NOT to use:
       source: "plan-confirm",
       actorId: "root",
       carryForward: input.executionMessage,
+      plan: input.plan,
       continueAfterReset: input.continueAfterReset,
       onCancelled: input.onCancelled,
     }, ctx),
@@ -2710,13 +2744,14 @@ When NOT to use:
     lastRunStates = nextStates;
   }
 
-  async function openGatewayOverlay(ctx: ExtensionContext, initialPage: "home" | "config" = "home"): Promise<void> {
+  async function openGatewayOverlay(ctx: ExtensionContext, initialPage: "home" | "config" | "tunnel" = "home"): Promise<void> {
     await ctx.ui.custom<void>((tui, _theme, _keybindings, done) => {
       const overlay = new GatewayOverlay({
         cwd: ctx.cwd,
         initialPage,
         requestRender: () => tui.requestRender(),
         getTerminalRows: () => tui.terminal.rows,
+        input: (title, placeholder) => ctx.ui.input(title, placeholder ?? ""),
         close: () => done(undefined),
         onFabricProjection: (snapshot) => pi.events.emit(GATEWAY_FABRIC_MONITOR_EVENT, snapshot),
         onRegisterWorkspace: async (path) => registerWindowWithMode(path, false),
@@ -2871,21 +2906,40 @@ When NOT to use:
   }
 
   async function openTodoOverlay(ctx: ExtensionContext): Promise<void> {
-    const tasks = getVisibleTasks().filter((task) => !task.origin);
+    const tasks = getVisibleTasks().filter((task) => !task.origin && task.status !== "deleted");
     if (tasks.length === 0) {
       ctx.ui.notify("No local or teammate Todo tasks to display.", "info");
       return;
     }
+    // The center overlay is Cockpit's shared TodoOverlay component; Flow only
+    // owns the data and the Alt+T inline toggle forwarding.
+    const glyphs = resolveGlyphs("auto");
     await ctx.ui.custom<void>((tui, theme, _keybindings, done) =>
-      new TodoOverlay({
-        getTasks: () => getVisibleTasks(),
+      new CockpitTodoOverlay({
+        getTodos: () => getVisibleTasks()
+          .filter((task) => !task.origin && task.status !== "deleted")
+          .map(toCockpitTodoItem),
         requestRender: () => tui.requestRender(),
         close: () => done(undefined),
         theme,
+        glyphs,
       }), {
       overlay: true,
       overlayOptions: { anchor: "center", width: "94%", maxHeight: "90%" },
     });
+  }
+
+  function toCockpitTodoItem(task: TodoTask): CockpitTodoItem {
+    return {
+      id: task.id,
+      subject: task.subject,
+      status: task.status === "deleted" ? "pending" : task.status,
+      blockedBy: [...task.blockedBy],
+      createdBy: task.createdBy ? { id: task.createdBy.id, label: task.createdBy.label } : undefined,
+      assignee: task.assignee ? { id: task.assignee.id, label: task.assignee.label } : undefined,
+      skills: task.skills.map((skill) => ({ name: skill.name, role: skill.role })),
+      updatedAt: task.updatedAt,
+    };
   }
 
   async function openGoalOverlay(ctx: ExtensionContext): Promise<void> {
@@ -2999,11 +3053,16 @@ When NOT to use:
     async handler(_args, ctx) { await openSessionOverlay(ctx); },
   });
   pi.registerCommand("gateway", {
-    description: "Open Pi Maestro Gateway — two-page home/config control center with Cloudflare ↔ OpenAI tunnel switching, workspaces, collaboration, and Monitor. Usage: /gateway [config|wizard]",
+    description: "Open Pi Maestro Gateway — home/config control center. Usage: /gateway [config|wizard|tunnel]",
     async handler(args, ctx) {
-      const page = ["config", "wizard"].includes(args.trim().toLowerCase()) ? "config" : "home";
+      const requested = args.trim().toLowerCase();
+      const page = requested === "tunnel" ? "tunnel" : ["config", "wizard"].includes(requested) ? "config" : "home";
       await openGatewayOverlay(ctx, page);
     },
+  });
+  pi.registerCommand("gateway-tunnel", {
+    description: "Open the dedicated Pi Maestro Gateway tunnel operator page",
+    async handler(_args, ctx) { await openGatewayOverlay(ctx, "tunnel"); },
   });
   pi.registerCommand("gateway-config", {
     description: "Open the dedicated Pi Maestro Gateway configuration TUI. Standalone: pi-maestro-gateway config [--config PATH]",
@@ -3356,6 +3415,10 @@ When NOT to use:
     }
     updateTodoWidget();
   }));
+  // Handshake: this subscription may have been registered after Cockpit's
+  // session_start broadcast; ask once instead of waiting for the next
+  // config-driven re-broadcast. No answer means Cockpit is absent/disabled.
+  pi.events.emit(COCKPIT_UI_OWNERSHIP_QUERY_EVENT, undefined);
 
 
   pi.registerShortcut(TODO_TOGGLE_KEY, {
@@ -3379,6 +3442,9 @@ When NOT to use:
   // === Session lifecycle ===
   pi.on("session_start", async (event, ctx) => {
     const guiGeneration = ++guiLifecycleGeneration;
+    // Re-ask ownership on every session boundary: a reload re-runs extension
+    // factories and Cockpit's broadcast may have landed before we subscribed.
+    pi.events.emit(COCKPIT_UI_OWNERSHIP_QUERY_EVENT, undefined);
     const previousGuiServer = guiServer;
     guiServer = null;
     guiEvents.bind(null);
@@ -3583,6 +3649,7 @@ When NOT to use:
     // resumed session replays the identical transformed prefix. Destructive
     // teardown stays with reset()/onCompact().
     state.activeToolCalls.clear();
+    ctx.ui.setStatus("maestro-tool-calls", undefined);
     widgetCtx?.ui.setWidget("todo-panel", undefined);
     widgetCtx = undefined;
     todoRootContext = undefined;
@@ -3699,6 +3766,7 @@ When NOT to use:
             actorId: newContextRequest.actorId,
             ...(newContextRequest.carryForward ? { carryForward: newContextRequest.carryForward } : {}),
             ...(newContextRequest.handoff ? { handoff: newContextRequest.handoff } : {}),
+            ...(newContextRequest.plan ? { plan: { ...newContextRequest.plan } } : {}),
             resourceUris: [...newContextRequest.resourceUris],
           };
           const compaction = await runWithCompactionStatus(event, ctx, () =>
@@ -4632,6 +4700,7 @@ function registerMaestroChildSurface(pi: ExtensionAPI): void {
           actorId: newContextRequest.actorId,
           ...(newContextRequest.carryForward ? { carryForward: newContextRequest.carryForward } : {}),
           ...(newContextRequest.handoff ? { handoff: newContextRequest.handoff } : {}),
+          ...(newContextRequest.plan ? { plan: { ...newContextRequest.plan } } : {}),
           resourceUris: [...newContextRequest.resourceUris],
         };
         const result = await runObservedCompaction(observed, () =>

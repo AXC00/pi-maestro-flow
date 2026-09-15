@@ -6,6 +6,8 @@
  */
 
 export const COCKPIT_UI_OWNERSHIP_EVENT = "cockpit:ui-ownership";
+/** Late subscribers emit this; Cockpit answers with a fresh ownership broadcast. */
+export const COCKPIT_UI_OWNERSHIP_QUERY_EVENT = "cockpit:ui-ownership-query";
 export const COCKPIT_PREEMPT_RESIZE_EVENT = "cockpit:preempt-resize";
 export const COCKPIT_SESSION_LIST_EVENT = "cockpit:open-session-list";
 

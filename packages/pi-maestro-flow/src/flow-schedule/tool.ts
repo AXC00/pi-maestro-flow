@@ -8,7 +8,7 @@ import {
   type SessionMessageResult,
 } from "pi-maestro-teammate/v1/sessions";
 import type { FlowToolResult } from "../tools/tool-result.ts";
-import { resultSummary, toolCallLine, toolResultLine } from "../quiet-render.ts";
+import { resultSummary, toolCallLine, toolResultLine } from "pi-cockpit/src/quiet-tools.ts";
 import {
   FlowScheduleCreateStepInputSchema,
   FlowScheduleDispatchIdSchema,

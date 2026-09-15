@@ -1,9 +1,9 @@
 import assert from "node:assert/strict";
 import test, { afterEach } from "node:test";
 import { visibleWidth } from "@earendil-works/pi-tui";
-import { setQuietMode } from "../src/quiet-state.ts";
+import { setQuietMode } from "pi-maestro-settings-core/ui";
 import { createLspTool } from "../src/tools/lsp-tool.ts";
-import { toolCallLine, toolResultLine } from "../src/quiet-render.ts";
+import { toolCallLine, toolResultLine } from "pi-cockpit/src/quiet-tools.ts";
 
 const theme = {
 	fg: (_name: string, text: string) => text,

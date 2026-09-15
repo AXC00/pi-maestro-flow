@@ -398,6 +398,43 @@ test("workflow status renders after the mode-bearing first line", () => {
 	assert.match(lines[2], /^⚑ session/);
 });
 
+test("maestro workflow snapshot renders a dedicated session/run line", () => {
+	const lines = renderFooter(parts({
+		width: 120,
+		maestroWorkflow: {
+			session: { id: "s1", label: "auth-m1", status: "paused" },
+			run: { id: "003", command: "plan", status: "blocked" },
+			chain: { completed: 2, running: 0, pending: 1, total: 3 },
+			gates: { passed: 2, total: 3 },
+			next: "Resume from gate",
+		},
+	}));
+	const workflowLine = lines.find((line) => line.includes("⚑"));
+	assert.ok(workflowLine, "expected a maestro workflow line");
+	assert.match(workflowLine, /^⚑ auth-m1/);
+	assert.match(workflowLine, /» Resume from gate/);
+	assert.match(workflowLine, /! blocked/);
+	assert.match(workflowLine, /003\/plan/);
+	assert.match(workflowLine, /✓2 ▶0 ○1/);
+	assert.match(workflowLine, /gate 2\/3/);
+});
+
+test("maestro workflow line stays within the footer width", () => {
+	const lines = renderFooter(parts({
+		width: 40,
+		maestroWorkflow: {
+			session: { id: "s1", label: "20260724-companion-goal-final-fixes", status: "running" },
+			run: { id: "003", command: "execute", status: "running" },
+			chain: { completed: 1, running: 1, pending: 1, total: 3 },
+			gates: { passed: 0, total: 0 },
+			next: "Resume from gate",
+		},
+	}));
+	const workflowLine = lines.find((line) => line.includes("⚑"));
+	assert.ok(workflowLine);
+	assert.ok(utils.measure(workflowLine) <= 40);
+});
+
 test("fmtTokens formats k and m", () => {
 	assert.equal(fmtTokens(0), "0");
 	assert.equal(fmtTokens(999), "999");

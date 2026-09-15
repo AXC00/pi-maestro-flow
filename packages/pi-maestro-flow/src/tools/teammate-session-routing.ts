@@ -2,7 +2,7 @@ import type { AgentToolResult } from "@earendil-works/pi-agent-core";
 import type { ExtensionAPI, ExtensionContext, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { Text } from "@earendil-works/pi-tui";
-import { toolCallLine, toolResultLine } from "../quiet-render.ts";
+import { toolCallLine, toolResultLine } from "pi-cockpit/src/quiet-tools.ts";
 import {
   TEAMMATE_TASK_TYPES,
   loadModelRoutingConfig,

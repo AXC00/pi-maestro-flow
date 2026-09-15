@@ -19,7 +19,7 @@ import type { AgentToolResult } from "@earendil-works/pi-agent-core";
 import type { ExtensionAPI, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { Text } from "@earendil-works/pi-tui";
-import { toolCallLine, toolResultLine, resultSummary } from "../quiet-render.ts";
+import { toolCallLine, toolResultLine, resultSummary } from "pi-cockpit/src/quiet-tools.ts";
 
 export const ConflictParams = Type.Object({
   action: Type.Union([

@@ -52,10 +52,13 @@ export const STATUS_PRESENTATION: Readonly<Record<AgentStatus, StatusPresentatio
   pending: { icon: "■", text: "running · starting", tone: "dim" },
   running: { icon: "■", text: "running", tone: "warning" },
   retrying: { icon: "■", text: "running · retrying", tone: "warning" },
-  sleeping: { icon: "◉", text: "sleeping", tone: "warning" },
+  // Tones mirror Cockpit agent-bar's statusColor: settled/idle rows read as
+  // muted (ProgressPalette `dim`), and a terminated agent is an error, not a
+  // warning (stalled/failed/terminated share the error slot).
+  sleeping: { icon: "◉", text: "sleeping", tone: "dim" },
   completed: { icon: "◉", text: "sleeping · completed", tone: "success" },
   failed: { icon: "◉", text: "sleeping · failed", tone: "error" },
-  terminated: { icon: "◉", text: "sleeping · terminated", tone: "warning" },
+  terminated: { icon: "◉", text: "sleeping · terminated", tone: "error" },
 });
 
 export const DERIVED_STATUS_PRESENTATION: Readonly<Record<DerivedDisplayStatus, StatusPresentation>> = Object.freeze({

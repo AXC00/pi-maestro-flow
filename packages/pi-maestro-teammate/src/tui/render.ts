@@ -19,7 +19,7 @@ import {
   idleSeconds,
 } from "../shared/agent-status.ts";
 import type { AgentProgressSnapshot, AgentProgressStatus, ChildAgentCallSnapshot, Details, SingleResult, Usage } from "../shared/types.ts";
-import { isQuietMode, quietStatusMark } from "../quiet-state.ts";
+import { isQuietMode, quietStatusMark } from "pi-maestro-settings-core/ui";
 import {
   buildProgressTree,
   focusTaskIndex,

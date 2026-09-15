@@ -27,7 +27,7 @@ import {
   type SessionHistoryInventorySource,
   type SessionHistoryOmission,
 } from "pi-maestro-teammate/v1/session-history";
-import { toolCallLine, toolResultLine, resultSummary } from "../quiet-render.ts";
+import { toolCallLine, toolResultLine, resultSummary } from "pi-cockpit/src/quiet-tools.ts";
 import {
   authorizeSessionHistoryFffCandidates,
   createSessionHistoryFffAccelerator,

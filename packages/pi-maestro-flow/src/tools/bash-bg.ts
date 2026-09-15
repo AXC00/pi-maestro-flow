@@ -10,7 +10,7 @@ import {
   type ObservationWaitOptions,
 } from "pi-maestro-teammate/v1/observation";
 import { registerForegroundDetach } from "pi-maestro-teammate/v1/foreground-detach";
-import { sanitizeCardText, toolCallLine, toolResultCard, toolResultLine, resultFirstLine } from "../quiet-render.ts";
+import { sanitizeCardText, toolCallLine, toolResultCard, toolResultLine, resultFirstLine } from "pi-cockpit/src/quiet-tools.ts";
 import { Type } from "typebox";
 import { spawn, spawnSync } from "node:child_process";
 import type { ChildProcess } from "node:child_process";

@@ -35,6 +35,13 @@ export interface CockpitSessionListRequestV1 {
  */
 export const COCKPIT_TODO_TOGGLE_EVENT = "cockpit:toggle-todo";
 export const COCKPIT_INPUT_TARGET_EVENT = "cockpit:input-target";
+
+/**
+ * Ownership handshake: a consumer that subscribed after Cockpit's session_start
+ * broadcast emits this query; Cockpit answers by re-emitting
+ * `cockpit:ui-ownership` with the current state. Fire-and-forget; no payload.
+ */
+export const COCKPIT_UI_OWNERSHIP_QUERY_EVENT = "cockpit:ui-ownership-query";
 export interface CockpitTodoToggleV1 {
 	expanded?: unknown;
 }
@@ -208,6 +215,7 @@ export interface MaestroEventMapV1 {
 	"maestro:ui-snapshot": MaestroUiSnapshotV1;
 	"maestro:todo-state-changed": MaestroTodoStateChangedV1;
 	"cockpit:ui-ownership": CockpitUiOwnershipV1;
+	"cockpit:ui-ownership-query": undefined;
 	"cockpit:open-session-list": CockpitSessionListRequestV1;
 	"cockpit:preempt-resize": undefined;
 	"cockpit:toggle-todo": CockpitTodoToggleV1 | undefined;

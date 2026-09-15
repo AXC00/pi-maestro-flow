@@ -1,6 +1,6 @@
 import type { AgentToolResult, ToolRenderResultOptions } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
-import { compactJson, toolCallLine, toolResultLine, resultSummary } from "../quiet-render.ts";
+import { compactJson, toolCallLine, toolResultLine, resultSummary } from "pi-cockpit/src/quiet-tools.ts";
 
 type McpToolResultDetails = Record<string, unknown> & { error?: unknown };
 type McpToolContentBlock = AgentToolResult<McpToolResultDetails>["content"][number];

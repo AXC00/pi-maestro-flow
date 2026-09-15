@@ -10,6 +10,9 @@ export const TEAMMATE_OPEN_AGENT_EVENT = "teammate:open-agent";
 // Payload: { correlationId, action: "interrupt" | "steer", message? }.
 export const TEAMMATE_AGENT_COMMAND_EVENT = "teammate:agent-command";
 export const COCKPIT_UI_OWNERSHIP_EVENT = "cockpit:ui-ownership";
+// Late subscribers emit this query; Cockpit answers with a fresh
+// COCKPIT_UI_OWNERSHIP_EVENT broadcast (see public/v1/events.ts).
+export const COCKPIT_UI_OWNERSHIP_QUERY_EVENT = "cockpit:ui-ownership-query";
 export const BASH_BG_UPDATE_EVENT = "bash-bg:update";
 export const BASH_BG_QUERY_EVENT = "bash-bg:query";
 // Unified supervision telemetry from the shared layer (pi-maestro-teammate/v1/supervision).

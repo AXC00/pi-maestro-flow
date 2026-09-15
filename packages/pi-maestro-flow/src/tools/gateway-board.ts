@@ -6,7 +6,7 @@ import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { Type, type Static } from "typebox";
 import { createGatewayLocalClient } from "../gateway/local-client.ts";
 import { GATEWAY_HANDOFF_SCHEMA } from "../gateway/handoff-contracts.ts";
-import { resultSummary, toolCallLine, toolResultLine } from "../quiet-render.ts";
+import { resultSummary, toolCallLine, toolResultLine } from "pi-cockpit/src/quiet-tools.ts";
 import type { FlowToolResult } from "./tool-result.ts";
 
 export const GATEWAY_BOARD_ACTIONS = [

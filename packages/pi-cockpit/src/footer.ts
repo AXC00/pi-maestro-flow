@@ -2,6 +2,7 @@ import type { Theme, ThemeColor } from "@earendil-works/pi-coding-agent";
 import type { ExtensionStatusSegment } from "./extension-status.ts";
 import type { IconGlyphs } from "./icons.ts";
 import { fitSegmentsByPriority, type PrioritizedSegment, type WidthUtils } from "./layout.ts";
+import type { MaestroWorkflowV1 } from "./public/v1/events.ts";
 
 // Re-exported so existing importers keep working; the implementations now live in
 // layout.ts because the widgets need the same priority-collapse behaviour.
@@ -35,6 +36,8 @@ export interface FooterParts {
 	agentSummary?: string;
 	bashBgStatus?: string;
 	workflowStatus?: string;
+	/** Maestro workflow session/run snapshot from the UI projection channel. */
+	maestroWorkflow?: MaestroWorkflowV1 | null;
 	supervisionStatus?: string;
 	/** Provider usage bars (quota/balance/spend) on a dedicated footer line. */
 	usageStatus?: string;
@@ -229,6 +232,60 @@ function paintExtensionStatus(
 	return theme.fg(extensionStatusColor(status), text);
 }
 
+const MAESTRO_STATUS_GLYPHS: Record<string, string> = {
+	running: "▶",
+	paused: "⏸",
+	blocked: "!",
+	waiting_user: "?",
+	retrying: "↻",
+	sealed: "✓",
+	failed: "×",
+	cancelled: "⊘",
+	ready: "✓",
+	completed: "✓",
+	pending: "○",
+	unknown: "□",
+};
+
+function maestroStatusColor(status: string): ThemeColor {
+	switch (status) {
+		case "running":
+		case "retrying":
+			return "warning";
+		case "blocked":
+		case "failed":
+		case "cancelled":
+			return "error";
+		case "completed":
+		case "ready":
+		case "sealed":
+			return "success";
+		case "paused":
+		case "waiting_user":
+			return "accent";
+		default:
+			return "muted";
+	}
+}
+
+/**
+ * Maestro Session/Run footer line, sourced from the Flow UI projection snapshot.
+ * Mirrors the shape Flow renders when it owns the footer: session label first so
+ * concurrent sessions stay identifiable at narrow widths.
+ */
+function renderMaestroWorkflowLine(workflow: MaestroWorkflowV1, theme: PaintTheme, g: IconGlyphs): string {
+	const sep = ` ${theme.fg("dim", g.separator.trim())} `;
+	const run = workflow.run;
+	const status = run?.status ?? workflow.session.status;
+	const parts: string[] = [`${theme.fg("accent", "⚑")} ${theme.fg("accent", workflow.session.label)}`];
+	if (workflow.next) parts.push(theme.fg("warning", `» ${workflow.next}`));
+	parts.push(theme.fg(maestroStatusColor(status), `${MAESTRO_STATUS_GLYPHS[status] ?? "□"} ${status}`));
+	if (run) parts.push(theme.fg("muted", `${run.id}/${run.command}`));
+	parts.push(`${theme.fg("success", `✓${workflow.chain.completed}`)} ${theme.fg("warning", `▶${workflow.chain.running}`)} ${theme.fg("dim", `○${workflow.chain.pending}`)}`);
+	if (workflow.gates.total > 0) parts.push(theme.fg("muted", `gate ${workflow.gates.passed}/${workflow.gates.total}`));
+	return parts.join(sep);
+}
+
 function alignRight(left: string, right: string, width: number, measure: WidthUtils["measure"]): string {
 	if (right === "") return left;
 	const rw = measure(right);
@@ -397,6 +454,9 @@ export function renderFooter(p: FooterParts): string[] {
 	}
 	if (p.workflowStatus) {
 		lines.push(utils.clip(theme.fg("muted", p.workflowStatus), width, ell));
+	}
+	if (p.maestroWorkflow) {
+		lines.push(utils.clip(renderMaestroWorkflowLine(p.maestroWorkflow, theme, g), width, ell));
 	}
 	const statuses = visibleStatuses.filter((status) => !controlStatuses.includes(status));
 	if (statuses.length > 0) {

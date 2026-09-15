@@ -4,7 +4,7 @@ import path from "node:path";
 import test, { afterEach } from "node:test";
 import type { AgentToolResult } from "@earendil-works/pi-agent-core";
 import { visibleWidth } from "@earendil-works/pi-tui";
-import { setQuietMode } from "../src/quiet-state.ts";
+import { setQuietMode } from "pi-maestro-settings-core/ui";
 import type { Details, SingleResult } from "../src/shared/types.ts";
 import { renderTeammateCall, renderTeammateResult } from "../src/tui/render.ts";
 

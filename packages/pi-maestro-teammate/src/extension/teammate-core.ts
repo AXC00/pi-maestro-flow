@@ -194,7 +194,7 @@ import {
   getTeammatePermissionBroker,
   registerTeammateChildProxyCaller,
 } from "../runs/child-extensions.ts";
-import { setQuietMode } from "../quiet-state.ts";
+import { setQuietMode } from "pi-maestro-settings-core/ui";
 import { agentActiveMs, progressDurationMs } from "./teammate-helpers.ts";
 
 

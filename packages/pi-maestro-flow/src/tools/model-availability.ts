@@ -10,7 +10,7 @@ import {
 } from "../providers/cli-tools-loader.ts";
 import { probeSshCliExecutable } from "pi-maestro-teammate/v1/acp-cli";
 import { Text } from "@earendil-works/pi-tui";
-import { toolCallLine, toolResultLine } from "../quiet-render.ts";
+import { toolCallLine, toolResultLine } from "pi-cockpit/src/quiet-tools.ts";
 import {
   TEAMMATE_TASK_TYPES,
   modelRegistrationAvailabilityDiagnostics,

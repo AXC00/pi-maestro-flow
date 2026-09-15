@@ -25,7 +25,7 @@ import type { AgentToolResult } from "@earendil-works/pi-agent-core";
 import type { ExtensionAPI, ExtensionContext, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { Text } from "@earendil-works/pi-tui";
-import { toolCallLine, toolResultLine, resultSummary } from "../quiet-render.ts";
+import { toolCallLine, toolResultLine, resultSummary } from "pi-cockpit/src/quiet-tools.ts";
 import { checkGhAvailable, showGhHint } from "./web-access/github-api.ts";
 import { getAgentOutputPath, formatAgentMatchListing, resolveAgentOutput } from "../teammate/agent-output-store.ts";
 import { createSessionHistoryInventoryProvider } from "./session-history.ts";

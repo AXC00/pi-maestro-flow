@@ -120,11 +120,13 @@ import {
 	BASH_BG_QUERY_EVENT,
 	BASH_BG_UPDATE_EVENT,
 	COCKPIT_UI_OWNERSHIP_EVENT,
+	COCKPIT_UI_OWNERSHIP_QUERY_EVENT,
 	DEFAULT_CONFIG,
 	STACK_WIDGET_KEY,
 	TEAMMATE_COMPLETE_EVENT,
 	TEAMMATE_MESSAGE_EVENT,
 	TEAMMATE_STARTED_EVENT,
+	TEAMMATE_OPEN_AGENT_EVENT,
 	TEAMMATE_AGENT_COMMAND_EVENT,
 	TODO_TOOL_NAME,
 	WORKFLOW_STATUS_KEY,
@@ -615,7 +617,21 @@ export default function (pi: ExtensionAPI): void {
 		const spinner = jobs.some((job) => job.status === "running" || job.status === "stopping")
 			? spinFrame(resolveGlyphs(config.icons.mode), now, shouldAnimateFrames(policy()))
 			: "";
-		return JSON.stringify([spinner, agentState, jobState]);
+		// The 250 ms tick uses this key to skip a full tree render when only the
+		// wall clock moved. Todo rows and endpoint selection/content change the
+		// visible UI too, so include lightweight summaries (not full objects).
+		const todoItems = todos.snapshot();
+		const todoState = todoItems.slice(0, 25).map((item) => [item.id, item.status, item.subject.slice(0, 40)]);
+		const todoCounts: Record<string, number> = {};
+		for (const item of todoItems) todoCounts[item.status] = (todoCounts[item.status] ?? 0) + 1;
+		const endpointSnapshot = endpoints.snapshot();
+		const endpointState = [
+			endpointSnapshot.contentRevision,
+			endpointSnapshot.mainEndpointId,
+			endpointSnapshot.viewMode,
+			endpointSnapshot.endpoints.map((e) => [e.id, e.status, e.kind, e.outputRevision ?? ""]),
+		];
+		return JSON.stringify([spinner, agentState, jobState, todoState, todoCounts, endpointState]);
 	};
 
 	// One microtask dirty latch: a burst of store events in the same tick (a
@@ -1528,6 +1544,7 @@ export default function (pi: ExtensionAPI): void {
 							? usageSubsystem?.getStatus(theme, config.usage.barWidth)
 							: undefined,
 						workflowStatus: extensionStatuses.find((status) => status.key === WORKFLOW_STATUS_KEY)?.text,
+						maestroWorkflow: maestro.workflow(),
 						extensionStatuses: extensionStatuses.filter((status) => status.key !== WORKFLOW_STATUS_KEY),
 						glyphs,
 						theme,
@@ -1731,6 +1748,11 @@ export default function (pi: ExtensionAPI): void {
 	const subscribeBusEvents = (): void => {
 		if (busDisposers.length > 0) return;
 		busDisposers.push(
+			// Ownership handshake: a consumer that subscribed after the session_start
+			// broadcast asks once and gets the current ownership re-emitted.
+			pi.events.on(COCKPIT_UI_OWNERSHIP_QUERY_EVENT, () => {
+				publishUiOwnership();
+			}),
 			cockpitTuiLocale.subscribe(() => {
 				if (config.quietMode && lastCtx) {
 					try { lastCtx.ui.setHiddenThinkingLabel(quietThinkingLabel()); } catch { /* non-TUI */ }
@@ -1741,6 +1763,10 @@ export default function (pi: ExtensionAPI): void {
 				on: (event, handler) => pi.events.on(event, handler),
 			}),
 			pi.events.on(TEAMMATE_STARTED_EVENT, (payload) => {
+				// Re-broadcast ownership at the exact moment a native agent widget
+				// would appear; a late-loaded teammate may have missed the
+				// session_start broadcast (and its query may have raced startup).
+				publishUiOwnership();
 				if (!isStartedPayload(payload) || !agentReads.applyLegacyStarted(payload)) return;
 				if (usingRuntimeV2) return;
 				agents = agentReads.current;
@@ -1830,6 +1856,17 @@ export default function (pi: ExtensionAPI): void {
 					? (payload as { expanded?: unknown }).expanded
 					: undefined;
 				setTodoExpanded(typeof requested === "boolean" ? requested : !effectiveTodoExpanded());
+			}),
+			pi.events.on(TEAMMATE_OPEN_AGENT_EVENT, (payload) => {
+				if (!config.enabled) return;
+				const ctx = lastCtx;
+				if (!ctx) return;
+				const correlationId = payload && typeof payload === "object"
+					? (payload as { correlationId?: unknown }).correlationId
+					: undefined;
+				void openAgentOverlay(ctx, typeof correlationId === "string" ? correlationId : undefined).catch(() => {
+					// Best-effort: an overlay failure must not break the event bus.
+				});
 			}),
 			pi.events.on(COCKPIT_PREEMPT_RESIZE_EVENT, () => {
 				// A capturing overlay opened by another extension (teammate attach,

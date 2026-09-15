@@ -10,6 +10,7 @@ import {
 	BASH_BG_QUERY_EVENT,
 	BASH_BG_UPDATE_EVENT,
 	COCKPIT_UI_OWNERSHIP_EVENT,
+	COCKPIT_UI_OWNERSHIP_QUERY_EVENT,
 	DEFAULT_CONFIG,
 	TEAMMATE_COMPLETE_EVENT,
 	TEAMMATE_MESSAGE_EVENT,
@@ -136,6 +137,7 @@ test("Cockpit packages complete selectable color themes", () => {
 test("Cockpit owns native UI through events instead of clearing foreign widget keys", () => {
 	const source = readFileSync(new URL("../src/index.ts", import.meta.url), "utf8");
 	assert.match(source, /pi\.events\.emit\(COCKPIT_UI_OWNERSHIP_EVENT/);
+	assert.match(source, /pi\.events\.on\(COCKPIT_UI_OWNERSHIP_QUERY_EVENT/);
 	assert.match(source, /agents: config\.enabled && config\.hideNativeAgents/);
 	assert.match(source, /sessionList: config\.enabled/);
 	assert.match(source, /todoDurationChart: config\.todoDurationChart/);
@@ -149,8 +151,38 @@ test("Cockpit owns native UI through events instead of clearing foreign widget k
 	assert.match(source, /pi\.events\.on\(COCKPIT_TODO_TOGGLE_EVENT/);
 	assert.doesNotMatch(source, /teammate-agents|todo-panel/);
 	assert.equal(COCKPIT_UI_OWNERSHIP_EVENT, "cockpit:ui-ownership");
+	assert.equal(COCKPIT_UI_OWNERSHIP_QUERY_EVENT, "cockpit:ui-ownership-query");
 	assert.equal(COCKPIT_SESSION_LIST_EVENT, "cockpit:open-session-list");
 	assert.equal(COCKPIT_TODO_TOGGLE_EVENT, "cockpit:toggle-todo");
+});
+
+test("Ownership handshake: late subscribers can query and both consumers ask", () => {
+	const cockpitSource = readFileSync(new URL("../src/index.ts", import.meta.url), "utf8");
+	// Cockpit answers the query with a fresh broadcast and re-broadcasts when
+	// agent activity starts (the moment a native widget would otherwise appear).
+	assert.match(cockpitSource, /pi\.events\.on\(COCKPIT_UI_OWNERSHIP_QUERY_EVENT, \(\) => \{\s*\n\s*publishUiOwnership\(\);/);
+	const startedBlock = cockpitSource.match(
+		/pi\.events\.on\(TEAMMATE_STARTED_EVENT, \(payload\) => \{[\s\S]*?\n\t\t\t\}\)\,/,
+	);
+	assert.ok(startedBlock, "TEAMMATE_STARTED subscription not found");
+	assert.match(startedBlock[0], /publishUiOwnership\(\);/);
+	const teammateSource = readFileSync(
+		new URL("../../pi-maestro-teammate/src/extension/index.ts", import.meta.url),
+		"utf8",
+	);
+	const flowSource = readFileSync(
+		new URL("../../pi-maestro-flow/src/extension/index.ts", import.meta.url),
+		"utf8",
+	);
+	// Both consumers ask after subscribing and again on session_start, so either
+	// extension load order converges on cockpit-owned surfaces.
+	for (const [name, source] of [["teammate", teammateSource], ["flow", flowSource]] as const) {
+		const emits = source.match(/pi\.events\.emit\(COCKPIT_UI_OWNERSHIP_QUERY_EVENT, undefined\)/g) ?? [];
+		assert.ok(emits.length >= 2, `${name} must emit the ownership query at subscribe time and on session_start`);
+	}
+	// Neither order can strand the native panels: cockpit also answers queries
+	// emitted before its own session_start broadcast.
+	assert.equal(COCKPIT_UI_OWNERSHIP_QUERY_EVENT, "cockpit:ui-ownership-query");
 });
 
 test("Cockpit owns, retries, and releases the viewport-stability patch across TUI modes", () => {
@@ -387,6 +419,7 @@ test("Teammate's literal cockpit event constants match the public contract (CS-6
 	);
 	const cockpitEvents = await import("../src/public/v1/events.ts");
 	assert.equal(teammateEvents.COCKPIT_UI_OWNERSHIP_EVENT, "cockpit:ui-ownership");
+	assert.equal(teammateEvents.COCKPIT_UI_OWNERSHIP_QUERY_EVENT, cockpitEvents.COCKPIT_UI_OWNERSHIP_QUERY_EVENT);
 	assert.equal(teammateEvents.COCKPIT_SESSION_LIST_EVENT, cockpitEvents.COCKPIT_SESSION_LIST_EVENT);
 	assert.equal(teammateEvents.COCKPIT_PREEMPT_RESIZE_EVENT, cockpitEvents.COCKPIT_PREEMPT_RESIZE_EVENT);
 	assert.equal(

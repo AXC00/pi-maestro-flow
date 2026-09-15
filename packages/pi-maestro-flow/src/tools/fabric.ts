@@ -6,7 +6,7 @@ import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { FABRIC_CONTROL_VERSION } from "pi-maestro-fabric-core/v1";
 import { Type, type Static } from "typebox";
 import { createGatewayLocalClient } from "../gateway/local-client.ts";
-import { resultSummary, toolCallLine, toolResultLine } from "../quiet-render.ts";
+import { resultSummary, toolCallLine, toolResultLine } from "pi-cockpit/src/quiet-tools.ts";
 import type { FlowToolResult } from "./tool-result.ts";
 
 const id = Type.String({ minLength: 1, maxLength: 128, pattern: "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$" });

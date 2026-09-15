@@ -22,6 +22,9 @@ import type { AgentToolResult } from "@earendil-works/pi-agent-core";
 import { Check } from "typebox/value";
 import { isGuiTeammateToolAllowed, registerGuiTool, unregisterGuiTool } from "../shared/gui-registry.ts";
 import { Key, Text, decodeKittyPrintable, isKeyRelease, isKeyRepeat, matchesKey, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import { makeOverlayFrame, resolveGlyphs, type IconGlyphs } from "pi-maestro-settings-core/ui";
+
+const ATTACH_GLYPHS: IconGlyphs = resolveGlyphs("nerd");
 import { loadTranscript, scanWorkspaceSessionDirs, groupTranscriptTurns, type WorkspaceSessionScan } from "../transcript/session-transcript.ts";
 import type { TranscriptRow } from "../shared/transcript.ts";
 import {
@@ -410,6 +413,7 @@ import {
   TEAMMATE_COMPLETE_EVENT,
   TEAMMATE_STARTED_EVENT,
   TEAMMATE_MESSAGE_EVENT,
+  TEAMMATE_OPEN_AGENT_EVENT,
   AGENT_TURN_VERSION,
   MESSAGE_PROVENANCE_VERSION,
   normalizeMessageProvenanceV1,
@@ -466,7 +470,7 @@ import {
   getTeammatePermissionBroker,
   registerTeammateChildProxyCaller,
 } from "../runs/child-extensions.ts";
-import { setQuietMode } from "../quiet-state.ts";
+import { setQuietMode } from "pi-maestro-settings-core/ui";
 import {
   aggregateAgentRunPhase,
   diagnoseAgentRuntime,
@@ -569,12 +573,14 @@ import {
   switchConversationSession,
   restoreMainOwnershipIfHandbackPending,
   AGENT_WIDGET_IDLE_HIDE_MS,
+  agentWidgetRows,
   renderAgentStatusWidget,
   COCKPIT_UI_OWNERSHIP_EVENT,
 } from "./teammate-core.ts";
 import {
   COCKPIT_PREEMPT_RESIZE_EVENT,
   COCKPIT_SESSION_LIST_EVENT,
+  COCKPIT_UI_OWNERSHIP_QUERY_EVENT,
   TEAMMATE_AGENT_COMMAND_EVENT,
 } from "../shared/cockpit-events.ts";
 import { logDiagnosticError, logDiagnosticWarn } from "../shared/diagnostic-log.ts";
@@ -6136,7 +6142,7 @@ export default function registerTeammateExtension(
             killAgent(state, correlationId, undefined, "failed");
           }
         }
-        if (foregroundToolRuns.delete(correlationId)) updateAgentWidget();
+        if (foregroundToolRuns.delete(correlationId)) scheduleAgentWidgetUpdate();
         signal.removeEventListener("abort", abortForward);
       }
     },
@@ -9820,7 +9826,7 @@ This Monitor-only lifecycle tool loads configured target ids without exposing SS
           const finish = (value: T): void => {
             disposePanel();
             interactivePanelActive = false;
-            updateAgentWidget();
+            scheduleAgentWidgetUpdate();
             done(value);
           };
 
@@ -9829,13 +9835,14 @@ This Monitor-only lifecycle tool loads configured target ids without exposing SS
             render: (width: number) => {
               const lines = panel?.render(width) ?? [];
               const inner = Math.max(1, Math.min(width, 60) - 2);
-              const edge = "─".repeat(inner);
-              const border = (glyph: string) => theme.bg("customMessageBg", theme.fg("borderMuted", glyph));
-              const fill = (line: string): string => {
-                const fitted = truncateToWidth(line, inner, "…");
-                return theme.bg("customMessageBg", " " + fitted + " ".repeat(Math.max(0, inner - visibleWidth(fitted))) + " ");
-              };
-              return [border(`╭${edge}╮`), ...lines.map(fill), border(`╰${edge}╯`)];
+              const frameWidth = inner + 2;
+              return makeOverlayFrame(
+                lines.map((line) => truncateToWidth(line, inner, "…")),
+                frameWidth,
+                theme,
+                ATTACH_GLYPHS,
+                { measure: visibleWidth, clip: truncateToWidth },
+              );
             },
             handleInput: (data: string) => {
               panel?.handleInput(data === "\x03" ? "\x1b" : data);
@@ -9851,7 +9858,7 @@ This Monitor-only lifecycle tool loads configured target ids without exposing SS
       );
     } catch (error) {
       interactivePanelActive = false;
-      updateAgentWidget();
+      scheduleAgentWidgetUpdate();
       throw error;
     }
   }
@@ -9869,6 +9876,14 @@ This Monitor-only lifecycle tool loads configured target ids without exposing SS
     const agent = typeof target === "string" ? state.activeRuns.get(target) : target;
     if (!agent) {
       ctx.ui.notify(tuiT("extension.agentInactive"), "error");
+      return;
+    }
+
+    // Single-owner: when Cockpit owns the agent surfaces, hand the attach
+    // request to Cockpit's AgentOverlay; the native overlay stays for the
+    // Cockpit-absent path and for read-only history views.
+    if (cockpitOwnsAgents && !opts.readOnly) {
+      pi.events.emit(TEAMMATE_OPEN_AGENT_EVENT, { correlationId: agent.correlationId });
       return;
     }
 
@@ -10004,7 +10019,7 @@ This Monitor-only lifecycle tool loads configured target ids without exposing SS
       );
     } finally {
       interactivePanelActive = false;
-      updateAgentWidget();
+      scheduleAgentWidgetUpdate();
     }
   }
 
@@ -10196,9 +10211,16 @@ This Monitor-only lifecycle tool loads configured target ids without exposing SS
     state.currentWorkspaceId = undefined;
     state.currentSourceId = undefined;
     state.settlementOwner = undefined;
+    if (widgetUpdateTimer) {
+      clearTimeout(widgetUpdateTimer);
+      widgetUpdateTimer = null;
+    }
     widgetCtx?.ui.setWidget("teammate-agents", undefined);
     agentWidgetInstalled = false;
     widgetCtx = null;
+    widgetAgents = [];
+    widgetTui = null;
+    lastWidgetRenderKey = undefined;
     setPersistentUi(undefined);
   }
 
@@ -10760,14 +10782,70 @@ This Monitor-only lifecycle tool loads configured target ids without exposing SS
   });
 
   function clearAgentWidget(): void {
+    if (widgetUpdateTimer) {
+      clearTimeout(widgetUpdateTimer);
+      widgetUpdateTimer = null;
+    }
     if (!agentWidgetInstalled) return;
     widgetCtx?.ui.setWidget("teammate-agents", undefined);
     agentWidgetInstalled = false;
+    widgetTui = null;
+    lastWidgetRenderKey = undefined;
+  }
+
+  // Stable widget mounting + renderKey gating (pi-subagents fleet-status
+  // pattern): setWidget is called only on install/uninstall transitions; the
+  // render closure reads the mutable widgetAgents holder. Content changes only
+  // ask the host for a repaint, and only when the serialized visual state
+  // actually changed — identical states never schedule a render.
+  let widgetAgents: ActiveAgent[] = [];
+  let widgetTui: { requestRender?: () => void } | null = null;
+  let lastWidgetRenderKey: string | undefined;
+  let widgetUpdateTimer: ReturnType<typeof setTimeout> | null = null;
+
+  function agentWidgetRenderKey(agents: ActiveAgent[]): string {
+    return JSON.stringify(agentWidgetRows(agents).map((row) => [
+      row.correlationId,
+      row.parentCorrelationId ?? "",
+      row.label,
+      row.agent,
+      row.status,
+      row.phase ?? "",
+      row.action,
+      row.direction,
+      row.toolCount,
+      row.tokens,
+      row.inputTokens ?? 0,
+      row.outputTokens ?? 0,
+      // Display precision is whole seconds; finer granularity would schedule a
+      // repaint for an invisible change.
+      Math.floor(row.durationMs / 1000),
+      row.pendingInteractions,
+      row.parentLabel ?? "",
+      row.resultLabels ?? [],
+    ]));
+  }
+
+  /** Drop the renderKey cache so the next update cannot be suppressed (locale changes). */
+  function invalidateAgentWidget(): void {
+    lastWidgetRenderKey = undefined;
+  }
+
+  /** Coalesce event bursts into one update ~100ms later (completion-batcher pattern). */
+  function scheduleAgentWidgetUpdate(): void {
+    if (!widgetCtx || cockpitOwnsAgents || interactivePanelActive || foregroundToolRuns.size > 0) return;
+    if (widgetUpdateTimer) return;
+    widgetUpdateTimer = setTimeout(() => {
+      widgetUpdateTimer = null;
+      updateAgentWidget();
+    }, 100);
+    widgetUpdateTimer.unref?.();
   }
 
   function updateAgentWidget(): void {
     if (!widgetCtx) {
       agentWidgetInstalled = false;
+      widgetTui = null;
       return;
     }
     if (cockpitOwnsAgents || interactivePanelActive || foregroundToolRuns.size > 0) {
@@ -10788,15 +10866,25 @@ This Monitor-only lifecycle tool loads configured target ids without exposing SS
       return;
     }
 
-    const agents = visible.map(([, agent]) => agent);
+    const key = agentWidgetRenderKey(visible.map(([, agent]) => agent));
+    if (agentWidgetInstalled && key === lastWidgetRenderKey) return;
+    widgetAgents = visible.map(([, agent]) => agent);
+    lastWidgetRenderKey = key;
 
-    widgetCtx.ui.setWidget("teammate-agents", (_tui, theme) => ({
-      render(width: number): string[] {
-        return renderAgentStatusWidget(agents, width, theme);
-      },
-      invalidate() {},
-    }), { placement: "belowEditor" });
-    agentWidgetInstalled = true;
+    if (!agentWidgetInstalled) {
+      widgetCtx.ui.setWidget("teammate-agents", (tui, theme) => {
+        widgetTui = tui;
+        return {
+          render(width: number): string[] {
+            return renderAgentStatusWidget(widgetAgents, width, theme);
+          },
+          invalidate() {},
+        };
+      }, { placement: "belowEditor" });
+      agentWidgetInstalled = true;
+      return;
+    }
+    widgetTui?.requestRender?.();
   }
 
   let widgetTimer: ReturnType<typeof setInterval> | null = null;
@@ -10920,7 +11008,7 @@ This Monitor-only lifecycle tool loads configured target ids without exposing SS
         ...enforceWakeableAgentBudget(state),
       ];
       if (retired.length > 0) publishRuntimeReadDelta();
-      updateAgentWidget();
+      scheduleAgentWidgetUpdate();
       scheduleWakeableEvictionTimer();
     }, delay);
     wakeableEvictionTimer.unref?.();
@@ -10932,6 +11020,8 @@ This Monitor-only lifecycle tool loads configured target ids without exposing SS
   disposers.push(registerWorkspaceProjectionDirtyListener(markWorkspacePeerDirty));
   const disposeTuiLocaleEvents = pi.events.on(SETTINGS_LOCALE_EVENT, (payload) => {
     if (!applySettingsLocaleEvent(payload)) return;
+    // Localized labels feed the render output but not the renderKey inputs.
+    invalidateAgentWidget();
     updateAgentWidget();
     syncMonitorInteractionStatus();
   });
@@ -10952,6 +11042,10 @@ This Monitor-only lifecycle tool loads configured target ids without exposing SS
     setQuietMode(ownership.quiet === true, ownership.quietSymbols);
     updateAgentWidget();
   }));
+  // Handshake: this subscription may have been registered after Cockpit's
+  // session_start broadcast; ask once instead of waiting for the next
+  // config-driven re-broadcast. No answer means Cockpit is absent/disabled.
+  pi.events.emit(COCKPIT_UI_OWNERSHIP_QUERY_EVENT, undefined);
 
   // Cockpit agent list commands: interrupt (打断) aborts the current turn with
   // a canned continue notice; steer (引导) interrupts and injects the user's
@@ -10971,7 +11065,7 @@ This Monitor-only lifecycle tool loads configured target ids without exposing SS
     backgroundStatusHeartbeat.refresh();
     markWorkspacePeerDirty();
     publishRuntimeReadDelta();
-    updateAgentWidget();
+    scheduleAgentWidgetUpdate();
     startWidgetTimer();
   }));
   disposers.push(pi.events.on(TEAMMATE_COMPLETE_EVENT, () => {
@@ -10983,7 +11077,7 @@ This Monitor-only lifecycle tool loads configured target ids without exposing SS
       if (!ownsRootSessionFence(fence)) return;
       const retired = enforceWakeableAgentBudget(state);
       if (retired.length > 0) publishRuntimeReadDelta();
-      updateAgentWidget();
+      scheduleAgentWidgetUpdate();
       if (!hasTeammateWidgetWork(state)) {
         stopWidgetTimer();
         scheduleWakeableEvictionTimer();
@@ -11002,6 +11096,9 @@ This Monitor-only lifecycle tool loads configured target ids without exposing SS
   pi.on("session_start", (event, ctx) => {
     backgroundStatusHeartbeat.setIntervalMs(getGlobalBackgroundStatusHeartbeatMs());
     backgroundStatusHeartbeat.reset();
+    // Re-ask ownership on every session boundary: a reload re-runs extension
+    // factories and Cockpit's broadcast may have landed before we subscribed.
+    pi.events.emit(COCKPIT_UI_OWNERSHIP_QUERY_EVENT, undefined);
     registerTeammateSettings();
     state.settlementOwner = undefined;
     state.sessionGeneration = (state.sessionGeneration ?? 0) + 1;

@@ -1,6 +1,6 @@
 import type { AgentToolResult } from "@earendil-works/pi-agent-core";
 import { Text } from "@earendil-works/pi-tui";
-import { toolCallLine, toolResultLine } from "../quiet-render.ts";
+import { toolCallLine, toolResultLine } from "pi-cockpit/src/quiet-tools.ts";
 import type { ExtensionAPI, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import {

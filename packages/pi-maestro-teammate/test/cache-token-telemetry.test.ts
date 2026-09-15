@@ -8,7 +8,7 @@ import registerTeammateExtension, {
   renderAgentStatusWidget,
   type TeammateRuntimeOptions,
 } from "../src/extension/index.ts";
-import { setQuietMode } from "../src/quiet-state.ts";
+import { setQuietMode } from "pi-maestro-settings-core/ui";
 import type { AgentProgress, Details, SingleResult, Usage } from "../src/shared/types.ts";
 import { buildProgressTree, type ProgressPalette } from "../src/tui/progress-tree.ts";
 import { renderTeammateResult } from "../src/tui/render.ts";

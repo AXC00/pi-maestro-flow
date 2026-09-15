@@ -189,7 +189,7 @@ import {
   schedulePermissionRequestAudit,
   type PermissionAuditSource,
 } from "../runs/shared/permission-audit.ts";
-import { setQuietMode } from "../quiet-state.ts";
+import { setQuietMode } from "pi-maestro-settings-core/ui";
 import { type ReplyTarget } from "../shared/routing.ts";
 
 import {
