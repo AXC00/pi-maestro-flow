@@ -3,10 +3,12 @@ import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import {
   buildNewContextRecoveryCapsule,
   createNewContextController,
   NEW_CONTEXT_MAX_BYTES,
+  NEW_CONTEXT_MAX_CARRY_FORWARD_BYTES,
   newContextFirstKeptEntryId,
   selectNewContextHandoff,
 } from "../src/compaction/new-context.ts";
@@ -28,7 +30,10 @@ import {
   type TodoTask,
 } from "../src/tools/todo.ts";
 import { TODO_MAX_HANDOFF_BYTES } from "../src/tools/todo-contract.ts";
-import { createNewContextTool } from "../src/tools/new-context.ts";
+import {
+  createNewContextTool,
+  registerNewContextWithoutLlmCommand,
+} from "../src/tools/new-context.ts";
 
 const renderTheme = {
   fg: (_role: string, text: string) => text,
@@ -217,6 +222,14 @@ test("plan-confirm New Context checkpoints its execution contract and resumes wi
       source: "plan-confirm",
       actorId: "root",
       carryForward: executionMessage,
+      plan: {
+        status: "approved",
+        revision: 4,
+        path: "D:/plans/approvals/approved.md",
+        handoffKey: "handoff-plan-4",
+        checksum: "checksum-plan-4",
+        markdown: "# Approved Plan\n\nPreserve the execution boundary.",
+      },
       continueAfterReset() {
         planContinuations += 1;
         return true;
@@ -232,6 +245,8 @@ test("plan-confirm New Context checkpoints its execution contract and resumes wi
     assert.equal(consumed?.requestId, receipt.requestId);
     assert.equal(consumed?.source, "plan-confirm");
     assert.equal(consumed?.carryForward, executionMessage);
+    assert.equal(consumed?.plan?.path, "D:/plans/approvals/approved.md");
+    assert.equal(consumed?.plan?.checksum, "checksum-plan-4");
 
     const checkpoint = details();
     checkpoint.newContext = {
@@ -239,16 +254,59 @@ test("plan-confirm New Context checkpoints its execution contract and resumes wi
       source: "plan-confirm",
       actorId: "root",
       carryForward: executionMessage,
+      ...(consumed?.plan ? { plan: consumed.plan } : {}),
       resourceUris: [],
     };
     const capsule = buildNewContextRecoveryCapsule(checkpoint);
     assert.match(capsule, /## Plan Confirm Execution/);
     assert.match(capsule, /The user selected Execute/);
+    assert.match(capsule, /## Plan Recovery/);
+    assert.match(capsule, /# Approved Plan/);
+    assert.match(capsule, /First action: reload and verify this Plan/);
     assert.doesNotMatch(capsule, /## Carry Forward/);
 
     harness.compactOptions?.onComplete?.();
     assert.equal(planContinuations, 1);
     assert.equal(genericContinuations, 0);
+  } finally {
+    await fixture.dispose();
+  }
+});
+
+test("standalone new-context captures the current Plan and preserves a Plan-aware continuation", async () => {
+  const fixture = await enabledProject();
+  try {
+    const arbiter = new CompactionArbiter();
+    let continuations = 0;
+    const controller = createNewContextController(arbiter, {
+      getPlanRecoveryPayload: () => ({
+        status: "draft",
+        revision: 2,
+        path: "D:/plans/current.md",
+        markdown: "# Draft Plan\n\nContinue planning before approval.",
+      }),
+      continueAfterReset() {
+        continuations += 1;
+      },
+    });
+    const harness = context(fixture.cwd);
+    controller.onSessionStart(harness.ctx as never);
+    assert.equal(await controller.schedule({ source: "tool", actorId: "root" }, harness.ctx as never).coalesced, false);
+    assert.equal(await controller.onAgentSettled(harness.ctx as never), true);
+    const request = compactionRequestFromInstructions(harness.compactOptions?.customInstructions);
+    const observed = arbiter.observeStart(request);
+    assert.equal(observed.trigger?.owner, "new-context");
+    if (observed.trigger?.owner !== "new-context") assert.fail("missing new-context trigger");
+    const consumed = controller.consume(observed.trigger, harness.ctx as never);
+    assert.equal(consumed?.plan?.status, "draft");
+    assert.equal(consumed?.plan?.path, "D:/plans/current.md");
+
+    const checkpoint = details();
+    checkpoint.newContext = consumed;
+    assert.match(buildNewContextRecoveryCapsule(checkpoint), /# Draft Plan/);
+    assert.match(buildNewContextRecoveryCapsule(checkpoint), /First action: reload and verify this Plan/);
+    harness.compactOptions?.onComplete?.();
+    assert.equal(continuations, 1);
   } finally {
     await fixture.dispose();
   }
@@ -628,6 +686,93 @@ test("new_context guidance persists actionable recommendations and task-relative
   assert.match(tool.parameters.properties.resourceUris.description, /never inside the URI/);
   assert.match(tool.parameters.properties.handoff.description, /Reset-local/);
   assert.match(tool.parameters.properties.handoff.description, /does not mutate or persist to Todo state/);
+});
+
+test("new_context_without_llm records and separately sends trailing text after the reset", async () => {
+  const fixture = await enabledProject();
+  try {
+    const arbiter = new CompactionArbiter();
+    let defaultContinuations = 0;
+    const sentMessages: Array<{ content: unknown; deliverAs?: string }> = [];
+    const controller = createNewContextController(arbiter, {
+      continueAfterReset() {
+        defaultContinuations += 1;
+      },
+    });
+    const harness = context(fixture.cwd);
+    controller.onSessionStart(harness.ctx as never);
+    let command: {
+      description?: string;
+      handler: (args: string, ctx: ExtensionCommandContext) => Promise<void>;
+    } | undefined;
+    const api = {
+      registerCommand(name: string, value: typeof command) {
+        assert.equal(name, "new_context_without_llm");
+        command = value;
+      },
+      sendUserMessage(content: unknown, options?: { deliverAs?: string }) {
+        sentMessages.push({ content, deliverAs: options?.deliverAs });
+      },
+    } as unknown as ExtensionAPI;
+    registerNewContextWithoutLlmCommand(api, controller, "root");
+    assert.ok(command);
+    assert.match(command.description ?? "", /without model summarization/);
+
+    const commandContext = {
+      ...harness.ctx,
+      waitForIdle: async () => {},
+      isIdle: () => true,
+      hasPendingMessages: () => false,
+    } as unknown as ExtensionCommandContext;
+    await command.handler("  Preserve this exact operator note.  ", commandContext);
+
+    const request = compactionRequestFromInstructions(harness.compactOptions?.customInstructions);
+    const observed = arbiter.observeStart(request);
+    assert.equal(observed.trigger?.owner, "new-context");
+    if (observed.trigger?.owner !== "new-context") assert.fail("missing new-context trigger");
+    assert.equal(observed.trigger.source, "command");
+    const consumed = controller.consume(observed.trigger, harness.ctx as never);
+    assert.equal(consumed?.carryForward, "Preserve this exact operator note.");
+    const runtime = details();
+    runtime.newContext = consumed;
+    assert.match(buildNewContextRecoveryCapsule(runtime), /## Carry Forward\nPreserve this exact operator note\./);
+    assert.deepEqual(sentMessages, []);
+
+    harness.compactOptions?.onComplete?.();
+    assert.deepEqual(sentMessages, [{
+      content: "Preserve this exact operator note.",
+      deliverAs: "followUp",
+    }]);
+    assert.equal(defaultContinuations, 0);
+  } finally {
+    await fixture.dispose();
+  }
+});
+
+test("new_context_without_llm rejects oversized trailing text before compaction", async () => {
+  const fixture = await enabledProject();
+  try {
+    const controller = createNewContextController(new CompactionArbiter());
+    const harness = context(fixture.cwd);
+    controller.onSessionStart(harness.ctx as never);
+    let command: { handler: (args: string, ctx: ExtensionCommandContext) => Promise<void> } | undefined;
+    registerNewContextWithoutLlmCommand({
+      registerCommand(_name: string, value: typeof command) {
+        command = value;
+      },
+    } as unknown as ExtensionAPI, controller, "root");
+    assert.ok(command);
+    await command.handler("x".repeat(NEW_CONTEXT_MAX_CARRY_FORWARD_BYTES + 1), {
+      ...harness.ctx,
+      waitForIdle: async () => {},
+      isIdle: () => true,
+      hasPendingMessages: () => false,
+    } as unknown as ExtensionCommandContext);
+    assert.equal(harness.compactOptions, undefined);
+    assert.match(harness.notifications.at(-1) ?? "", /carryForward exceeds 4096 UTF-8 bytes/);
+  } finally {
+    await fixture.dispose();
+  }
 });
 
 test("new-context structured handoff clears reset-local supplements without mutating Todo", async () => {

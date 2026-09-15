@@ -10,6 +10,7 @@ import {
   type TodoHandoffInput,
 } from "../tools/todo-contract.ts";
 import { getTodoCompactionSnapshot, type TodoTask } from "../tools/todo.ts";
+import type { PlanNewContextPayload } from "../tools/plan.ts";
 import type {
   MaestroCompactionDetails,
   MaestroNewContextDetails,
@@ -38,15 +39,17 @@ const NEW_CONTEXT_INSTRUCTIONS = [
 export const NEW_CONTEXT_RECOVERY_BROKER_NAME = "maestro-new-context-recovery";
 
 export interface NewContextScheduleInput {
-  source: "todo-transition" | "plan-confirm" | "tool";
+  source: "todo-transition" | "plan-confirm" | "tool" | "command";
   actorId: string;
   carryForward?: string;
   /** Structured supplement for this reset; it does not mutate Todo state. */
   handoff?: TodoHandoffInput;
+  /** Current Plan material when the reset is Plan-aware. */
+  plan?: PlanNewContextPayload;
   resourceUris?: readonly string[];
   /** Root-authorized shared state required when a child session owns the reset. */
   recoveryState?: MaestroRecoveryState;
-  /** In-memory continuation used by Plan confirmation after the checkpoint is committed. */
+  /** Request-specific continuation after the checkpoint is committed. */
   continueAfterReset?: () => boolean;
   /** Clears a Plan handoff when the reset becomes stale before continuation. */
   onCancelled?: (reason: string) => void;
@@ -92,6 +95,8 @@ export interface NewContextControllerOptions {
     request: ScheduledNewContextRequest,
     ctx: NewContextControllerContext,
   ) => MaestroRecoveryState | undefined | Promise<MaestroRecoveryState | undefined>;
+  /** Supplies the current Plan for standalone root resets outside plan-confirm. */
+  getPlanRecoveryPayload?: () => PlanNewContextPayload | undefined;
 }
 
 function sessionIdOf(ctx: Pick<ExtensionContext, "sessionManager">): string {
@@ -126,6 +131,29 @@ function normalizedCarryForward(value: string | undefined, maxBytes: number): st
     throw new Error(`carryForward exceeds ${maxBytes} UTF-8 bytes`);
   }
   return normalized;
+}
+
+function normalizedPlanRecoveryPayload(value: PlanNewContextPayload | undefined): PlanNewContextPayload | undefined {
+  if (!value) return undefined;
+  const path = value.path.trim();
+  const markdown = value.markdown;
+  if (!path || !markdown.trim()) return undefined;
+  const boundedMarkdown = boundedUtf8(markdown, NEW_CONTEXT_MAX_PLAN_HANDOFF_BYTES);
+  return {
+    status: value.status,
+    revision: value.revision,
+    path,
+    ...(value.handoffKey ? { handoffKey: value.handoffKey } : {}),
+    ...(value.checksum ? { checksum: value.checksum } : {}),
+    markdown: boundedMarkdown,
+    ...(boundedMarkdown.length !== markdown.length || value.markdownTruncated
+      ? { markdownTruncated: true }
+      : {}),
+  };
+}
+
+function clonePlanRecoveryPayload(value: PlanNewContextPayload): PlanNewContextPayload {
+  return { ...value };
 }
 
 function mergeResourceUris(left: readonly string[], right: readonly string[]): string[] {
@@ -215,7 +243,10 @@ export function createNewContextController(
   ): boolean => isRequestLifecycleCurrent(request, ctx)
     && pending?.requestId === request.requestId;
   const hasUniquePayload = (request: ScheduledNewContextRequest): boolean =>
-    request.carryForward !== undefined || request.handoff !== undefined || request.resourceUris.length > 0;
+    request.carryForward !== undefined
+    || request.handoff !== undefined
+    || request.plan !== undefined
+    || request.resourceUris.length > 0;
   const coalesceIntoEquivalentPlan = (
     request: ScheduledNewContextRequest,
     ctx: Pick<ExtensionContext, "ui">,
@@ -466,6 +497,7 @@ export function createNewContextController(
         input.carryForward,
         input.source === "plan-confirm" ? NEW_CONTEXT_MAX_PLAN_HANDOFF_BYTES : NEW_CONTEXT_MAX_CARRY_FORWARD_BYTES,
       );
+      const plan = normalizedPlanRecoveryPayload(input.plan ?? options.getPlanRecoveryPayload?.());
       const resourceUris = normalizeTodoResourceUris(input.resourceUris);
       const todoRevision = input.recoveryState?.todo.revision ?? getTodoCompactionSnapshot().revision;
       if (pending) {
@@ -478,6 +510,7 @@ export function createNewContextController(
         pending.todoRevision = todoRevision;
         if (input.source === "plan-confirm") pending.source = input.source;
         if (input.recoveryState) pending.recoveryState = input.recoveryState;
+        if (plan) pending.plan = clonePlanRecoveryPayload(plan);
         if (carryForward !== undefined) pending.carryForward = carryForward;
         if (input.handoff !== undefined) {
           const handoff = normalizeTodoHandoff(input.handoff, pending.handoff, pending.requestId);
@@ -500,6 +533,7 @@ export function createNewContextController(
         sessionId,
         todoRevision,
         ...(input.recoveryState ? { recoveryState: input.recoveryState } : {}),
+        ...(plan ? { plan: clonePlanRecoveryPayload(plan) } : {}),
         ...(carryForward ? { carryForward } : {}),
         ...(handoff ? { handoff } : {}),
         ...(input.continueAfterReset ? { continueAfterReset: input.continueAfterReset } : {}),
@@ -533,6 +567,7 @@ export function createNewContextController(
       return {
         ...request,
         ...(request.handoff ? { handoff: cloneTodoHandoff(request.handoff) } : {}),
+        ...(request.plan ? { plan: clonePlanRecoveryPayload(request.plan) } : {}),
         resourceUris: [...request.resourceUris],
       };
     },
@@ -914,6 +949,35 @@ export function buildNewContextRecoveryCapsule(details: MaestroCompactionDetails
         continue;
       }
       lines.push(line);
+    }
+  }
+
+  const planRecovery = details.newContext?.plan;
+  if (planRecovery) {
+    const header = [
+      "",
+      "## Plan Recovery",
+      `- Status: ${planRecovery.status}`,
+      `- Revision: ${planRecovery.revision}`,
+      `- Source: ${boundedUtf8(planRecovery.path, 1_024)}`,
+      ...(planRecovery.handoffKey ? [`- Handoff Key: ${boundedUtf8(planRecovery.handoffKey, 512)}`] : []),
+      ...(planRecovery.checksum ? [`- Checksum: ${boundedUtf8(planRecovery.checksum, 512)}`] : []),
+      "- First action: reload and verify this Plan before decomposing or modifying the project.",
+      "### Inline Plan",
+    ];
+    const availableBytes = CAPSULE_BODY_MAX_BYTES - Buffer.byteLength(lines.join("\n"), "utf8") - 512;
+    const headerBytes = Buffer.byteLength(header.join("\n"), "utf8");
+    if (availableBytes >= headerBytes + 64) {
+      const inline = boundedUtf8(
+        planRecovery.markdown,
+        Math.min(NEW_CONTEXT_MAX_PLAN_HANDOFF_BYTES, availableBytes - headerBytes),
+      );
+      lines.push(...header, inline);
+      if (planRecovery.markdownTruncated || inline.length !== planRecovery.markdown.length) {
+        lines.push(`- Inline Plan is truncated; read the complete source at ${boundedUtf8(planRecovery.path, 1_024)} before continuing.`);
+      }
+    } else if (availableBytes >= headerBytes - Buffer.byteLength("\n### Inline Plan", "utf8")) {
+      lines.push(...header.slice(0, -1), "- Inline Plan omitted due to capsule budget; read the complete source before continuing.");
     }
   }
 

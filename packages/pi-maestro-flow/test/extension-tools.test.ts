@@ -485,6 +485,7 @@ test("extension registers Board, LSP, browser, BM25 discovery, and the Gateway c
   assert.ok(commands.includes("maestro-keybindings"));
   assert.ok(commands.includes("export-session-info"));
   assert.ok(commands.includes("gateway"));
+  assert.ok(commands.includes("new_context_without_llm"));
   assert.equal(commands.includes("mcpx"), false);
   assert.equal(commands.includes("swarm"), false);
   assert.ok(renderers.includes("run-event"));

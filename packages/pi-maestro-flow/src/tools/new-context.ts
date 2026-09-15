@@ -4,7 +4,7 @@ import { Type } from "typebox";
 import type { NewContextController } from "../compaction/new-context.ts";
 import { NEW_CONTEXT_MAX_CARRY_FORWARD_BYTES } from "../compaction/new-context.ts";
 import { createTodoHandoffSchema } from "../extension/schemas.ts";
-import { toolCallLine, toolResultCard, type QuietTheme } from "../quiet-render.ts";
+import { toolCallLine, toolResultCard, type QuietTheme } from "pi-cockpit/src/quiet-tools.ts";
 import {
   TODO_MAX_RESOURCE_URIS,
   TODO_MAX_RESOURCE_URI_BYTES,
@@ -188,4 +188,39 @@ export function registerNewContextTool(
   actorId: string,
 ): void {
   pi.registerTool(createNewContextTool(controller, actorId) as never);
+}
+
+export function registerNewContextWithoutLlmCommand(
+  pi: ExtensionAPI,
+  controller: NewContextController,
+  actorId: string,
+): void {
+  pi.registerCommand("new_context_without_llm", {
+    description: "Reset context without model summarization; trailing text is sent after the reset",
+    async handler(args, ctx) {
+      await ctx.waitForIdle();
+      try {
+        const message = args.trim() || undefined;
+        const receipt = controller.schedule({
+          source: "command",
+          actorId,
+          carryForward: message,
+          continueAfterReset: message
+            ? () => {
+              pi.sendUserMessage(message, { deliverAs: "followUp" });
+              return true;
+            }
+            : () => true,
+        }, ctx);
+        const started = await controller.onAgentSettled(ctx);
+        if (started) {
+          ctx.ui.notify(`New-context request ${receipt.requestId} started without model summarization.`, "info");
+        } else if (controller.hasPending()) {
+          ctx.ui.notify(`New-context request ${receipt.requestId} is waiting for the active compaction to settle.`, "info");
+        }
+      } catch (error) {
+        ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
+      }
+    },
+  });
 }

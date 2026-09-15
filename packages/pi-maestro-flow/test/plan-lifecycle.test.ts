@@ -810,6 +810,12 @@ test("plan-confirm defers New Context until settlement and passes the execution 
     assert.match(scheduled.executionMessage, /selected Execute/);
     assert.match(scheduled.executionMessage, /Knowledge Gate/);
     assert.match(scheduled.executionMessage, /approvals[\\/].*\.md/);
+    assert.match(scheduled.executionMessage, /after a deterministic reset, reload it/);
+    assert.equal(scheduled.plan.status, "approved");
+    assert.match(scheduled.plan.path, /approvals[\\/].*\.md/);
+    assert.match(scheduled.plan.markdown, /New Context Tool Plan/);
+    assert.ok(scheduled.plan.handoffKey);
+    assert.ok(scheduled.plan.checksum);
     assert.equal(harness.compactions.length, 0, "Plan delegates deterministic reset ownership to New Context");
     assert.equal(scheduled.continueAfterReset(), true);
     assert.equal(harness.messages.length, 1);

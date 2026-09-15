@@ -28,6 +28,7 @@ import {
 import {
   getPlanCompactionSnapshot,
   type PlanCompactionSnapshot,
+  type PlanNewContextPayload,
 } from "../tools/plan.ts";
 import type {
   CompactionOwner,
@@ -525,11 +526,13 @@ export interface MaestroCompactionReference {
 
 export interface MaestroNewContextDetails {
   requestId: number;
-  source: "todo-transition" | "plan-confirm" | "tool";
+  source: "todo-transition" | "plan-confirm" | "tool" | "command";
   actorId: string;
   carryForward?: string;
   /** Structured supplement for this reset; durable Todo handoffs remain authoritative. */
   handoff?: TodoHandoff;
+  /** Plan identity and bounded Markdown for Plan-aware deterministic resets. */
+  plan?: PlanNewContextPayload;
   resourceUris: string[];
 }
 
@@ -841,6 +844,7 @@ export async function captureMaestroCompactionDetails(
       newContext: {
         ...dependencies.newContext,
         ...(dependencies.newContext.handoff ? { handoff: cloneTodoHandoff(dependencies.newContext.handoff) } : {}),
+        ...(dependencies.newContext.plan ? { plan: { ...dependencies.newContext.plan } } : {}),
         resourceUris: [...dependencies.newContext.resourceUris],
       },
     } : {}),
@@ -1122,14 +1126,38 @@ export function normalizeMaestroCompactionDetails(value: unknown): MaestroCompac
       const context = candidate.newContext as Partial<MaestroNewContextDetails>;
       const requestId = context.requestId;
       if (!Number.isSafeInteger(requestId)
-        || (context.source !== "todo-transition" && context.source !== "plan-confirm" && context.source !== "tool")
+        || (context.source !== "todo-transition" && context.source !== "plan-confirm" && context.source !== "tool" && context.source !== "command")
         || !Array.isArray(context.resourceUris)) return undefined;
+      const rawPlan = context.plan;
+      const plan = rawPlan && typeof rawPlan === "object" && !Array.isArray(rawPlan)
+        ? (() => {
+          const candidate = rawPlan as Partial<PlanNewContextPayload>;
+          const revision = candidate.revision;
+          if ((candidate.status !== "draft" && candidate.status !== "approved")
+            || typeof revision !== "number"
+            || !Number.isSafeInteger(revision)
+            || typeof candidate.path !== "string"
+            || !candidate.path
+            || typeof candidate.markdown !== "string"
+            || !candidate.markdown) return undefined;
+          return {
+            status: candidate.status,
+            revision,
+            path: candidate.path,
+            ...(typeof candidate.handoffKey === "string" && candidate.handoffKey ? { handoffKey: candidate.handoffKey } : {}),
+            ...(typeof candidate.checksum === "string" && candidate.checksum ? { checksum: candidate.checksum } : {}),
+            markdown: candidate.markdown,
+            ...(candidate.markdownTruncated === true ? { markdownTruncated: true } : {}),
+          } satisfies PlanNewContextPayload;
+        })()
+        : undefined;
       return {
         requestId: requestId as number,
         source: context.source,
         actorId: typeof context.actorId === "string" && context.actorId ? context.actorId : "root",
         ...(typeof context.carryForward === "string" ? { carryForward: context.carryForward } : {}),
         handoff: readTodoHandoff(context.handoff),
+        ...(plan ? { plan } : {}),
         resourceUris: context.resourceUris.filter((uri): uri is string => typeof uri === "string"),
       } satisfies MaestroNewContextDetails;
     })()

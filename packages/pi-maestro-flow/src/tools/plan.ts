@@ -17,7 +17,7 @@ import { Key, Text, matchesKey, truncateToWidth, visibleWidth } from "@earendil-
 import { Type } from "typebox";
 import { altKey } from "../key-labels.ts";
 import type { UserAttentionHandler } from "../notify/user-attention.ts";
-import { toolCallLine, toolResultLine, resultSummary } from "../quiet-render.ts";
+import { toolCallLine, toolResultLine, resultSummary } from "pi-cockpit/src/quiet-tools.ts";
 import { buildPlanDecomposeContract, PlanDecomposeParams } from "./plan-decompose.ts";
 import { isRunControlReadAction, isRunControlReadArgv } from "./run-control.ts";
 import {
@@ -95,6 +95,17 @@ export interface PlanCompactionSnapshot {
   path?: string;
 }
 
+/** Immutable Plan material carried by a Plan-aware deterministic context reset. */
+export interface PlanNewContextPayload {
+  status: "draft" | "approved";
+  revision: number;
+  path: string;
+  handoffKey?: string;
+  checksum?: string;
+  markdown: string;
+  markdownTruncated?: boolean;
+}
+
 export interface LoadedPlanArtifactDocument {
   entry: PlanArtifactEntry;
   markdown: string;
@@ -108,6 +119,7 @@ export interface PlanArtifactSummary {
 
 export interface PlanNewContextScheduleInput {
   executionMessage: string;
+  plan: PlanNewContextPayload;
   continueAfterReset(): boolean;
   onCancelled(reason: string): void;
 }
@@ -181,6 +193,8 @@ let latestPlan: string | undefined;
 let latestRevision = 0;
 let latestStatus: PlanToolDetails["status"] = "empty";
 let latestHandoffKey: string | undefined;
+let latestApprovedPath: string | undefined;
+let latestApprovedChecksum: string | undefined;
 let latestExecution: PlanExecutionChoice | undefined;
 let latestWorkflowBinding: PlanWorkflowBinding | undefined;
 let latestArtifactAvailable = false;
@@ -337,6 +351,8 @@ export function clearPlan(): void {
   latestRevision = 0;
   latestStatus = "empty";
   latestHandoffKey = undefined;
+  latestApprovedPath = undefined;
+  latestApprovedChecksum = undefined;
   latestExecution = undefined;
   latestWorkflowBinding = undefined;
   latestArtifactAvailable = false;
@@ -376,6 +392,8 @@ function applyLoadedPlan(loaded: LoadedPlan): void {
     ? loaded.manifest.status
     : "empty";
   latestHandoffKey = loaded.manifest.handoffKey;
+  latestApprovedPath = loaded.manifest.approvedPath;
+  latestApprovedChecksum = loaded.manifest.approvedChecksum;
   latestExecution = loaded.manifest.execution;
   latestWorkflowBinding = loaded.manifest.workflowBinding;
   latestArtifactAvailable = latestArtifactAvailable
@@ -671,6 +689,8 @@ function resetRuntimeState(): void {
   latestRevision = 0;
   latestStatus = "empty";
   latestHandoffKey = undefined;
+  latestApprovedPath = undefined;
+  latestApprovedChecksum = undefined;
   latestExecution = undefined;
   latestWorkflowBinding = undefined;
   latestArtifactAvailable = false;
@@ -1564,7 +1584,7 @@ function buildPlanExecutionContract(
   const base = [
     "The user selected Execute and explicitly authorized immediate implementation of the approved Plan.",
     "Begin execution now. Do not ask the user to trigger implementation again.",
-    "The approved Plan is already in the current context.",
+    "The approved Plan is already in the current context for current-context execution; after a deterministic reset, reload it from the source path below before decomposition.",
     `Plan source: ${planPath}`,
     "Before modifying the project:",
     "1. Load the knowledge/spec system (Knowledge Gate) before any project-related work:",
@@ -1700,6 +1720,14 @@ function startPlanCompaction(ctx: PlanContext, handoff: PlanCompactHandoff): voi
     try {
       const receipt = schedulePlanNewContext(ctx, {
         executionMessage,
+        plan: {
+          status: "approved",
+          revision: latestRevision,
+          path: planPath,
+          ...(latestHandoffKey ? { handoffKey: latestHandoffKey } : {}),
+          ...(latestApprovedChecksum ? { checksum: latestApprovedChecksum } : {}),
+          markdown,
+        },
         continueAfterReset: () => deliverPlanHandoff(ctx, handoff),
         onCancelled(reason) {
           if (activePlanCompactHandoff === handoff) activePlanCompactHandoff = undefined;
@@ -1842,6 +1870,22 @@ export function getPlanCompactionSnapshot(): PlanCompactionSnapshot {
     handoffStatus: getPlanHandoffStatus(),
     ...(latestHandoffKey ? { handoffKey: latestHandoffKey } : {}),
     ...(currentStore?.currentPath ? { path: currentStore.currentPath } : {}),
+  };
+}
+
+/** Return the current Plan material for a deterministic context-reset handoff. */
+export function getPlanNewContextPayload(): PlanNewContextPayload | undefined {
+  if (!latestPlan || latestStatus === "empty" || !currentStore) return undefined;
+  const path = latestStatus === "approved" && latestApprovedPath
+    ? join(currentStore.plansDir, latestApprovedPath)
+    : currentStore.currentPath;
+  return {
+    status: latestStatus,
+    revision: latestRevision,
+    path,
+    ...(latestHandoffKey ? { handoffKey: latestHandoffKey } : {}),
+    ...(latestApprovedChecksum ? { checksum: latestApprovedChecksum } : {}),
+    markdown: latestPlan,
   };
 }
 

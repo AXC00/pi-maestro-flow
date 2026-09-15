@@ -38,12 +38,12 @@ export interface PlanHandoffCompactionTrigger {
   reason: string;
 }
 
-/** Deterministic same-session context reset requested by Todo, Plan confirmation, or the standalone tool. */
+/** Deterministic same-session context reset requested by Todo, Plan confirmation, the tool, or the command. */
 export interface NewContextCompactionTrigger {
   owner: "new-context";
   /** Stable scheduler request identity; never reused across session generations. */
   requestId: number;
-  source: "todo-transition" | "plan-confirm" | "tool";
+  source: "todo-transition" | "plan-confirm" | "tool" | "command";
 }
 
 export type CompactionTrigger =
