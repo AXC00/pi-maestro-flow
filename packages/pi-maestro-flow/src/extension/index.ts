@@ -61,6 +61,7 @@ import { registerSwarmDisplay } from "../tools/swarm.ts";
 import { MaestroUiPublisher, registerMaestroUiQuery } from "../ui-projection.ts";
 import { registerMaestroProviders } from "../providers/provider-registry.ts";
 import { registerApiProviderConfigs } from "../providers/api-provider-config.ts";
+import { registerDevinProvider } from "../providers/devin-provider.ts";
 import { registerNextSuggest } from "../next-suggest/index.ts";
 import { registerPromptEnhance } from "../prompt-enhance/index.ts";
 import { registerExploreConfigManager } from "../providers/explore-config-manager.ts";
@@ -1622,6 +1623,16 @@ export default function registerMaestroExtension(pi: ExtensionAPI): void {
     // Provider registration failures should not block extension load
     console.error(
       `[maestro] Provider registration warning: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+
+  // Devin account login: Pi owns the OAuth flow through /login and /logout;
+  // this only registers the provider so the account appears in the login list.
+  try {
+    registerDevinProvider(pi);
+  } catch (error) {
+    console.error(
+      `[maestro] Devin provider registration warning: ${error instanceof Error ? error.message : String(error)}`,
     );
   }
 
