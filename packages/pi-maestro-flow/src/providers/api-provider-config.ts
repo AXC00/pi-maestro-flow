@@ -50,6 +50,13 @@ import {
   matchOpenRouterPricing,
 } from "./cost-backfill.ts";
 import { discoverModels, type DiscoveredModel } from "./model-discovery.ts";
+import {
+  AGENT_HEADER_PRESETS,
+  customAgentHeaders,
+  expandAgentHeaderPreset,
+  isAgentHeaderPreset,
+  type AgentHeaderPreset,
+} from "./agent-header-presets.ts";
 
 export type ApiProviderId = "maestro-openai" | "maestro-qwen" | "maestro-anthropic";
 
@@ -117,6 +124,7 @@ const CATALOGS = {
     "form.section.model": "Model settings",
     "form.label.providerName": "Provider display name",
     "form.label.headers": "Request headers JSON",
+    "form.label.headerPreset": "Agent identity preset",
     "form.label.authHeader": "Authorization",
     "form.label.developerRole": "Developer role",
     "form.label.maxTokensField": "Output request field",
@@ -131,6 +139,12 @@ const CATALOGS = {
     "form.help.modelEdit": "Changing the Model ID renames this entry and migrates its thinking default and default-model reference; the new ID must not collide.",
     "form.help.multimodal": "On writes input: [text, image]; off writes input: [text] for vision delegation capability checks.",
     "form.choice.auto": "Auto",
+    "form.choice.headerPreset.none": "None (pi default)",
+    "form.choice.headerPreset.claude-code": "Claude Code CLI",
+    "form.choice.headerPreset.codex": "Codex CLI",
+    "form.choice.headerPreset.grok": "Grok CLI",
+    "form.choice.headerPreset.antigravity": "Antigravity CLI",
+    "form.choice.headerPreset.opencode": "OpenCode session affinity",
     "form.choice.autoUrl": "Auto (detect from URL)",
     "form.choice.bearer": "Bearer",
     "form.choice.noSend": "Do not send",
@@ -139,6 +153,7 @@ const CATALOGS = {
     "form.confirm.preset": "Save {name} API configuration?",
     "form.confirm.provider": "Save Provider {name}?",
     "form.preview.compat": "Compat: {value}",
+    "form.preview.headerPreset": "Agent identity preset: {value}",
     "form.preview.headers": "Headers: {value}",
     "form.preview.authorization": "Authorization: {value}",
     "form.value.none": "none",
@@ -211,6 +226,7 @@ const CATALOGS = {
     "form.section.model": "模型（Model 级）",
     "form.label.providerName": "Provider 显示名称",
     "form.label.headers": "请求头 JSON",
+    "form.label.headerPreset": "Agent 身份预设",
     "form.label.authHeader": "Authorization",
     "form.label.developerRole": "Developer 角色",
     "form.label.maxTokensField": "输出请求字段",
@@ -225,6 +241,12 @@ const CATALOGS = {
     "form.help.modelEdit": "修改 Model ID 将重命名该模型，并迁移思考强度默认值与默认模型引用；新 ID 不能与其他模型冲突。",
     "form.help.multimodal": "开启时写入 input: [text, image]；关闭时写入 input: [text]，用于视觉委托能力判断。",
     "form.choice.auto": "自动",
+    "form.choice.headerPreset.none": "无（pi 默认）",
+    "form.choice.headerPreset.claude-code": "Claude Code CLI",
+    "form.choice.headerPreset.codex": "Codex CLI",
+    "form.choice.headerPreset.grok": "Grok CLI",
+    "form.choice.headerPreset.antigravity": "Antigravity CLI",
+    "form.choice.headerPreset.opencode": "OpenCode 会话路由",
     "form.choice.autoUrl": "自动（按 URL 识别）",
     "form.choice.bearer": "Bearer",
     "form.choice.noSend": "不发送",
@@ -233,6 +255,7 @@ const CATALOGS = {
     "form.confirm.preset": "保存 {name} API 配置？",
     "form.confirm.provider": "保存 Provider {name}？",
     "form.preview.compat": "Compat：{value}",
+    "form.preview.headerPreset": "Agent 身份预设：{value}",
     "form.preview.headers": "请求头：{value}",
     "form.preview.authorization": "Authorization：{value}",
     "form.value.none": "无",
@@ -286,6 +309,30 @@ function t(key: CatalogKey, vars?: Readonly<Record<string, string | number>>): s
     vars[name] !== undefined ? String(vars[name]) : `{${name}}`);
 }
 
+export interface ApiKeyEntry {
+  /** Stable identifier for this key within the provider. */
+  id: string;
+  /** The API key literal or env/command placeholder. */
+  key: string;
+  /** Whether this key is eligible for selection. */
+  enabled?: boolean;
+  /** Selection weight for weighted policy (>=0; default 1). */
+  weight?: number;
+  /** Runtime failure bookkeeping persisted so a restart remembers recent failures. */
+  failureCount?: number;
+  lastFailureAt?: number;
+  lastFailureStatus?: number;
+  lastUsedAt?: number;
+}
+
+export type ApiKeyPolicy = "sticky" | "round-robin" | "weighted" | "failover";
+
+export const API_KEY_POLICIES: readonly ApiKeyPolicy[] = ["sticky", "round-robin", "weighted", "failover"];
+
+export function isApiKeyPolicy(value: unknown): value is ApiKeyPolicy {
+  return typeof value === "string" && (API_KEY_POLICIES as readonly string[]).includes(value);
+}
+
 export interface ApiProviderSettings {
   /** Provider id used by Pi to qualify models and isolate URL/API key configuration. */
   provider: string;
@@ -297,6 +344,7 @@ export interface ApiProviderSettings {
   reasoning: boolean;
   /** Whether the model supports multimodal input (text + image). Derived from model.input array. */
   multimodal?: boolean;
+  /** Legacy single API key. Kept for backward compatibility; superseded by apiKeys. */
   apiKey: string;
   maxThinking?: boolean;
   /** API protocol. Required for user-defined Providers; presets derive it from PROVIDERS. */
@@ -311,8 +359,16 @@ export interface ApiProviderSettings {
   replaceProviderOptions?: boolean;
   /** Custom request headers for this Provider. */
   headers?: Record<string, string>;
+  /** Agent identity preset whose headers are stamped on requests. "none" clears it. */
+  headerPreset?: AgentHeaderPreset;
   /** Whether to send Authorization: Bearer. Undefined lets pi decide. */
   authHeader?: boolean;
+  /** Multi-key pool. When present and non-empty it takes precedence over the legacy apiKey field. */
+  apiKeys?: ApiKeyEntry[];
+  /** How to pick the active key from apiKeys. */
+  keyPolicy?: ApiKeyPolicy;
+  /** Explicitly pinned active key id; used by sticky and failover policies. */
+  activeKeyId?: string;
 }
 
 /**
@@ -347,6 +403,32 @@ function thinkingFormatOptions(): ReadonlyArray<{ label: string; value?: string 
 export function apiFormatLabel(api: string): string {
   const name = API_FORMAT_NAMES[api];
   return name ? `${name} (${api})` : api;
+}
+
+/** Label keys for the agent identity presets; the record is exhaustive by type. */
+const AGENT_HEADER_PRESET_LABEL_KEYS: Readonly<Record<AgentHeaderPreset, CatalogKey>> = {
+  none: "form.choice.headerPreset.none",
+  "claude-code": "form.choice.headerPreset.claude-code",
+  codex: "form.choice.headerPreset.codex",
+  grok: "form.choice.headerPreset.grok",
+  antigravity: "form.choice.headerPreset.antigravity",
+  opencode: "form.choice.headerPreset.opencode",
+};
+
+function agentHeaderPresetLabel(preset: AgentHeaderPreset): string {
+  return t(AGENT_HEADER_PRESET_LABEL_KEYS[preset]);
+}
+
+function agentHeaderPresetChoices(): ApiModelFormChoice[] {
+  return (Object.keys(AGENT_HEADER_PRESETS) as AgentHeaderPreset[]).map((value) => ({
+    label: agentHeaderPresetLabel(value),
+    value,
+  }));
+}
+
+/** Tolerates a form payload that predates the preset field. */
+function formHeaderPreset(values: ApiModelFormValues): AgentHeaderPreset {
+  return isAgentHeaderPreset(values.headerPreset) ? values.headerPreset : "none";
 }
 
 interface LoadedApiProviderSettings extends ApiProviderSettings {
@@ -384,7 +466,7 @@ export interface ApiRetrySettings {
   maxDelayMs?: number;
 }
 
-export type ApiProviderAction = "cache" | "cache-agent" | "configure" | "delete" | "disable" | "enable" | "enhance" | "export" | "filter" | "import" | "list" | "logout" | "nextsuggest" | "price" | "provider" | "reset" | "retry" | "show" | "stats" | "toggle" | "vision";
+export type ApiProviderAction = "cache" | "cache-agent" | "configure" | "delete" | "disable" | "enable" | "enhance" | "export" | "filter" | "import" | "key" | "list" | "logout" | "nextsuggest" | "price" | "provider" | "reset" | "retry" | "show" | "stats" | "switch-key" | "toggle" | "vision";
 export type ApiThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
 
 export const DEFAULT_THINKING_LEVEL: ApiThinkingLevel = "medium";
@@ -486,6 +568,31 @@ export function registerApiProviderConfigs(
     },
   });
   if (typeof pi.on === "function") {
+    pi.on("after_provider_response", async (event, ctx) => {
+      if (event.status < 400) return;
+      // Only react to auth/quota/server errors that are likely tied to a key.
+      if (![401, 403, 429].includes(event.status) && !(event.status >= 500)) return;
+      const model = ctx.model;
+      if (!model) return;
+      const providerId = model.provider;
+      const root = await readModelsRoot(modelsPath);
+      const providers = isRecord(root.providers) ? root.providers : {};
+      const config = isRecord(providers[providerId]) ? providers[providerId] : {};
+      if (!Array.isArray(config.apiKeys) || config.apiKeys.length === 0) return;
+      const keyPolicy = isApiKeyPolicy(config.keyPolicy) ? config.keyPolicy : "sticky";
+      const resolved = resolveApiKey(config, keyPolicy);
+      if (!resolved || resolved.id === "legacy") return;
+      const switched = await recordApiKeyFailureAndAdvance(providerId, resolved.id, event.status, modelsPath);
+      if (!switched) return;
+      if (hasEnabledProviderSync(providerId, modelsPath)) {
+        pi.registerProvider(providerId, configuredProviderRegistration(providerId, modelsPath));
+        ctx.modelRegistry?.refresh?.();
+      }
+      ctx.ui?.notify?.(
+        `${providerId} key ${resolved.id} failed (HTTP ${event.status}); switched to ${switched.activeKeyId}.`,
+        "warning",
+      );
+    });
     pi.on("session_start", async (_event, ctx) => {
       let migratedLevel: ThinkingLevel | undefined;
       try {
@@ -594,11 +701,15 @@ export async function loadApiProviderSettings(
     // model is never assumed to accept images.
     multimodal: Array.isArray(model?.input) && model.input.includes("image"),
     apiKey: typeof config.apiKey === "string" ? config.apiKey : "",
+    apiKeys: Array.isArray(config.apiKeys) ? config.apiKeys.filter((entry): entry is ApiKeyEntry => isRecord(entry) && typeof entry.id === "string" && typeof entry.key === "string") : undefined,
+    keyPolicy: isApiKeyPolicy(config.keyPolicy) ? config.keyPolicy : undefined,
+    activeKeyId: typeof config.activeKeyId === "string" ? config.activeKeyId : undefined,
     maxThinking: thinkingLevelMap.xhigh === "max" || thinkingLevelMap.max === "max",
     api,
     name: typeof config.name === "string" ? config.name : preset?.name,
     compat,
     headers,
+    headerPreset: isAgentHeaderPreset(config.headerPreset) ? config.headerPreset : "none",
     authHeader: typeof config.authHeader === "boolean" ? config.authHeader : undefined,
     maxTokens: typeof model?.maxTokens === "number"
       ? model.maxTokens
@@ -621,6 +732,9 @@ export async function saveApiProviderSettings(
     reasoning: settings.reasoning,
     multimodal: settings.multimodal,
     apiKey: required(settings.apiKey ?? "", "API key config"),
+    apiKeys: settings.apiKeys && settings.apiKeys.length > 0 ? settings.apiKeys : undefined,
+    keyPolicy: isApiKeyPolicy(settings.keyPolicy) ? settings.keyPolicy : undefined,
+    activeKeyId: settings.activeKeyId?.trim() || undefined,
     maxThinking: settings.maxThinking === true,
     api: settings.api,
     name: settings.name?.trim() || undefined,
@@ -630,6 +744,7 @@ export async function saveApiProviderSettings(
       : positiveInteger(settings.maxTokens, "单次最大输出 maxTokens"),
     replaceProviderOptions: settings.replaceProviderOptions === true,
     headers: settings.headers && Object.keys(settings.headers).length > 0 ? settings.headers : undefined,
+    headerPreset: isAgentHeaderPreset(settings.headerPreset) ? settings.headerPreset : undefined,
     authHeader: settings.authHeader,
   };
   let result: SaveApiProviderResult | undefined;
@@ -1432,7 +1547,7 @@ async function showApiProviderManager(
     if (!target) return;
     const ref = await resolveChannelRef(target, ctx, modelsPath);
     if (!ref) return;
-    await configureProviderConnection(ctx, ref.id, ref.name, modelsPath, defaultsPath);
+    await configureProviderConnection(pi, ctx, ref.id, ref.name, modelsPath, defaultsPath);
     return;
   }
   if (action === "retry") {
@@ -1514,6 +1629,21 @@ async function showApiProviderManager(
       return;
     }
     await showUsageStatsPanel(ctx);
+    return;
+  }
+  if (action === "key" || action === "switch-key") {
+    if (!ctx.hasUI) {
+      ctx.ui.notify(t("manager.actionNeedTui", { action }), "warning");
+      return;
+    }
+    const target = parsed.target ?? await chooseProvider(ctx, modelsPath, defaultsPath);
+    if (!target) return;
+    const ref = await resolveChannelRef(target, ctx, modelsPath);
+    if (!ref) return;
+    const keyArgs = action === "switch-key"
+      ? { subAction: "switch" as const, keyId: parsed.key?.keyId }
+      : parsed.key;
+    await manageProviderKeys(pi, ref.id, ref.name, keyArgs, ctx, modelsPath);
     return;
   }
   if (action === "enable" || action === "disable" || action === "toggle") {
@@ -2465,10 +2595,20 @@ async function configureCustomModelWithForm(
         help: t("form.help.apiKey"),
       },
       {
+        id: "headerPreset",
+        label: t("form.label.headerPreset"),
+        kind: "choice",
+        value: current.headerPreset ?? "none",
+        choices: agentHeaderPresetChoices(),
+      },
+      {
         id: "headers",
         label: t("form.label.headers"),
         kind: "secret",
-        value: JSON.stringify(current.headers ?? {}),
+        // Only user-authored headers are shown: the preset field already carries
+        // its own values, and echoing them here would re-stamp the previous
+        // identity after the user switches preset.
+        value: JSON.stringify(customAgentHeaders(current.headers, current.headerPreset)),
         help: t("form.help.headers"),
       },
       {
@@ -2582,7 +2722,8 @@ async function configureCustomModelWithForm(
   const maxTokens = positiveInteger(formText(result.values, "maxTokens"), t("form.label.maxTokens"));
   validateModelWindow(contextWindow, maxTokens);
   const apiKey = required(formText(result.values, "apiKey"), "API key");
-  const headers = parseHeadersForm(formText(result.values, "headers"));
+  const headerPreset = formHeaderPreset(result.values);
+  const headers = expandAgentHeaderPreset(headerPreset, parseHeadersForm(formText(result.values, "headers"))) ?? {};
   const nextCompat = { ...compat };
   setOptionalCompatString(nextCompat, "thinkingFormat", formText(result.values, "thinkingFormat"));
   setOptionalCompatBoolean(nextCompat, "supportsDeveloperRole", formText(result.values, "supportsDeveloperRole"));
@@ -2611,6 +2752,7 @@ async function configureCustomModelWithForm(
           ? JSON.stringify(nextCompat)
           : t("form.choice.auto"),
       }),
+      t("form.preview.headerPreset", { value: agentHeaderPresetLabel(headerPreset) }),
       t("form.preview.headers", {
         value: Object.keys(headers).length > 0 ? Object.keys(headers).join(", ") : t("form.value.none"),
       }),
@@ -2640,6 +2782,7 @@ async function configureCustomModelWithForm(
       compat: Object.keys(nextCompat).length > 0 ? nextCompat : undefined,
       replaceProviderOptions: true,
       headers: Object.keys(headers).length > 0 ? headers : undefined,
+      headerPreset,
       authHeader,
     };
     saveResult = await saveApiProviderSettings(next, modelsPath);
@@ -2914,12 +3057,15 @@ import {
   saveModelThinkingDefault,
   serializeMutation,
   setPiThinkingLevel,
+  recordApiKeyFailureAndAdvance,
+  resolveApiKey,
   showProvider,
   syncEffortStatus,
   toggleProvider,
   validateModelWindow,
   writeApiProviderSettings,
   writeModelsRoot,
+  manageProviderKeys,
 } from "./api-provider-ops.ts";
 import type { CacheAgentManagerArgs, CacheManagerArgs, ConfigureModelTarget, RetryManagerArgs } from "./api-provider-ops.ts";
 import { showUsageStatsPanel } from "./usage-stats-panel.ts";

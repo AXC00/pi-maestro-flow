@@ -496,6 +496,21 @@ test("agent header presets cover supported agent identities", () => {
   assert.match(AGENT_HEADER_PRESETS["antigravity"]["User-Agent"], /^antigravity\//);
 });
 
+// The ChatGPT Codex backend 404s when the originator and the leading User-Agent
+// segment disagree, or when `version` disagrees with the User-Agent version
+// segment or falls below the 0.144.0 floor.
+test("codex header preset keeps originator, User-Agent, and version consistent", () => {
+  const preset = AGENT_HEADER_PRESETS.codex as Record<string, string>;
+  const userAgent = preset["User-Agent"] ?? "";
+  const match = /^(?<originator>[^/\s]+)\/(?<version>[^\s]+) /.exec(userAgent);
+  assert.ok(match?.groups, `unexpected Codex User-Agent shape: ${userAgent}`);
+  assert.equal(preset.originator, match.groups.originator);
+  assert.equal(preset.version, match.groups.version);
+  const [major, minor] = match.groups.version.split(".").map(Number);
+  assert.ok((major ?? 0) > 0 || (minor ?? 0) >= 144, `version below the 0.144.0 floor: ${match.groups.version}`);
+  assert.equal(preset["OpenAI-Beta"], "responses=experimental");
+});
+
 test("api manager commit syncs new custom providers into api-manager.json managedProviders", async () => {
   const { provider, modelsPath, defaultsPath, context } = harness(
     { providers: {} },
@@ -554,4 +569,84 @@ test("api manager commit appends to existing managedProviders without duplicatin
 
   const defaults = JSON.parse(readFileSync(defaultsPath, "utf8")) as { managedProviders?: string[] };
   assert.deepEqual(defaults.managedProviders, ["existing-vendor"], "existing managed id kept without duplication");
+});
+
+test("api manager read masks apiKeys and commit preserves plaintext keys", async () => {
+  const { provider, modelsPath, context } = harness({
+    providers: {
+      "multi-key": {
+        baseUrl: "https://gateway.example.com/v1",
+        api: "openai-responses",
+        apiKeys: [
+          { id: "a", key: "sk-a", weight: 2 },
+          { id: "b", key: "sk-b" },
+        ],
+        keyPolicy: "round-robin",
+        activeKeyId: "a",
+        models: [{ id: "gpt-5.6" }],
+      },
+    },
+  });
+  const snapshot = await provider.read({ context });
+  const providers = snapshot.effective.values.find((entry) => entry.key === "api.providers")?.value as Array<Record<string, unknown>>;
+  const multi = providers.find((entry) => entry.id === "multi-key")!;
+  const keys = multi.apiKeys as Array<Record<string, unknown>>;
+  assert.equal(keys[0].key, SETTINGS_SECRET_SET_PLACEHOLDER, "api key pool values are masked on read");
+  assert.equal(keys[0].weight, 2, "key metadata is preserved");
+  assert.equal(multi.keyPolicy, "round-robin");
+  assert.equal(multi.activeKeyId, "a");
+
+  // Simulate a baseUrl-only edit: the editor echoes back the masked pool.
+  const transactionId = "tx-multi-key";
+  const prepared = await provider.prepare!({
+    context,
+    transactionId,
+    changes: [{
+      operation: "set" as const,
+      key: "api.providers",
+      scope: "global" as const,
+      value: [{
+        id: "multi-key",
+        baseUrl: "https://gateway.example.com/v2",
+        api: "openai-responses",
+        enabled: true,
+        apiKey: null,
+        apiKeys: keys,
+        keyPolicy: "round-robin",
+        activeKeyId: "a",
+      }],
+    }],
+  });
+  assert.equal(prepared.prepared, true);
+  await provider.commit!({ context, transactionId, prepareToken: prepared.prepareToken! });
+  const written = JSON.parse(readFileSync(modelsPath, "utf8")) as Record<string, any>;
+  const writtenKeys = written.providers["multi-key"].apiKeys as Array<Record<string, unknown>>;
+  assert.equal(writtenKeys[0].key, "sk-a", "plaintext keys are restored from previous config");
+  assert.equal(writtenKeys[1].key, "sk-b");
+  assert.equal(written.providers["multi-key"].keyPolicy, "round-robin");
+  assert.equal(written.providers["multi-key"].activeKeyId, "a");
+});
+
+test("api manager validate rejects malformed apiKeys", async () => {
+  const { provider, context } = harness({
+    providers: {
+      "multi-key": {
+        baseUrl: "https://gateway.example.com/v1",
+        api: "openai-responses",
+        apiKeys: [{ id: "a", key: "sk-a" }],
+        models: [{ id: "gpt-5.6" }],
+      },
+    },
+  });
+  const invalid = await provider.validate!({
+    context,
+    changes: [{
+      operation: "set" as const,
+      key: "api.providers",
+      scope: "global" as const,
+      value: [{ id: "multi-key", apiKeys: [{ id: "", key: "sk-a" }], keyPolicy: "bogus" }],
+    }],
+  });
+  assert.equal(invalid.valid, false);
+  assert.equal(invalid.issues[0]?.code, "invalid-apiKeys");
 });

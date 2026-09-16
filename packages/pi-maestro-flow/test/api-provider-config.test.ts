@@ -28,6 +28,10 @@ async function createModelRegistry(credentials: unknown, modelsPath: string) {
   return new ModelRegistry(await ModelRuntime.create({ credentials, modelsPath }));
 }
 import {
+  AGENT_HEADER_PRESETS,
+  customAgentHeaders,
+} from "../src/providers/agent-header-presets.ts";
+import {
   DEFAULT_KEEP_RECENT_TOKENS,
   DEFAULT_RESERVE_TOKENS,
   DEFAULT_SOFT_COMPACTION,
@@ -1338,6 +1342,180 @@ test("/api-manager custom form preserves advanced parameters and unknown compat 
   const settings = JSON.parse(readFileSync(join(tempDir, "settings.json"), "utf8"));
   assert.equal(settings.modelThinkingLevels["advanced-proxy/attempted-custom-rename"], "medium");
   assert.equal(settings.modelThinkingLevels["advanced-proxy/advanced-model"], undefined);
+});
+
+/**
+ * Drive /api-manager's custom-Provider model form with a fixed payload. The
+ * form is the only surface where the agent identity preset is selectable, so
+ * these tests exercise the real select -> form -> save path.
+ */
+async function submitCustomProviderForm(
+  tempDir: string,
+  modelsPath: string,
+  defaultsPath: string,
+  providerId: string,
+  modelId: string,
+  overrides: Record<string, unknown>,
+): Promise<void> {
+  const existing = existsSync(modelsPath)
+    ? (JSON.parse(readFileSync(modelsPath, "utf8")).providers ?? {})[providerId]
+    : undefined;
+  if (!existing) {
+    await saveApiProviderSettings({
+      provider: providerId,
+      name: providerId,
+      api: "openai-completions",
+      baseUrl: "https://relay.example.com/v1",
+      modelId,
+      contextWindow: 200_000,
+      maxTokens: 32_000,
+      reasoning: true,
+      apiKey: "relay-secret",
+    }, modelsPath);
+  }
+  const commands = new Map<string, any>();
+  registerApiProviderConfigs({
+    registerProvider() {},
+    registerCommand(name: string, command: any) { commands.set(name, command); },
+    setThinkingLevel() {},
+  } as any, { modelsPath, defaultsPath });
+  await commands.get("api-manager").handler(`set ${providerId}`, {
+    cwd: tempDir,
+    hasUI: true,
+    modelRegistry: { refresh() {}, getAll() { return []; } },
+    ui: {
+      // configureCustomChannel asks for the Provider ID before opening the form.
+      async input(_title: string, initial: string) { return initial; },
+      async select(_title: string, options: string[]) {
+        return options.find((option) => option === modelId) ?? options[0];
+      },
+      async custom() {
+        return {
+          values: {
+            provider: providerId,
+            api: "openai-completions",
+            name: providerId,
+            baseUrl: "https://relay.example.com/v1",
+            modelId,
+            reasoning: true,
+            defaultThinking: "medium",
+            contextWindow: "200000",
+            maxTokens: "32000",
+            thinkingFormat: "",
+            supportsDeveloperRole: "",
+            supportsReasoningEffort: "",
+            maxTokensField: "",
+            headers: "{}",
+            authHeader: "auto",
+            apiKey: "relay-secret",
+            ...overrides,
+          },
+        };
+      },
+      async confirm() { return true; },
+      notify() {},
+    },
+  });
+}
+
+const CODEX_PRESET = AGENT_HEADER_PRESETS.codex as Record<string, string>;
+
+test("/api-manager custom form stamps the selected agent identity preset onto the provider", async (t) => {
+  const tempDir = mkdtempSync(join(tmpdir(), "pi-api-provider-preset-select-"));
+  t.after(() => rmSync(tempDir, { recursive: true, force: true }));
+  const modelsPath = join(tempDir, "models.json");
+  const defaultsPath = join(tempDir, "api-manager.json");
+
+  await submitCustomProviderForm(tempDir, modelsPath, defaultsPath, "relay", "relay-model", {
+    headerPreset: "codex",
+    headers: "{\"X-Title\":\"pi\"}",
+  });
+
+  const saved = JSON.parse(readFileSync(modelsPath, "utf8")).providers.relay;
+  assert.equal(saved.headerPreset, "codex");
+  // The preset supplies the identity, the JSON field supplies the extras.
+  assert.deepEqual(saved.headers, { ...CODEX_PRESET, "X-Title": "pi" });
+  assert.equal(saved.headers.originator, "codex-tui");
+  assert.equal(saved.headers.version, "0.146.0");
+});
+
+test("/api-manager custom form lets a custom header override the selected preset", async (t) => {
+  const tempDir = mkdtempSync(join(tmpdir(), "pi-api-provider-preset-override-"));
+  t.after(() => rmSync(tempDir, { recursive: true, force: true }));
+  const modelsPath = join(tempDir, "models.json");
+  const defaultsPath = join(tempDir, "api-manager.json");
+
+  await submitCustomProviderForm(tempDir, modelsPath, defaultsPath, "relay", "relay-model", {
+    headerPreset: "codex",
+    headers: JSON.stringify({ originator: "my-gateway" }),
+  });
+
+  const saved = JSON.parse(readFileSync(modelsPath, "utf8")).providers.relay;
+  assert.equal(saved.headerPreset, "codex");
+  assert.equal(saved.headers.originator, "my-gateway");
+  // Untouched preset values still come from the preset.
+  assert.equal(saved.headers.version, CODEX_PRESET.version);
+});
+
+// An unmodified preset value must not survive as if it were user-authored, or
+// switching the preset would leave the previous identity's headers behind.
+test("/api-manager custom form drops the previous identity when the preset changes", async (t) => {
+  const tempDir = mkdtempSync(join(tmpdir(), "pi-api-provider-preset-switch-"));
+  t.after(() => rmSync(tempDir, { recursive: true, force: true }));
+  const modelsPath = join(tempDir, "models.json");
+  const defaultsPath = join(tempDir, "api-manager.json");
+
+  await submitCustomProviderForm(tempDir, modelsPath, defaultsPath, "relay", "relay-model", {
+    headerPreset: "codex",
+    headers: "{\"X-Title\":\"pi\"}",
+  });
+
+  // Re-open the form: it must offer only the user-authored headers, so a preset
+  // switch cannot re-stamp the Codex identity.
+  const current = await loadApiProviderSettings("relay", modelsPath, "relay-model");
+  assert.equal(current.headerPreset, "codex");
+  assert.deepEqual(customAgentHeaders(current.headers, current.headerPreset), { "X-Title": "pi" });
+
+  await submitCustomProviderForm(tempDir, modelsPath, defaultsPath, "relay", "relay-model", {
+    headerPreset: "grok",
+    headers: JSON.stringify(customAgentHeaders(current.headers, current.headerPreset)),
+  });
+
+  const saved = JSON.parse(readFileSync(modelsPath, "utf8")).providers.relay;
+  assert.equal(saved.headerPreset, "grok");
+  assert.deepEqual(saved.headers, { ...(AGENT_HEADER_PRESETS.grok as Record<string, string>), "X-Title": "pi" });
+  assert.equal(saved.headers.originator, undefined);
+  assert.equal(saved.headers.version, undefined);
+});
+
+test("/api-manager custom form clears the preset and headers when set to none", async (t) => {
+  const tempDir = mkdtempSync(join(tmpdir(), "pi-api-provider-preset-clear-"));
+  t.after(() => rmSync(tempDir, { recursive: true, force: true }));
+  const modelsPath = join(tempDir, "models.json");
+  const defaultsPath = join(tempDir, "api-manager.json");
+
+  await submitCustomProviderForm(tempDir, modelsPath, defaultsPath, "relay", "relay-model", {
+    headerPreset: "codex",
+    headers: "{\"X-Title\":\"pi\"}",
+  });
+  await submitCustomProviderForm(tempDir, modelsPath, defaultsPath, "relay", "relay-model", {
+    headerPreset: "none",
+    headers: "{}",
+  });
+
+  const saved = JSON.parse(readFileSync(modelsPath, "utf8")).providers.relay;
+  assert.equal(saved.headerPreset, undefined);
+  assert.equal(saved.headers, undefined);
+});
+
+test("customAgentHeaders keeps overridden preset values and drops unmodified ones", () => {
+  const effective = { ...CODEX_PRESET, originator: "my-gateway", "X-Title": "pi" };
+  assert.deepEqual(customAgentHeaders(effective, "codex"), {
+    originator: "my-gateway",
+    "X-Title": "pi",
+  });
+  assert.deepEqual(customAgentHeaders(CODEX_PRESET, "codex"), {});
+  assert.deepEqual(customAgentHeaders(undefined, "none"), {});
 });
 
 test("saveApiProviderSettings renames a model in place and preserves siblings", async (t) => {

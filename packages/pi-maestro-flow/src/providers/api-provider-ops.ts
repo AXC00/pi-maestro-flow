@@ -33,8 +33,16 @@ import { deriveCompactionThreshold, type CompactionThresholdReason } from "../co
 import {
   showApiModelEditor,
   type ApiModelFormChoice,
+  type ApiModelFormField,
   type ApiModelFormValues,
 } from "../tui/api-model-editor.ts";
+import {
+  AGENT_HEADER_PRESETS,
+  customAgentHeaders,
+  expandAgentHeaderPreset,
+  isAgentHeaderPreset,
+  type AgentHeaderPreset,
+} from "./agent-header-presets.ts";
 
 import {
   API_RETRY_MAX_RETRIES,
@@ -54,7 +62,7 @@ import {
   configurePresetModelTarget,
   configureCustomModelTarget,
 } from "./api-provider-config.ts";
-import type { ApiProviderAction, ApiProviderId, ApiProviderSettings, ApiThinkingLevel, ProviderDefaults, SaveApiProviderResult } from "./api-provider-config.ts";
+import { API_KEY_POLICIES, isApiKeyPolicy, type ApiKeyEntry, type ApiKeyPolicy, type ApiProviderAction, type ApiProviderId, type ApiProviderSettings, type ApiThinkingLevel, type ProviderDefaults, type SaveApiProviderResult } from "./api-provider-config.ts";
 import { lookupBuiltinPricing } from "./cost-backfill.ts";
 import { loadVisionDelegationConfig } from "./vision-assist.ts";
 import { getTuiLocale } from "../tui/locale.ts";
@@ -86,6 +94,7 @@ const OPS_CATALOGS = {
     "menu.cache": "Prompt cache policy (current: {value})",
     "menu.cacheAgent": "Agent cache tier (current: {value})",
     "menu.price": "Backfill model pricing (built-in table + OpenRouter)",
+    "menu.key": "Manage API keys (multi-key / switch / policy)",
     "menu.logout": "Sign out a Provider",
     "menu.filter": "Filter models (hide from teammate)",
     "menu.reset": "Reset a Provider",
@@ -96,6 +105,22 @@ const OPS_CATALOGS = {
     "export.done": "Exported {providers} Providers ({models} models)",
     "export.saved": "Export file: {path}",
     "export.secretNote": "The export contains API keys; keep the file safe.",
+    "key.title": "Manage API keys for {provider}",
+    "key.policy": "Key selection policy: {policy}",
+    "key.active": "Active key: {id}",
+    "key.empty": "No multi-key pool configured; this Provider uses the single stored API key.",
+    "key.addPrompt": "Add a new API key",
+    "key.idPrompt": "Key id (unique label)",
+    "key.keyPrompt": "API key",
+    "key.weightPrompt": "Weight for weighted policy (number, default 1)",
+    "key.policyPrompt": "Select key policy",
+    "key.chooseSwitch": "Choose key to activate",
+    "key.switched": "Switched {provider} active key to {id}",
+    "key.added": "Added key {id} to {provider}",
+    "key.removed": "Removed key {id} from {provider}",
+    "key.status.healthy": "healthy",
+    "key.status.cooling": "cooling",
+    "key.status.disabled": "disabled",
     "import.notFound": "Import file not found: {path}",
     "import.invalid": "Invalid import file {path}: {message}",
     "import.done": "Imported {providers} Providers ({models} models) from {path}",
@@ -113,6 +138,52 @@ const OPS_CATALOGS = {
     "threshold.maxOutput": "lowered by max-output protection",
     "threshold.capped": "max output is too large; safe reserve capped at 90% of the window",
     "validation.window": "Max output ({max}) must be smaller than the context window ({window}); otherwise no room remains for input.",
+    "conn.title": "Provider connection · {name}",
+    "conn.section.connection": "Connection (Provider / URL level)",
+    "conn.section.compat": "Compatibility (format level)",
+    "conn.field.providerId": "Provider ID",
+    "conn.field.name": "Provider display name",
+    "conn.field.api": "API format",
+    "conn.field.baseUrl": "Base URL",
+    "conn.field.apiKey": "API key",
+    "conn.field.enabled": "Enabled",
+    "conn.field.headerPreset": "Agent identity preset",
+    "conn.field.headers": "Request headers JSON",
+    "conn.field.authHeader": "Authorization",
+    "conn.field.thinkingFormat": "Thinking format",
+    "conn.field.developerRole": "Developer role",
+    "conn.field.reasoningEffort": "Reasoning effort",
+    "conn.field.maxTokensField": "Output request field",
+    "conn.help.apiKey": "The API key is masked; leave it untouched to preserve the current models.json value.",
+    "conn.help.enabled": "Off unregisters this Provider's models from /model while keeping URL, API key and model config.",
+    "conn.help.headers": "Headers may contain credentials. The form only shows a mask; enter the complete JSON object when editing.",
+    "conn.choice.auto": "Auto",
+    "conn.choice.autoUrl": "Auto (detect from URL)",
+    "conn.choice.bearer": "Bearer",
+    "conn.choice.noSend": "Do not send",
+    "conn.choice.supported": "Supported",
+    "conn.choice.unsupported": "Unsupported",
+    "conn.headerPreset.none": "None (pi default)",
+    "conn.headerPreset.claude-code": "Claude Code CLI",
+    "conn.headerPreset.codex": "Codex CLI",
+    "conn.headerPreset.grok": "Grok CLI",
+    "conn.headerPreset.antigravity": "Antigravity CLI",
+    "conn.headerPreset.opencode": "OpenCode session affinity",
+    "conn.validation.headersJson": "Request headers JSON is invalid",
+    "conn.validation.headersObject": "Request headers must be a JSON object with string keys and values",
+    "conn.validation.apiKeyRequired": "API key is required when no multi-key pool is configured",
+    "conn.confirm": "Save Provider {name} connection?",
+    "conn.preview.provider": "Provider: {value}",
+    "conn.preview.api": "API format: {value}",
+    "conn.preview.baseUrl": "Base URL: {value}",
+    "conn.preview.enabled": "Enabled: {value}",
+    "conn.preview.headerPreset": "Agent identity preset: {value}",
+    "conn.preview.headers": "Headers: {value}",
+    "conn.preview.authorization": "Authorization: {value}",
+    "conn.preview.compat": "Compat: {value}",
+    "conn.preview.modelsKept": "Models: unchanged",
+    "conn.value.none": "none",
+    "conn.saved": "Provider connection updated (models unchanged)",
   },
   "zh-CN": {
     "value.on": "开启",
@@ -129,6 +200,7 @@ const OPS_CATALOGS = {
     "menu.cache": "提示缓存策略（当前：{value}）",
     "menu.cacheAgent": "Agent 缓存档位（当前：{value}）",
     "menu.price": "回填模型价格（内置表 + OpenRouter 在线）",
+    "menu.key": "管理 API Key（多 Key / 切换 / 策略）",
     "menu.logout": "注销 Provider",
     "menu.filter": "模型过滤（屏蔽 teammate 可见模型）",
     "menu.reset": "重置 Provider",
@@ -139,6 +211,22 @@ const OPS_CATALOGS = {
     "export.done": "已导出 {providers} 个 Provider（{models} 个模型）",
     "export.saved": "导出文件：{path}",
     "export.secretNote": "导出文件包含 API key，请妥善保管。",
+    "key.title": "管理 {provider} 的 API Key",
+    "key.policy": "Key 选择策略：{policy}",
+    "key.active": "当前激活：{id}",
+    "key.empty": "未配置多 Key 池；该 Provider 仍使用单个已存 API Key。",
+    "key.addPrompt": "新增 API Key",
+    "key.idPrompt": "Key 标识（唯一标签）",
+    "key.keyPrompt": "API Key",
+    "key.weightPrompt": "加权策略权重（数字，默认 1）",
+    "key.policyPrompt": "选择 Key 策略",
+    "key.chooseSwitch": "选择要激活的 Key",
+    "key.switched": "已将 {provider} 的激活 Key 切换为 {id}",
+    "key.added": "已为 {provider} 添加 Key {id}",
+    "key.removed": "已从 {provider} 移除 Key {id}",
+    "key.status.healthy": "健康",
+    "key.status.cooling": "冷却中",
+    "key.status.disabled": "已禁用",
     "import.notFound": "导入文件不存在：{path}",
     "import.invalid": "导入文件 {path} 无效：{message}",
     "import.done": "已从 {path} 导入 {providers} 个 Provider（{models} 个模型）",
@@ -156,6 +244,52 @@ const OPS_CATALOGS = {
     "threshold.maxOutput": "受单次最大输出保护下调",
     "threshold.capped": "单次最大输出过大，安全预留已封顶为窗口 90%",
     "validation.window": "单次最大输出 maxTokens（{max}）必须小于上下文窗口 contextWindow（{window}）；否则没有空间容纳输入。",
+    "conn.title": "Provider 连接 · {name}",
+    "conn.section.connection": "连接（Provider / URL 级）",
+    "conn.section.compat": "兼容（format 级）",
+    "conn.field.providerId": "Provider ID",
+    "conn.field.name": "Provider 显示名称",
+    "conn.field.api": "API 协议",
+    "conn.field.baseUrl": "Base URL",
+    "conn.field.apiKey": "API key",
+    "conn.field.enabled": "启用",
+    "conn.field.headerPreset": "Agent 身份预设",
+    "conn.field.headers": "请求头 JSON",
+    "conn.field.authHeader": "Authorization",
+    "conn.field.thinkingFormat": "Thinking 格式",
+    "conn.field.developerRole": "Developer 角色",
+    "conn.field.reasoningEffort": "Reasoning effort",
+    "conn.field.maxTokensField": "输出请求字段",
+    "conn.help.apiKey": "API key 仅显示掩码；不编辑即可保留 models.json 中的当前值。",
+    "conn.help.enabled": "关闭后该 Provider 的 models 从 /model 移除，URL、API key 与模型配置保留。",
+    "conn.help.headers": "请求头可能包含凭据，表单仅显示掩码；编辑时需输入完整 JSON 对象。",
+    "conn.choice.auto": "自动",
+    "conn.choice.autoUrl": "自动（按 URL 识别）",
+    "conn.choice.bearer": "Bearer",
+    "conn.choice.noSend": "不发送",
+    "conn.choice.supported": "支持",
+    "conn.choice.unsupported": "不支持",
+    "conn.headerPreset.none": "无（pi 默认）",
+    "conn.headerPreset.claude-code": "Claude Code CLI",
+    "conn.headerPreset.codex": "Codex CLI",
+    "conn.headerPreset.grok": "Grok CLI",
+    "conn.headerPreset.antigravity": "Antigravity CLI",
+    "conn.headerPreset.opencode": "OpenCode 会话路由",
+    "conn.validation.headersJson": "请求头 JSON 无效",
+    "conn.validation.headersObject": "请求头必须是字符串键值的 JSON 对象",
+    "conn.validation.apiKeyRequired": "未配置多 Key 池时 API key 必填",
+    "conn.confirm": "保存 Provider {name} 连接？",
+    "conn.preview.provider": "Provider：{value}",
+    "conn.preview.api": "API 协议：{value}",
+    "conn.preview.baseUrl": "Base URL：{value}",
+    "conn.preview.enabled": "启用状态：{value}",
+    "conn.preview.headerPreset": "Agent 身份预设：{value}",
+    "conn.preview.headers": "请求头：{value}",
+    "conn.preview.authorization": "Authorization：{value}",
+    "conn.preview.compat": "Compat：{value}",
+    "conn.preview.modelsKept": "模型：不变",
+    "conn.value.none": "无",
+    "conn.saved": "已更新 Provider 连接配置（模型未改动）",
   },
 } as const;
 
@@ -583,9 +717,15 @@ export async function writeApiProviderSettings(
     ...currentProvider,
     baseUrl: settings.baseUrl,
     api: defaults.api,
-    apiKey: settings.apiKey,
     models: nextModels,
   };
+  if (settings.apiKeys && settings.apiKeys.length > 0) {
+    nextProvider.apiKeys = settings.apiKeys;
+    delete nextProvider.apiKey;
+  } else {
+    nextProvider.apiKey = settings.apiKey;
+    delete nextProvider.apiKeys;
+  }
   if (defaults.compat) {
     nextProvider.compat = preset
       ? { ...(existingCompat ?? {}), ...defaults.compat }
@@ -603,32 +743,119 @@ export async function writeApiProviderSettings(
   } else if (existingHeaders) {
     nextProvider.headers = existingHeaders;
   }
+  // "none" is an explicit choice, so it clears the stored identity instead of
+  // falling through to the preserved value.
+  if (settings.headerPreset !== undefined) {
+    if (settings.headerPreset === "none") delete nextProvider.headerPreset;
+    else nextProvider.headerPreset = settings.headerPreset;
+  } else if (!preset && settings.replaceProviderOptions) {
+    delete nextProvider.headerPreset;
+  }
   if (settings.authHeader !== undefined) nextProvider.authHeader = settings.authHeader;
   else if (!preset && settings.replaceProviderOptions) delete nextProvider.authHeader;
   providers[settings.provider] = nextProvider;
   return writeModelsRoot({ ...root, providers }, modelsPath, exists);
 }
 
-/** Pick an API format from the given ordered options; returns undefined on cancel. */
-async function chooseApi(
-  ctx: ExtensionCommandContext,
-  apiOptions: readonly string[],
-): Promise<string | undefined> {
-  const labels = apiOptions.map(apiFormatLabel);
-  const choice = await ctx.ui.select("API format", labels);
-  if (!choice) return undefined;
-  return apiOptions.find((candidate) => apiFormatLabel(candidate) === choice)
-    ?? (apiOptions.includes(choice) ? choice : undefined);
+const CONNECTION_THINKING_FORMAT_OPTIONS: ReadonlyArray<{ label: string; value?: string }> = [
+  { label: "自动（按 URL 识别，推荐）" },
+  { label: "openai（reasoning_effort）", value: "openai" },
+  { label: "openrouter（reasoning.effort）", value: "openrouter" },
+  { label: "deepseek（thinking.type · 亦适用 api.z.ai 直连）", value: "deepseek" },
+  { label: "zai（enable_thinking · DashScope 托管 GLM）", value: "zai" },
+  { label: "qwen（enable_thinking）", value: "qwen" },
+  { label: "qwen-chat-template（chat_template_kwargs）", value: "qwen-chat-template" },
+];
+
+const CONNECTION_THINKING_FORMAT_OPTIONS_EN: ReadonlyArray<{ label: string; value?: string }> = [
+  { label: "Auto (detect from URL, recommended)" },
+  { label: "openai (reasoning_effort)", value: "openai" },
+  { label: "openrouter (reasoning.effort)", value: "openrouter" },
+  { label: "deepseek (thinking.type; also direct api.z.ai)", value: "deepseek" },
+  { label: "zai (enable_thinking; DashScope-hosted GLM)", value: "zai" },
+  { label: "qwen (enable_thinking)", value: "qwen" },
+  { label: "qwen-chat-template (chat_template_kwargs)", value: "qwen-chat-template" },
+];
+
+function connectionThinkingFormatOptions(): ReadonlyArray<{ label: string; value?: string }> {
+  return getTuiLocale() === "zh-CN"
+    ? CONNECTION_THINKING_FORMAT_OPTIONS
+    : CONNECTION_THINKING_FORMAT_OPTIONS_EN;
+}
+
+const CONNECTION_HEADER_PRESET_LABEL_KEYS: Readonly<Record<AgentHeaderPreset, OpsCatalogKey>> = {
+  none: "conn.headerPreset.none",
+  "claude-code": "conn.headerPreset.claude-code",
+  codex: "conn.headerPreset.codex",
+  grok: "conn.headerPreset.grok",
+  antigravity: "conn.headerPreset.antigravity",
+  opencode: "conn.headerPreset.opencode",
+};
+
+function connectionHeaderPresetLabel(preset: AgentHeaderPreset): string {
+  return opsText(CONNECTION_HEADER_PRESET_LABEL_KEYS[preset]);
+}
+
+function connectionHeaderPresetChoices(): ApiModelFormChoice[] {
+  return (Object.keys(AGENT_HEADER_PRESETS) as AgentHeaderPreset[]).map((value) => ({
+    label: connectionHeaderPresetLabel(value),
+    value,
+  }));
+}
+
+function connectionTriStateChoices(): ApiModelFormChoice[] {
+  return [
+    { label: opsText("conn.choice.auto"), value: "auto" },
+    { label: opsText("conn.choice.supported"), value: "true" },
+    { label: opsText("conn.choice.unsupported"), value: "false" },
+  ];
+}
+
+function connectionTriStateValue(value: unknown): string {
+  return typeof value === "boolean" ? String(value) : "auto";
+}
+
+function connectionFormText(values: ApiModelFormValues, id: string): string {
+  const value = values[id];
+  return typeof value === "string" ? value : "";
+}
+
+function connectionFormChoicesWithCurrent(current: string, choices: readonly ApiModelFormChoice[]): ApiModelFormChoice[] {
+  return choices.some((choice) => choice.value === current)
+    ? [...choices]
+    : [{ label: `${current}（当前）`, value: current }, ...choices];
+}
+
+function parseConnectionHeadersForm(value: string): Record<string, string> {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(value || "{}");
+  } catch {
+    throw new Error(opsText("conn.validation.headersJson"));
+  }
+  if (!isStringRecord(parsed)) throw new Error(opsText("conn.validation.headersObject"));
+  return { ...parsed };
+}
+
+function setOptionalConnectionCompatString(target: Record<string, unknown>, key: string, value: string): void {
+  if (value) target[key] = value;
+  else delete target[key];
+}
+
+function setOptionalConnectionCompatBoolean(target: Record<string, unknown>, key: string, value: string): void {
+  if (value === "auto") delete target[key];
+  else target[key] = value === "true";
 }
 
 /**
  * Manage a Provider's connection-level fields only — Base URL, API format, API
- * key, headers, auth header, compat and display name — without touching its
- * models. Lets a user set up a Provider's connection once and then add models
- * (manually or via discovery) repeatedly, instead of re-entering the URL/key
- * on every model. Presets use their fixed API; customs pick from KNOWN_APIS.
+ * key, enabled state, headers, auth header, compat and display name — without
+ * touching its models. Uses the same overlay form as the model editor so the
+ * whole connection is edited in one pass. Presets use their fixed API; customs
+ * pick from KNOWN_APIS.
  */
 export async function configureProviderConnection(
+  pi: ExtensionAPI,
   ctx: ExtensionCommandContext,
   providerId: string,
   displayName: string,
@@ -637,90 +864,199 @@ export async function configureProviderConnection(
 ): Promise<void> {
   const preset = findPreset(providerId);
   const current = await loadApiProviderSettings(providerId, modelsPath, null);
-  const apiOptions = preset
-    ? [preset.api]
-    : (current.api && KNOWN_APIS.includes(current.api)
-      ? [current.api, ...KNOWN_APIS.filter((api) => api !== current.api)]
-      : [...KNOWN_APIS]);
-  const api = apiOptions.length === 1
-    ? preset!.api
-    : await chooseApi(ctx, apiOptions);
-  if (!api) return;
+  const currentEnabled = await isProviderEnabled(providerId, modelsPath);
+  const currentApi = preset?.api ?? current.api ?? "openai-completions";
+  const compat = current.compat ?? {};
+  const fields: ApiModelFormField[] = [
+    { id: "connection-section", label: opsText("conn.section.connection"), kind: "section", value: "" },
+    { id: "providerId", label: opsText("conn.field.providerId"), kind: "readonly", value: providerId },
+    { id: "name", label: opsText("conn.field.name"), kind: "text", value: current.name ?? displayName },
+    preset
+      ? { id: "api", label: opsText("conn.field.api"), kind: "readonly", value: apiFormatLabel(preset.api) }
+      : {
+        id: "api",
+        label: opsText("conn.field.api"),
+        kind: "choice",
+        value: currentApi,
+        choices: connectionFormChoicesWithCurrent(
+          currentApi,
+          KNOWN_APIS.map((api) => ({ label: apiFormatLabel(api), value: api })),
+        ),
+      },
+    { id: "baseUrl", label: opsText("conn.field.baseUrl"), kind: "text", value: current.baseUrl },
+    {
+      id: "apiKey",
+      label: opsText("conn.field.apiKey"),
+      kind: "secret",
+      value: current.apiKey,
+      help: opsText("conn.help.apiKey"),
+    },
+    {
+      id: "enabled",
+      label: opsText("conn.field.enabled"),
+      kind: "toggle",
+      value: currentEnabled,
+      help: opsText("conn.help.enabled"),
+    },
+    {
+      id: "headerPreset",
+      label: opsText("conn.field.headerPreset"),
+      kind: "choice",
+      value: current.headerPreset ?? "none",
+      choices: connectionHeaderPresetChoices(),
+    },
+    {
+      id: "headers",
+      label: opsText("conn.field.headers"),
+      kind: "secret",
+      // Only user-authored headers are shown: the preset field already carries
+      // its own values, and echoing them here would re-stamp the previous
+      // identity after the user switches preset.
+      value: JSON.stringify(customAgentHeaders(current.headers, current.headerPreset)),
+      help: opsText("conn.help.headers"),
+    },
+    {
+      id: "authHeader",
+      label: opsText("conn.field.authHeader"),
+      kind: "choice",
+      value: connectionTriStateValue(current.authHeader),
+      choices: [
+        { label: opsText("conn.choice.auto"), value: "auto" },
+        { label: opsText("conn.choice.bearer"), value: "true" },
+        { label: opsText("conn.choice.noSend"), value: "false" },
+      ],
+    },
+    { id: "compat-section", label: opsText("conn.section.compat"), kind: "section", value: "" },
+    {
+      id: "thinkingFormat",
+      label: opsText("conn.field.thinkingFormat"),
+      kind: "choice",
+      value: typeof compat.thinkingFormat === "string" ? compat.thinkingFormat : "",
+      choices: connectionFormChoicesWithCurrent(
+        typeof compat.thinkingFormat === "string" ? compat.thinkingFormat : "",
+        [{ label: opsText("conn.choice.autoUrl"), value: "" }, ...connectionThinkingFormatOptions().flatMap((entry) =>
+          entry.value ? [{ label: entry.label, value: entry.value }] : []
+        )],
+      ),
+    },
+    {
+      id: "supportsDeveloperRole",
+      label: opsText("conn.field.developerRole"),
+      kind: "choice",
+      value: connectionTriStateValue(compat.supportsDeveloperRole),
+      choices: connectionTriStateChoices(),
+    },
+    {
+      id: "supportsReasoningEffort",
+      label: opsText("conn.field.reasoningEffort"),
+      kind: "choice",
+      value: connectionTriStateValue(compat.supportsReasoningEffort),
+      choices: connectionTriStateChoices(),
+    },
+    {
+      id: "maxTokensField",
+      label: opsText("conn.field.maxTokensField"),
+      kind: "choice",
+      value: typeof compat.maxTokensField === "string" ? compat.maxTokensField : "",
+      choices: connectionFormChoicesWithCurrent(
+        typeof compat.maxTokensField === "string" ? compat.maxTokensField : "",
+        [
+          { label: opsText("conn.choice.auto"), value: "" },
+          { label: "max_completion_tokens", value: "max_completion_tokens" },
+          { label: "max_tokens", value: "max_tokens" },
+        ],
+      ),
+    },
+  ];
+  const result = await showApiModelEditor(ctx, {
+    title: opsText("conn.title", { name: displayName }),
+    locale: getTuiLocale(),
+    fields,
+    validate: (values) => {
+      const errors: string[] = [];
+      try {
+        normalizeBaseUrl(connectionFormText(values, "baseUrl"));
+      } catch (error) {
+        errors.push(errorMessage(error));
+      }
+      const apiKey = connectionFormText(values, "apiKey");
+      if (!apiKey && !current.apiKey && !(current.apiKeys && current.apiKeys.length > 0)) {
+        errors.push(opsText("conn.validation.apiKeyRequired"));
+      }
+      try {
+        parseConnectionHeadersForm(connectionFormText(values, "headers"));
+      } catch (error) {
+        errors.push(errorMessage(error));
+      }
+      return errors;
+    },
+  });
+  if (!result) return;
 
-  const nameInput = await ctx.ui.input("Provider 显示名称", current.name ?? displayName);
-  if (nameInput === undefined) return;
-  const nextName = nameInput.trim() || providerId;
-
-  const baseUrlInput = await ctx.ui.input(`${nextName} Base URL`, current.baseUrl);
-  if (baseUrlInput === undefined) return;
-  const baseUrl = normalizeBaseUrl(baseUrlInput);
-
-  const apiKeyInput = await ctx.ui.input(
-    `${nextName} API key`,
-    current.apiKey ? current.apiKey : "",
-  );
-  if (apiKeyInput === undefined) return;
-  const apiKey = required(apiKeyInput, "API key");
-
-  // Headers: collected as a JSON object string, mirroring the custom-model step flow.
-  const addHeaders = await ctx.ui.confirm(
-    "配置自定义请求头？",
-    "例如 OpenRouter 的 HTTP-Referer / X-Title，或 anthropic-version。留空 name 结束。",
-  );
-  const headers: Record<string, string> = {};
-  if (addHeaders) {
-    while (true) {
-      const headerNameInput = await ctx.ui.input("请求头 name（留空结束）", "");
-      if (headerNameInput === undefined) return;
-      const headerName = headerNameInput.trim();
-      if (!headerName) break;
-      const headerValueInput = await ctx.ui.input(`请求头 "${headerName}" 的值`, "");
-      if (headerValueInput === undefined) return;
-      headers[headerName] = headerValueInput;
-    }
-  }
-  if (Object.keys(headers).length === 0 && isStringRecord(current.headers)) {
-    Object.assign(headers, current.headers);
-  }
-
-  const authChoice = await ctx.ui.select(
-    "Authorization 头",
-    ["自动", "强制 Bearer（authHeader=true）", "不发 Bearer（authHeader=false）"],
-  );
-  if (!authChoice) return;
-  const authHeader = authChoice === "自动" ? undefined : authChoice.startsWith("强制");
+  const nextName = connectionFormText(result.values, "name").trim() || providerId;
+  const api = preset ? preset.api : required(connectionFormText(result.values, "api"), "API format");
+  const baseUrl = normalizeBaseUrl(connectionFormText(result.values, "baseUrl"));
+  const apiKey = connectionFormText(result.values, "apiKey");
+  const enabled = result.values.enabled === true;
+  const headerPreset = isAgentHeaderPreset(result.values.headerPreset) ? result.values.headerPreset : "none";
+  const headers = expandAgentHeaderPreset(headerPreset, parseConnectionHeadersForm(connectionFormText(result.values, "headers"))) ?? {};
+  const nextCompat = { ...compat };
+  setOptionalConnectionCompatString(nextCompat, "thinkingFormat", connectionFormText(result.values, "thinkingFormat"));
+  setOptionalConnectionCompatBoolean(nextCompat, "supportsDeveloperRole", connectionFormText(result.values, "supportsDeveloperRole"));
+  setOptionalConnectionCompatBoolean(nextCompat, "supportsReasoningEffort", connectionFormText(result.values, "supportsReasoningEffort"));
+  setOptionalConnectionCompatString(nextCompat, "maxTokensField", connectionFormText(result.values, "maxTokensField"));
+  const authHeaderValue = connectionFormText(result.values, "authHeader");
+  const authHeader = authHeaderValue === "auto" ? undefined : authHeaderValue === "true";
 
   const confirmed = await ctx.ui.confirm(
-    `保存 Provider ${nextName} 连接？`,
+    opsText("conn.confirm", { name: nextName }),
     [
-      `Provider ID：${providerId}`,
-      `API format：${apiFormatLabel(api)}`,
-      `Base URL：${baseUrl}`,
-      `请求头：${Object.keys(headers).length > 0 ? Object.keys(headers).join(", ") : "无"}`,
-      `Authorization：${authHeader === undefined ? "自动" : authHeader ? "Bearer" : "关闭"}`,
-      "Auth：stored API key",
-      "（模型配置不变）",
+      opsText("conn.preview.provider", { value: providerId }),
+      opsText("conn.preview.api", { value: apiFormatLabel(api) }),
+      opsText("conn.preview.baseUrl", { value: baseUrl }),
+      opsText("conn.preview.enabled", { value: enabled ? opsText("value.on") : opsText("value.off") }),
+      opsText("conn.preview.headerPreset", { value: connectionHeaderPresetLabel(headerPreset) }),
+      opsText("conn.preview.headers", {
+        value: Object.keys(headers).length > 0 ? Object.keys(headers).join(", ") : opsText("conn.value.none"),
+      }),
+      opsText("conn.preview.authorization", {
+        value: authHeader === undefined
+          ? opsText("conn.choice.auto")
+          : authHeader ? opsText("conn.choice.bearer") : opsText("conn.choice.noSend"),
+      }),
+      opsText("conn.preview.compat", {
+        value: Object.keys(nextCompat).length > 0 ? JSON.stringify(nextCompat) : opsText("conn.choice.auto"),
+      }),
+      opsText("conn.preview.modelsKept"),
     ].join("\n"),
   );
   if (!confirmed) return;
 
-  let result: SaveApiProviderResult | undefined;
+  let writeResult: SaveApiProviderResult | undefined;
   await serializeMutation(modelsPath, async () => {
     const exists = await fileExists(modelsPath);
     const root = await readModelsRoot(modelsPath);
     const providers = isRecord(root.providers) ? { ...root.providers } : {};
     const entry = isRecord(providers[providerId]) ? { ...providers[providerId] } : {};
-    // Preserve models[] and enabled; overwrite only connection-level fields.
-    const nextProvider: Record<string, unknown> = { ...entry, baseUrl, api, apiKey };
+    // Preserve models[] and unmanaged fields; overwrite only connection-level fields.
+    const nextProvider: Record<string, unknown> = { ...entry, baseUrl, api, enabled };
     nextProvider.name = nextName;
+    if (apiKey) nextProvider.apiKey = apiKey;
+    else if (!(Array.isArray(entry.apiKeys) && entry.apiKeys.length > 0)) delete nextProvider.apiKey;
+    if (headerPreset !== "none") nextProvider.headerPreset = headerPreset;
+    else delete nextProvider.headerPreset;
     if (Object.keys(headers).length > 0) nextProvider.headers = { ...headers };
     else delete nextProvider.headers;
     if (authHeader !== undefined) nextProvider.authHeader = authHeader;
+    else delete nextProvider.authHeader;
+    if (Object.keys(nextCompat).length > 0) nextProvider.compat = nextCompat;
+    else delete nextProvider.compat;
     providers[providerId] = nextProvider;
-    result = await writeModelsRoot({ ...root, providers }, modelsPath, exists);
+    writeResult = await writeModelsRoot({ ...root, providers }, modelsPath, exists);
   });
-  if (!result) throw new Error("API Provider connection was not written");
-  notifySaved(ctx, nextName, result, "已更新 Provider 连接配置（模型未改动）");
+  if (!writeResult) throw new Error("API Provider connection was not written");
+  reloadProviderRegistration(pi, ctx, providerId, modelsPath);
+  notifySaved(ctx, nextName, writeResult, opsText("conn.saved"));
 }
 
 export async function writeModelsRoot(
@@ -807,6 +1143,236 @@ export async function readModelsRoot(modelsPath: string): Promise<Record<string,
     }
     throw error;
   }
+}
+
+export interface ApiKeyRuntimeState {
+  id: string;
+  key: string;
+  enabled: boolean;
+  weight: number;
+  failureCount: number;
+  lastFailureAt?: number;
+  lastFailureStatus?: number;
+  lastUsedAt?: number;
+}
+
+export interface ResolvedApiKey {
+  id: string;
+  key: string;
+}
+
+const DEFAULT_KEY_WEIGHT = 1;
+const KEY_FAILURE_COOLDOWN_MS = 60_000;
+
+function isApiKeyEntryLocal(value: unknown): value is ApiKeyEntry {
+  return isRecord(value)
+    && typeof value.id === "string"
+    && value.id.length > 0
+    && typeof value.key === "string";
+}
+
+function sanitizeApiKeyEntry(entry: ApiKeyEntry): ApiKeyRuntimeState {
+  return {
+    id: entry.id,
+    key: entry.key,
+    enabled: entry.enabled !== false,
+    weight: typeof entry.weight === "number" && Number.isFinite(entry.weight) && entry.weight >= 0
+      ? entry.weight
+      : DEFAULT_KEY_WEIGHT,
+    failureCount: typeof entry.failureCount === "number" && entry.failureCount >= 0
+      ? entry.failureCount
+      : 0,
+    lastFailureAt: typeof entry.lastFailureAt === "number" ? entry.lastFailureAt : undefined,
+    lastFailureStatus: typeof entry.lastFailureStatus === "number" ? entry.lastFailureStatus : undefined,
+    lastUsedAt: typeof entry.lastUsedAt === "number" ? entry.lastUsedAt : undefined,
+  };
+}
+
+export function readApiKeys(config: Record<string, unknown>): ApiKeyRuntimeState[] {
+  if (!Array.isArray(config.apiKeys)) return [];
+  return config.apiKeys.filter(isApiKeyEntryLocal).map(sanitizeApiKeyEntry);
+}
+
+export function resolveApiKey(
+  config: Record<string, unknown>,
+  policy: ApiKeyPolicy = "sticky",
+): ResolvedApiKey | undefined {
+  const keys = readApiKeys(config);
+  if (keys.length === 0) {
+    if (typeof config.apiKey === "string" && config.apiKey.length > 0) {
+      return { id: "legacy", key: config.apiKey };
+    }
+    return undefined;
+  }
+  const enabled = keys.filter((key) => key.enabled);
+  if (enabled.length === 0) return undefined;
+  const activeId = typeof config.activeKeyId === "string" ? config.activeKeyId : undefined;
+  switch (policy) {
+    case "sticky":
+      return pickSticky(enabled, activeId) ?? pickKey(enabled[0]);
+    case "round-robin":
+      return pickRoundRobin(enabled, activeId);
+    case "weighted":
+      return pickWeighted(enabled);
+    case "failover":
+      return pickFailover(enabled, activeId);
+    default:
+      return pickKey(enabled[0]);
+  }
+}
+
+function pickKey(key: ApiKeyRuntimeState): ResolvedApiKey {
+  return { id: key.id, key: key.key };
+}
+
+function pickSticky(keys: ApiKeyRuntimeState[], activeId?: string): ResolvedApiKey | undefined {
+  if (activeId) {
+    const found = keys.find((key) => key.id === activeId);
+    if (found) return pickKey(found);
+  }
+  return undefined;
+}
+
+function pickRoundRobin(keys: ApiKeyRuntimeState[], activeId?: string): ResolvedApiKey {
+  if (!activeId) return pickKey(keys[0]);
+  const index = keys.findIndex((key) => key.id === activeId);
+  const next = keys[(index + 1) % keys.length];
+  return pickKey(next);
+}
+
+function pickWeighted(keys: ApiKeyRuntimeState[]): ResolvedApiKey {
+  const total = keys.reduce((sum, key) => sum + key.weight, 0);
+  if (total <= 0) return pickKey(keys[0]);
+  let point = Math.random() * total;
+  for (const key of keys) {
+    point -= key.weight;
+    if (point <= 0) return pickKey(key);
+  }
+  return pickKey(keys[keys.length - 1]);
+}
+
+function pickFailover(keys: ApiKeyRuntimeState[], activeId?: string): ResolvedApiKey {
+  if (activeId) {
+    const active = keys.find((key) => key.id === activeId);
+    if (active && active.enabled && !isKeyCooling(active)) {
+      return pickKey(active);
+    }
+  }
+  const healthy = keys.filter((key) => !isKeyCooling(key));
+  if (healthy.length === 0) {
+    const sorted = [...keys].sort((a, b) => {
+      if (a.failureCount !== b.failureCount) return a.failureCount - b.failureCount;
+      return (a.lastFailureAt ?? 0) - (b.lastFailureAt ?? 0);
+    });
+    return pickKey(sorted[0]);
+  }
+  const sorted = healthy.sort((a, b) => {
+    if (a.failureCount !== b.failureCount) return a.failureCount - b.failureCount;
+    return (a.lastUsedAt ?? 0) - (b.lastUsedAt ?? 0);
+  });
+  return pickKey(sorted[0]);
+}
+
+function isKeyCooling(key: ApiKeyRuntimeState): boolean {
+  if (key.failureCount === 0) return false;
+  const last = key.lastFailureAt;
+  if (!last) return false;
+  return Date.now() - last < KEY_FAILURE_COOLDOWN_MS * Math.min(key.failureCount, 5);
+}
+
+export function markApiKeyFailed(
+  config: Record<string, unknown>,
+  keyId: string,
+  status?: number,
+): ApiKeyEntry[] | undefined {
+  if (!Array.isArray(config.apiKeys)) return undefined;
+  let changed = false;
+  const next = (config.apiKeys as unknown[]).map((entry) => {
+    if (!isApiKeyEntryLocal(entry) || entry.id !== keyId) return entry;
+    changed = true;
+    return {
+      ...entry,
+      failureCount: (entry.failureCount ?? 0) + 1,
+      lastFailureAt: Date.now(),
+      lastFailureStatus: status ?? entry.lastFailureStatus,
+    };
+  });
+  return changed ? next as ApiKeyEntry[] : undefined;
+}
+
+export function advanceApiKey(
+  config: Record<string, unknown>,
+  policy: ApiKeyPolicy = "sticky",
+  excludeKeyId?: string,
+): { apiKeys: ApiKeyEntry[]; activeKeyId: string } | undefined {
+  const keys = readApiKeys(config);
+  if (keys.length === 0) return undefined;
+  const enabled = keys.filter((key) => key.enabled);
+  if (enabled.length === 0) return undefined;
+  const currentId = typeof config.activeKeyId === "string" ? config.activeKeyId : undefined;
+  if (policy === "round-robin") {
+    const index = enabled.findIndex((key) => key.id === currentId);
+    const nextIndex = index >= 0 ? (index + 1) % enabled.length : 0;
+    return { apiKeys: config.apiKeys as ApiKeyEntry[], activeKeyId: enabled[nextIndex].id };
+  }
+  if (policy === "weighted") {
+    const candidates = enabled.filter((key) => key.id !== excludeKeyId);
+    const pick = pickWeighted(candidates.length > 0 ? candidates : enabled);
+    return { apiKeys: config.apiKeys as ApiKeyEntry[], activeKeyId: pick.id };
+  }
+  let candidates = enabled.filter((key) => key.id !== excludeKeyId && !isKeyCooling(key));
+  if (candidates.length === 0) candidates = enabled.filter((key) => key.id !== excludeKeyId);
+  if (candidates.length === 0) candidates = enabled;
+  const sorted = candidates.sort((a, b) => {
+    if (a.failureCount !== b.failureCount) return a.failureCount - b.failureCount;
+    return (a.lastFailureAt ?? Infinity) - (b.lastFailureAt ?? Infinity);
+  });
+  return { apiKeys: config.apiKeys as ApiKeyEntry[], activeKeyId: sorted[0].id };
+}
+
+export async function updateProviderKeyState(
+  providerId: string,
+  update: (config: Record<string, unknown>) => { apiKeys?: ApiKeyEntry[]; activeKeyId?: string; keyPolicy?: ApiKeyPolicy } | undefined,
+  modelsPath: string,
+): Promise<SaveApiProviderResult | undefined> {
+  let result: SaveApiProviderResult | undefined;
+  await serializeMutation(modelsPath, async () => {
+    const exists = await fileExists(modelsPath);
+    const root = await readModelsRoot(modelsPath);
+    const providers = isRecord(root.providers) ? { ...root.providers } : {};
+    const entry = providers[providerId];
+    if (!isRecord(entry)) return;
+    const nextConfig = update(entry);
+    if (!nextConfig) return;
+    providers[providerId] = { ...entry, ...nextConfig };
+    result = await writeModelsRoot({ ...root, providers }, modelsPath, exists);
+  });
+  return result;
+}
+
+export async function recordApiKeyFailureAndAdvance(
+  providerId: string,
+  keyId: string,
+  status: number,
+  modelsPath: string,
+): Promise<{ activeKeyId: string; key: string } | undefined> {
+  if (keyId === "legacy") return undefined;
+  const update = (config: Record<string, unknown>) => {
+    const policy = (isApiKeyPolicy(config.keyPolicy) ? config.keyPolicy : "sticky") as ApiKeyPolicy;
+    const nextKeys = markApiKeyFailed(config, keyId, status);
+    if (!nextKeys) return undefined;
+    const advanced = advanceApiKey({ ...config, apiKeys: nextKeys }, policy, keyId);
+    if (!advanced) return undefined;
+    return { apiKeys: advanced.apiKeys, activeKeyId: advanced.activeKeyId };
+  };
+  const result = await updateProviderKeyState(providerId, update, modelsPath);
+  if (!result) return undefined;
+  const root = await readModelsRoot(modelsPath);
+  const providers = isRecord(root.providers) ? root.providers : {};
+  const config = isRecord(providers[providerId]) ? providers[providerId] : {};
+  const resolved = resolveApiKey(config, isApiKeyPolicy(config.keyPolicy) ? config.keyPolicy : "sticky");
+  if (!resolved) return undefined;
+  return { activeKeyId: config.activeKeyId as string, key: resolved.key };
 }
 
 export async function serializeMutation(path: string, mutate: () => Promise<void>): Promise<void> {
@@ -956,7 +1522,9 @@ export function configuredProviderRegistration(
       return { name: fallbackName };
     }
   }
-  if (typeof config.apiKey === "string") registration.apiKey = config.apiKey;
+  const keyPolicy = isApiKeyPolicy(config.keyPolicy) ? config.keyPolicy : "sticky";
+  const resolvedKey = resolveApiKey(config, keyPolicy);
+  if (resolvedKey) registration.apiKey = resolvedKey.key;
   if (typeof config.api === "string") registration.api = config.api;
   if (typeof config.streamSimple === "function") registration.streamSimple = config.streamSimple as ProviderConfig["streamSimple"];
   if (isStringRecord(config.headers)) registration.headers = { ...config.headers };
@@ -1053,6 +1621,13 @@ export interface ParsedManagerArgs {
   cache?: CacheManagerArgs;
   cacheAgent?: CacheAgentManagerArgs;
   stats?: StatsManagerArgs;
+  key?: KeyManagerArgs;
+}
+
+export interface KeyManagerArgs {
+  subAction?: "status" | "switch" | "add" | "remove" | "policy";
+  keyId?: string;
+  policy?: ApiKeyPolicy;
 }
 
 export interface StatsManagerArgs {
@@ -1117,6 +1692,14 @@ export function parseManagerArgs(args: string): ParsedManagerArgs {
   if (normalized[0] === "stats" || normalized[0] === "usage" || normalized[0] === "statistics") {
     return parseStatsArgs(values, normalized);
   }
+  if (normalized[0] === "key" || normalized[0] === "keys" || normalized[0] === "apikey" || normalized[0] === "apikeys") {
+    return parseKeyArgs(values, normalized);
+  }
+  if (normalized[0] === "switch-key" || normalized[0] === "switchkey" || normalized[0] === "switch") {
+    if (values.length === 1) return { action: "switch-key" };
+    if (values.length === 2) return { action: "switch-key", key: { subAction: "switch", keyId: values[1] } };
+    throw usageError();
+  }
   if (values.length === 1) {
     const action = actionFromArg(normalized[0]);
     if (action) return { action };
@@ -1142,7 +1725,7 @@ export function resolveTargetToken(value: string): ChannelTarget | undefined {
 
 export function usageError(): Error {
   return new Error(
-    `用法：/api-manager list | retry [show|on [1-${API_RETRY_MAX_RETRIES_LIMIT}]|off] | cache [show|auto|off|on] | cache agent [show|short|long|none] | price [openai|qwen|anthropic|<Provider ID>] | stats | stats footer [on|off|show] | show|set|delete|enable|disable|logout|filter|reset [openai|qwen|anthropic|<Provider ID>|new] | export [path] | import [path]`,
+    `用法：/api-manager list | retry [show|on [1-${API_RETRY_MAX_RETRIES_LIMIT}]|off] | cache [show|auto|off|on] | cache agent [show|short|long|none] | price [openai|qwen|anthropic|<Provider ID>] | stats | stats footer [on|off|show] | key [status|switch <id>|policy <sticky|round-robin|weighted|failover>|add|remove <id>] | switch-key <id> | show|set|delete|enable|disable|logout|filter|reset [openai|qwen|anthropic|<Provider ID>|new] | export [path] | import [path]`,
   );
 }
 
@@ -1459,6 +2042,7 @@ export async function chooseAction(
     { action: "cache", label: opsText("menu.cache", { value: await loadPromptCachePolicy(settingsPath) }) },
     { action: "cache-agent", label: opsText("menu.cacheAgent", { value: await loadAgentCacheRetention(settingsPath) }) },
     { action: "price", label: opsText("menu.price") },
+    { action: "key", label: opsText("menu.key") },
     { action: "stats", label: "📊 用量统计 (热图 / 折线图 · token / 成本 / cache)" },
     { action: "export", label: opsText("menu.export") },
     { action: "import", label: opsText("menu.import") },
@@ -1487,6 +2071,207 @@ function parseStatsArgs(values: string[], normalized: string[]): ParsedManagerAr
   throw usageError();
 }
 
+function parseKeyArgs(values: string[], normalized: string[]): ParsedManagerArgs {
+  // forms:
+  //   key                         → status / interactive manager
+  //   key status                  → show key status
+  //   key switch <id>             → switch active key
+  //   key policy <policy>         → set selection policy
+  //   key add                     → interactive add
+  //   key remove <id>             → remove key
+  if (values.length === 1) return { action: "key" };
+  if (normalized[1] === "status" || normalized[1] === "show") {
+    if (values.length === 2) return { action: "key", key: { subAction: "status" } };
+    throw usageError();
+  }
+  if (normalized[1] === "switch") {
+    if (values.length === 2) return { action: "key", key: { subAction: "switch" } };
+    if (values.length === 3) return { action: "key", key: { subAction: "switch", keyId: values[2] } };
+    throw usageError();
+  }
+  if (normalized[1] === "policy") {
+    if (values.length === 2) return { action: "key", key: { subAction: "policy" } };
+    if (values.length === 3 && isApiKeyPolicy(normalized[2])) {
+      return { action: "key", key: { subAction: "policy", policy: normalized[2] } };
+    }
+    throw usageError();
+  }
+  if (normalized[1] === "add") {
+    if (values.length === 2) return { action: "key", key: { subAction: "add" } };
+    throw usageError();
+  }
+  if (normalized[1] === "remove" || normalized[1] === "rm" || normalized[1] === "delete") {
+    if (values.length === 3) return { action: "key", key: { subAction: "remove", keyId: values[2] } };
+    throw usageError();
+  }
+  throw usageError();
+}
+
+export async function manageProviderKeys(
+  pi: ExtensionAPI,
+  providerId: string,
+  displayName: string,
+  args: { subAction?: "status" | "switch" | "add" | "remove" | "policy"; keyId?: string; policy?: ApiKeyPolicy } | undefined,
+  ctx: ExtensionCommandContext,
+  modelsPath: string,
+): Promise<void> {
+  if (!await isProviderConfigured(providerId, modelsPath)) {
+    ctx.ui.notify(`${displayName} 尚未配置，无法管理 key。`, "warning");
+    return;
+  }
+  const root = await readModelsRoot(modelsPath);
+  const providers = isRecord(root.providers) ? root.providers : {};
+  const config = isRecord(providers[providerId]) ? providers[providerId] : {};
+  const keys = readApiKeys(config);
+  const policy = (isApiKeyPolicy(config.keyPolicy) ? config.keyPolicy : "sticky") as ApiKeyPolicy;
+  const activeId = typeof config.activeKeyId === "string" ? config.activeKeyId : undefined;
+
+  const refresh = (): void => {
+    if (hasEnabledProviderSync(providerId, modelsPath)) {
+      pi.registerProvider(providerId, configuredProviderRegistration(providerId, modelsPath));
+      ctx.modelRegistry.refresh();
+    }
+  };
+
+  const statusText = (): string => {
+    if (keys.length === 0) return opsText("key.empty");
+    const lines = keys.map((key) => {
+      const status = key.enabled ? (isKeyCooling(key) ? opsText("key.status.cooling") : opsText("key.status.healthy")) : opsText("key.status.disabled");
+      const marker = key.id === activeId ? " *" : "";
+      return `  ${key.id}${marker} · weight=${key.weight} · failures=${key.failureCount} · ${status}`;
+    });
+    return [opsText("key.policy", { policy }), opsText("key.active", { id: activeId ?? "auto" }), ...lines].join("\n");
+  };
+
+  const doSwitch = async (keyId?: string): Promise<void> => {
+    if (keys.length === 0) {
+      ctx.ui.notify(opsText("key.empty"), "info");
+      return;
+    }
+    const enabled = keys.filter((key) => key.enabled);
+    if (enabled.length === 0) {
+      ctx.ui.notify("All keys are disabled; enable one before switching.", "warning");
+      return;
+    }
+    let targetId = keyId;
+    if (!targetId) {
+      const choice = await ctx.ui.select(opsText("key.chooseSwitch"), enabled.map((key) => {
+        const marker = key.id === activeId ? " (current)" : "";
+        return `${key.id}${marker}`;
+      }));
+      if (!choice) return;
+      targetId = enabled.find((key) => choice === key.id || choice.startsWith(`${key.id} `))?.id;
+    }
+    if (!targetId || !enabled.some((key) => key.id === targetId)) {
+      ctx.ui.notify("Invalid key id", "warning");
+      return;
+    }
+    const result = await updateProviderKeyState(providerId, () => ({ activeKeyId: targetId }), modelsPath);
+    if (!result) return;
+    refresh();
+    ctx.ui.notify(opsText("key.switched", { provider: displayName, id: targetId }), "info");
+  };
+
+  const doPolicy = async (nextPolicy?: ApiKeyPolicy): Promise<void> => {
+    if (!nextPolicy) {
+      const choice = await ctx.ui.select(opsText("key.policyPrompt"), API_KEY_POLICIES.map((value) => value));
+      if (!choice || !isApiKeyPolicy(choice)) return;
+      nextPolicy = choice;
+    }
+    const result = await updateProviderKeyState(providerId, () => ({ keyPolicy: nextPolicy }), modelsPath);
+    if (!result) return;
+    refresh();
+    ctx.ui.notify(`${displayName} key policy set to ${nextPolicy}`, "info");
+  };
+
+  const doAdd = async (): Promise<void> => {
+    const idInput = await ctx.ui.input(opsText("key.idPrompt"), "");
+    if (idInput === undefined) return;
+    const id = idInput.trim();
+    if (!id) {
+      ctx.ui.notify("Key id is required", "warning");
+      return;
+    }
+    if (keys.some((key) => key.id === id)) {
+      ctx.ui.notify(`Key id ${id} already exists`, "warning");
+      return;
+    }
+    const keyInput = await ctx.ui.input(opsText("key.keyPrompt"), "");
+    if (keyInput === undefined) return;
+    const key = keyInput.trim();
+    if (!key) {
+      ctx.ui.notify("API key is required", "warning");
+      return;
+    }
+    const weightInput = await ctx.ui.input(opsText("key.weightPrompt"), "1");
+    if (weightInput === undefined) return;
+    const weight = Number(weightInput.trim());
+    const newEntry: ApiKeyEntry = {
+      id,
+      key,
+      enabled: true,
+      weight: Number.isFinite(weight) && weight >= 0 ? weight : DEFAULT_KEY_WEIGHT,
+    };
+    const nextKeys = [...(config.apiKeys as ApiKeyEntry[] ?? []), newEntry];
+    const result = await updateProviderKeyState(
+      providerId,
+      () => ({ apiKeys: nextKeys, activeKeyId: activeId ?? id }),
+      modelsPath,
+    );
+    if (!result) return;
+    refresh();
+    ctx.ui.notify(opsText("key.added", { provider: displayName, id }), "info");
+  };
+
+  const doRemove = async (keyId?: string): Promise<void> => {
+    if (!keyId) {
+      ctx.ui.notify("Usage: /api-manager key remove <key-id>", "warning");
+      return;
+    }
+    const current = keys.find((key) => key.id === keyId);
+    if (!current) {
+      ctx.ui.notify(`Key ${keyId} not found`, "warning");
+      return;
+    }
+    const confirmed = await ctx.ui.confirm(`Remove key ${keyId}?`, "This cannot be undone.");
+    if (!confirmed) return;
+    const nextKeys = (config.apiKeys as ApiKeyEntry[] ?? []).filter((entry) => entry.id !== keyId);
+    const nextActiveId = activeId === keyId
+      ? (nextKeys.find((entry) => entry.enabled !== false)?.id ?? "")
+      : activeId;
+    const result = await updateProviderKeyState(
+      providerId,
+      () => ({ apiKeys: nextKeys, activeKeyId: nextActiveId || undefined }),
+      modelsPath,
+    );
+    if (!result) return;
+    refresh();
+    ctx.ui.notify(opsText("key.removed", { provider: displayName, id: keyId }), "info");
+  };
+
+  const subAction = args?.subAction ?? "status";
+  if (subAction === "status") {
+    ctx.ui.notify(statusText(), "info");
+    return;
+  }
+  if (subAction === "switch") {
+    await doSwitch(args?.keyId);
+    return;
+  }
+  if (subAction === "policy") {
+    await doPolicy(args?.policy);
+    return;
+  }
+  if (subAction === "add") {
+    await doAdd();
+    return;
+  }
+  if (subAction === "remove") {
+    await doRemove(args?.keyId);
+    return;
+  }
+}
+
 export function actionFromArg(value: string): ApiProviderAction | undefined {
   if (value === "configure" || value === "config" || value === "set" || value === "add" || value === "update") {
     return "configure";
@@ -1508,6 +2293,8 @@ export function actionFromArg(value: string): ApiProviderAction | undefined {
   if (value === "stats" || value === "usage" || value === "statistics") return "stats";
   if (value === "reset") return "reset";
   if (value === "filter" || value === "model-filter" || value === "modelfilter") return "filter";
+  if (value === "key" || value === "keys" || value === "apikey" || value === "apikeys") return "key";
+  if (value === "switch-key" || value === "switchkey" || value === "switch") return "switch-key";
   return undefined;
 }
 

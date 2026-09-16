@@ -21,8 +21,18 @@ import {
 } from "pi-maestro-settings-core/v1";
 import { SETTINGS_SECRET_SET_PLACEHOLDER } from "pi-maestro-settings-core/v1/schema";
 import { loadApiRetrySettings, saveApiRetrySettings } from "../providers/api-provider-config.ts";
+import {
+  AGENT_HEADER_PRESETS,
+  expandAgentHeaderPreset,
+  isAgentHeaderPreset,
+  type AgentHeaderPreset,
+} from "../providers/agent-header-presets.ts";
 import { NETWORK_RETRY_POLICY } from "pi-maestro-teammate/v1/retry";
-import { addManagedProvider, readModelsRoot, writeModelsRoot } from "../providers/api-provider-ops.ts";
+import { addManagedProvider, isRecord, readModelsRoot, writeModelsRoot } from "../providers/api-provider-ops.ts";
+import {
+  API_KEY_POLICIES,
+  isApiKeyPolicy,
+} from "../providers/api-provider-config.ts";
 import {
   AGENT_CACHE_RETENTION_DEFAULT,
   applyCacheRetentionEnv,
@@ -55,68 +65,14 @@ const API_KINDS = [
   "azure-openai-responses",
 ] as const;
 
-/**
- * Agent identity header presets, extracted from sub2api's outbound identity
- * layer (Wei-Shaw/sub2api): each upstream gateway fingerprints the client by
- * User-Agent (and friends) and rejects traffic that does not look like the
- * official CLI. Selecting a preset stamps the same identity on pi's requests.
- *
- * - claude-code: claude.DefaultHeaders + applyClaudeCodeMimicHeaders (claude-cli/2.1.220)
- * - codex: codexCLIUserAgent = codex-tui/0.146.0 (Ubuntu 22.4.0; x86_64) xterm-256color
- * - grok: xai CLI identity = xai-grok-workspace/0.2.114 + x-grok-client-version + x-grok-client-identifier
- * - antigravity: antigravity/1.23.2 windows/amd64
- * - opencode: official OpenCode CLI identity and session headers for Zen/Go gateways
- */
-export const AGENT_HEADER_PRESETS = {
-  none: {},
-  "claude-code": {
-    "User-Agent": "claude-cli/2.1.220 (external, cli)",
-    "X-Stainless-Lang": "js",
-    "X-Stainless-Package-Version": "0.94.0",
-    "X-Stainless-OS": "Linux",
-    "X-Stainless-Arch": "arm64",
-    "X-Stainless-Runtime": "node",
-    "X-Stainless-Runtime-Version": "v24.3.0",
-    "X-Stainless-Retry-Count": "0",
-    "X-Stainless-Timeout": "600",
-    "X-App": "cli",
-    "Anthropic-Dangerous-Direct-Browser-Access": "true",
-  },
-  codex: {
-    "User-Agent": "codex-tui/0.146.0 (Ubuntu 22.4.0; x86_64) xterm-256color",
-  },
-  grok: {
-    "User-Agent": "xai-grok-workspace/0.2.114",
-    "X-Grok-Client-Version": "0.2.114",
-    "X-Grok-Client-Identifier": "grok-shell",
-  },
-  antigravity: {
-    "User-Agent": "antigravity/1.23.2 windows/amd64",
-  },
-  // Keep Authorization out of the preset so pi can send the provider's configured API key.
-  opencode: {
-    "User-Agent": "opencode/1.15.3",
-    "x-opencode-client": "cli",
-    "x-opencode-session": "ses_01JQXYZ3K7MN0RSTUVWXYZabcd",
-    "x-opencode-request": "msg_01JQXYZ3K7MN0RSTUVWXYZefgh",
-    "x-opencode-project": "global",
-  },
-} as const;
-
-export type AgentHeaderPreset = keyof typeof AGENT_HEADER_PRESETS;
-
-export function isAgentHeaderPreset(value: unknown): value is AgentHeaderPreset {
-  return typeof value === "string" && value in AGENT_HEADER_PRESETS;
-}
-
-export function expandAgentHeaderPreset(
-  preset: AgentHeaderPreset | undefined,
-  custom: Record<string, string> | undefined,
-): Record<string, string> | undefined {
-  const presetHeaders = preset && preset !== "none" ? { ...AGENT_HEADER_PRESETS[preset] } : {};
-  const merged = { ...presetHeaders, ...(custom ?? {}) };
-  return Object.keys(merged).length > 0 ? merged : undefined;
-}
+// Re-exported so the preset table has one home while this provider keeps its
+// existing public surface.
+export {
+  AGENT_HEADER_PRESETS,
+  expandAgentHeaderPreset,
+  isAgentHeaderPreset,
+};
+export type { AgentHeaderPreset };
 
 type ApiManagerAction = (context: SettingsContextV1) => Promise<void> | void;
 
@@ -167,6 +123,11 @@ const PROVIDER_FIELDS: readonly SettingDefinition[] = [
   }, "openai-responses"),
   field("enabled", "boolean", "api.field.enabled", {}, true),
   field("apiKey", "secret", "api.field.apiKey", { writeOnly: true }),
+  field("keyPolicy", "enum", "api.field.keyPolicy", {
+    options: API_KEY_POLICIES.map((value) => ({ value, labelKey: `api.keyPolicy.${value}` })),
+  }, "sticky"),
+  field("activeKeyId", "text", "api.field.activeKeyId"),
+  field("apiKeys", "json", "api.field.apiKeys", { multiline: true }),
   field("headerPreset", "enum", "api.field.headerPreset", {
     options: (Object.keys(AGENT_HEADER_PRESETS) as AgentHeaderPreset[]).map((value) => ({ value, labelKey: `api.headerPreset.${value}` })),
   }, "none"),
@@ -368,6 +329,13 @@ const CATALOGS = {
     "api.field.api": "API protocol",
     "api.field.enabled": "Enabled",
     "api.field.apiKey": "API key",
+    "api.field.keyPolicy": "Key selection policy",
+    "api.field.activeKeyId": "Active key id",
+    "api.field.apiKeys": "API key pool (JSON array of {id,key,enabled?,weight?})",
+    "api.keyPolicy.sticky": "Sticky (cache affinity)",
+    "api.keyPolicy.round-robin": "Round-robin",
+    "api.keyPolicy.weighted": "Weighted",
+    "api.keyPolicy.failover": "Failover",
     "api.field.headerPreset": "Agent request headers",
     "api.field.headers": "Custom headers (JSON)",
     "api.headerPreset.none": "None (pi default)",
@@ -437,6 +405,7 @@ const CATALOGS = {
     "api.settings.invalidProviders": "Providers must be a list of objects with an id",
     "api.settings.invalidModels": "Each model needs an existing provider and a non-empty model id",
     "api.settings.invalidHeaders": "Custom headers must be a JSON object with string values",
+    "api.settings.invalidApiKeys": "API key pool must be an array of objects with id, key, optional enabled/weight; keyPolicy must be sticky, round-robin, weighted or failover",
     "api.settings.invalidRetry": "Retry values are invalid",
     "api.overview.providers": "Providers",
     "api.overview.models": "Models",
@@ -463,6 +432,13 @@ const CATALOGS = {
     "api.field.api": "API 协议",
     "api.field.enabled": "启用",
     "api.field.apiKey": "API Key",
+    "api.field.keyPolicy": "Key 选择策略",
+    "api.field.activeKeyId": "当前激活 Key 标识",
+    "api.field.apiKeys": "API Key 池（JSON 数组：{id,key,enabled?,weight?}）",
+    "api.keyPolicy.sticky": "Sticky（缓存亲和）",
+    "api.keyPolicy.round-robin": "轮询",
+    "api.keyPolicy.weighted": "加权",
+    "api.keyPolicy.failover": "故障转移",
     "api.field.headerPreset": "Agent 请求头",
     "api.field.headers": "自定义请求头（JSON）",
     "api.headerPreset.none": "无（pi 默认）",
@@ -532,6 +508,7 @@ const CATALOGS = {
     "api.settings.invalidProviders": "Providers 必须是含 id 的对象列表",
     "api.settings.invalidModels": "每个模型需要已存在的 Provider 与不为空的模型 id",
     "api.settings.invalidHeaders": "自定义请求头必须是字符串值的 JSON 对象",
+    "api.settings.invalidApiKeys": "API Key 池必须是对象数组，含 id/key，可选 enabled/weight；keyPolicy 必须是 sticky、round-robin、weighted 或 failover",
     "api.settings.invalidRetry": "重试配置值无效",
     "api.overview.providers": "Providers",
     "api.overview.models": "模型",
@@ -551,6 +528,9 @@ interface ApiProviderEntry {
   api: string;
   enabled: boolean;
   apiKey: string | null;
+  keyPolicy?: "sticky" | "round-robin" | "weighted" | "failover";
+  activeKeyId?: string;
+  apiKeys?: Array<{ id: string; key: string; enabled?: boolean; weight?: number }>;
   headerPreset?: AgentHeaderPreset;
   headers?: Record<string, string>;
   models?: JsonValue;
@@ -566,25 +546,56 @@ function parseProviderEntry(value: unknown): ApiProviderEntry | undefined {
       Object.entries(entry.headers).filter(([, headerValue]) => typeof headerValue === "string"),
     ) as Record<string, string>
     : undefined;
+  const apiKeys = Array.isArray(entry.apiKeys)
+    ? entry.apiKeys.filter((item): item is { id: string; key: string } =>
+      isRecord(item)
+      && typeof item.id === "string"
+      && item.id.length > 0
+      && typeof item.key === "string",
+    )
+    : undefined;
   return {
     id: entry.id,
     baseUrl: typeof entry.baseUrl === "string" ? entry.baseUrl : "",
     api: typeof entry.api === "string" ? entry.api : "openai-responses",
     enabled: entry.enabled !== false,
     apiKey: typeof entry.apiKey === "string" ? entry.apiKey : null,
+    keyPolicy: isApiKeyPolicy(entry.keyPolicy) ? entry.keyPolicy : undefined,
+    activeKeyId: typeof entry.activeKeyId === "string" ? entry.activeKeyId : undefined,
+    apiKeys,
     headerPreset: isAgentHeaderPreset(entry.headerPreset) ? entry.headerPreset : "none",
     headers,
     models: Array.isArray(entry.models) ? (entry.models as JsonValue) : undefined,
   };
 }
 
-function providerConfig(entry: ApiProviderEntry): Record<string, unknown> {
+function providerConfig(entry: ApiProviderEntry, previous?: Record<string, unknown>): Record<string, unknown> {
   const config: Record<string, unknown> = {
     baseUrl: entry.baseUrl,
     api: entry.api,
     enabled: entry.enabled,
   };
-  if (entry.apiKey && entry.apiKey !== SETTINGS_SECRET_SET_PLACEHOLDER) config.apiKey = entry.apiKey;
+  const previousKeys = previous && Array.isArray(previous.apiKeys) && previous.apiKeys.length > 0
+    ? previous.apiKeys as ApiProviderEntry["apiKeys"]
+    : undefined;
+  if (entry.apiKeys && entry.apiKeys.length > 0) {
+    config.apiKeys = entry.apiKeys.map((key) => ({
+      id: key.id,
+      key: key.key,
+      ...(key.enabled !== undefined ? { enabled: key.enabled } : {}),
+      ...(key.weight !== undefined ? { weight: key.weight } : {}),
+    }));
+    if (entry.keyPolicy) config.keyPolicy = entry.keyPolicy;
+    if (entry.activeKeyId) config.activeKeyId = entry.activeKeyId;
+  } else if (previousKeys) {
+    // The editor did not supply a multi-key pool; preserve the existing one so
+    // a connection-only edit does not wipe the key pool.
+    config.apiKeys = previousKeys;
+    config.keyPolicy = entry.keyPolicy ?? previous?.keyPolicy;
+    config.activeKeyId = entry.activeKeyId ?? previous?.activeKeyId;
+  } else if (entry.apiKey && entry.apiKey !== SETTINGS_SECRET_SET_PLACEHOLDER) {
+    config.apiKey = entry.apiKey;
+  }
   if (entry.headerPreset && entry.headerPreset !== "none") config.headerPreset = entry.headerPreset;
   // Preset expansion wins; custom headers override same-name preset headers.
   // Without a preset, keep any existing custom headers untouched.
@@ -685,9 +696,15 @@ export function createApiManagerSettingsProvider(
         return {
           ...parsed,
           apiKey: typeof entry.apiKey === "string" ? SETTINGS_SECRET_SET_PLACEHOLDER : null,
+          apiKeys: Array.isArray(entry.apiKeys)
+            ? (entry.apiKeys as Array<Record<string, unknown>>).map((key) => ({
+                ...key,
+                key: typeof key.key === "string" ? SETTINGS_SECRET_SET_PLACEHOLDER : "",
+              })) as ApiProviderEntry["apiKeys"]
+            : undefined,
         };
       })
-      .filter((entry): entry is ApiProviderEntry => entry !== undefined)
+      .filter((entry): entry is NonNullable<typeof entry> => entry !== undefined)
       .sort((left, right) => left.id.localeCompare(right.id));
     const retry = await loadApiRetrySettings(settingsPath);
     const promptCache = await loadPromptCachePolicy(settingsPath);
@@ -832,6 +849,30 @@ export function createApiManagerSettingsProvider(
               code: "invalid-headers",
               messageKey: "api.settings.invalidHeaders",
             });
+          } else if (Array.isArray(change.value) && change.value.some((entry) => {
+            const record = entry as Record<string, unknown>;
+            if (record.apiKeys !== undefined && !Array.isArray(record.apiKeys)) return true;
+            if (record.keyPolicy !== undefined && !isApiKeyPolicy(record.keyPolicy)) return true;
+            if (record.activeKeyId !== undefined && typeof record.activeKeyId !== "string") return true;
+            if (Array.isArray(record.apiKeys)) {
+              return record.apiKeys.some((item) => {
+                if (!item || typeof item !== "object" || Array.isArray(item)) return true;
+                const key = item as Record<string, unknown>;
+                if (typeof key.id !== "string" || key.id.length === 0) return true;
+                if (typeof key.key !== "string") return true;
+                if (key.weight !== undefined && (typeof key.weight !== "number" || key.weight < 0)) return true;
+                return false;
+              });
+            }
+            return false;
+          })) {
+            issues.push({
+              severity: "error",
+              key: change.key,
+              scope: change.scope,
+              code: "invalid-apiKeys",
+              messageKey: "api.settings.invalidApiKeys",
+            });
           }
         }
         if (change.key === "api.models" && change.operation === "set") {
@@ -954,10 +995,19 @@ export function createApiManagerSettingsProvider(
               const previous = typeof existing[entry.id] === "object" && existing[entry.id] !== null
                 ? existing[entry.id] as Record<string, unknown>
                 : undefined;
-              const config = providerConfig(entry);
+              const config = providerConfig(entry, previous);
               if (previous && typeof previous === "object") {
-                if ((entry.apiKey === null || entry.apiKey === SETTINGS_SECRET_SET_PLACEHOLDER) && typeof previous.apiKey === "string") {
+                if ((entry.apiKey === null || entry.apiKey === SETTINGS_SECRET_SET_PLACEHOLDER) && typeof previous.apiKey === "string" && !(config.apiKeys && Array.isArray(config.apiKeys))) {
                   config.apiKey = previous.apiKey;
+                }
+                if (Array.isArray(config.apiKeys) && Array.isArray(previous.apiKeys)) {
+                  const previousById = new Map((previous.apiKeys as Array<Record<string, unknown>>).map((key) => [key.id as string, key]));
+                  config.apiKeys = (config.apiKeys as Array<Record<string, unknown>>).map((key) => {
+                    if (key.key !== SETTINGS_SECRET_SET_PLACEHOLDER) return key;
+                    const prev = previousById.get(key.id as string);
+                    if (prev && typeof prev.key === "string") return { ...key, key: prev.key };
+                    return key;
+                  });
                 }
                 // models are owned by api.models; preserve whatever is already there
                 if (Array.isArray(previous.models)) config.models = previous.models;
