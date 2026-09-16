@@ -317,7 +317,7 @@ test("disconnect wins the shared lease-store CAS against an in-flight durable bi
   await entered.promise;
   await fixture.connections.disconnect(fixture.connectionId, fixture.generation);
   release.resolve();
-  await expectAsyncCode(pending, "conflict");
+  await expectAsyncCode(pending, "stale_generation");
   assert.equal(await fixture.store.record("lease", "binding-b"), undefined);
 });
 
