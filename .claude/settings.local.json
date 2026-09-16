@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cd /d D:\\\\pi-maestro-flow\\\\flow)",
+      "Bash(dir /s /b)",
+      "PowerShell(Test-Path \"D:\\\\pi-maestro-flow\\\\.pi\" | Select-Object -ExpandProperty PSObject | Write-Output \"$\\(if \\(Test-Path 'D:\\\\pi-maestro-flow\\\\.pi'\\) { 'EXISTS' } else { 'DOES NOT EXIST' }\\)\")"
+    ]
+  }
+}
