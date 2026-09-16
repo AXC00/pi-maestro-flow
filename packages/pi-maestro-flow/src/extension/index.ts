@@ -2117,7 +2117,7 @@ When NOT to use:
       const result = await executeRunControl(
         params as RunControlInput,
         workflowCoordinator,
-        hostSessionId ? { hostSessionId } : undefined,
+        hostSessionId ? { hostSessionId, requestId: id } : undefined,
       );
       if (result.ok) {
         await refreshWorkflow(ctx, actionOptsIn, actionOptsIn, actionOptsIn);

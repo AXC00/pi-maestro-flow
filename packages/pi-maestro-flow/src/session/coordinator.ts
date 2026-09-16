@@ -876,6 +876,7 @@ export class WorkflowCoordinator {
     argv: readonly string[],
     classification: WorkflowRunControlClassification,
     hostSessionId?: string,
+    requestId?: string,
   ): Promise<WorkflowTransitionResult> {
     const mode = await this.selectMode();
     if (classification.write && classification.mutation === "artifact-republish") {
@@ -888,7 +889,7 @@ export class WorkflowCoordinator {
       throw this.failClosedMutationError(argv.slice(0, 3).join(" ") || "mutation");
     }
     if (mode === "session-v3") {
-      return this.execV3(argv, classification, hostSessionId);
+      return this.execV3(argv, classification, hostSessionId, requestId);
     }
     const selectedClassification = legacyModeClassification(argv, classification);
     if (mode === "core-execution") {
@@ -922,12 +923,13 @@ export class WorkflowCoordinator {
     argv: readonly string[],
     classification: WorkflowRunControlClassification,
     hostSessionId?: string,
+    requestId?: string,
   ): Promise<WorkflowTransitionResult> {
     if (!classification.write) {
       const command = projectPublicRunCliResult(await this.adapter.exec(argv));
       return { command, snapshot: await this.bridge.refresh() };
     }
-    const prepared = await this.prepareV3MutationArgv(argv, hostSessionId);
+    const prepared = await this.prepareV3MutationArgv(argv, hostSessionId, requestId);
     const privateCommand = await this.adapter.exec(prepared);
     let envelope = parseRunResponse(privateCommand.stdout);
     if (envelope.ok) {
@@ -971,12 +973,13 @@ export class WorkflowCoordinator {
   private async prepareV3MutationArgv(
     argv: readonly string[],
     hostSessionId?: string,
+    requestId?: string,
   ): Promise<string[]> {
     const participantId = requireHostSessionId(hostSessionId);
     const prepared = [...argv];
     addFlag(prepared, "--participant", participantId);
     addFlag(prepared, "--actor", participantId);
-    addRequiredFlagIfMissing(prepared, "--request-id", randomUUID());
+    addRequiredFlagIfMissing(prepared, "--request-id", requestId ?? randomUUID());
     addRequiredFlagIfMissing(prepared, "--reason", "Pi run-control v3 mutation");
     addBooleanFlag(prepared, "--json");
     if (isV3OpenCommand(argv)) {
@@ -2029,7 +2032,13 @@ export class WorkflowCoordinator {
     if (!envelope.ok) {
       const code = envelope.error?.code ?? "UNKNOWN";
       const message = envelope.error?.message ?? "Core-execution mutation failed";
-      throw new Error(`${code}: ${message}`);
+      const failure = Object.assign(new Error(message), {
+        code,
+        retryable: envelope.error?.retryable,
+        details: envelope.error?.details,
+        next_actions: envelope.error?.recovery_command ? [envelope.error.recovery_command] : [],
+      });
+      throw failure;
     }
     if (mutation === "session") return undefined;
     const locator = runResponseCoreLocator(envelope);
@@ -3295,7 +3304,7 @@ function flagValue(argv: readonly string[], flag: string): string | undefined {
 const V3_RUN_OPERATION_CODES: Record<string, string> = {
   next: "next", create: "create", complete: "complete", brief: "brief",
   check: "check", recall: "recall", decide: "run-decide",
-  transition: "run-transition", cancel: "run-cancel", seal: "run-seal",
+  transition: "run-transition", cancel: "run-cancel", rebind: "run-rebind", seal: "run-seal",
 };
 
 function expectedV3Operation(argv: readonly string[]): string | null {

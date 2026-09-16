@@ -3,8 +3,10 @@ import {
   projectPublicRunCliResult,
   publicWorkflowErrorMessage,
   type WorkflowCoordinator,
+  type WorkflowCoordinatorMode,
   type WorkflowLeaseOwnership,
 } from "../session/coordinator.ts";
+import type { RunCliResult } from "../session/cli-adapter.ts";
 
 /**
  * Read-only action/command names. Doubles as:
@@ -185,15 +187,33 @@ export interface RunControlInput {
   argv: string[];
 }
 
+export interface RunControlError {
+  code: string;
+  message: string;
+  retryable?: boolean;
+  details?: unknown;
+  next_actions?: string[];
+  candidates?: unknown;
+}
+
+export interface RunControlAuthority {
+  protocol: "legacy-lease" | "session-cas" | "core-execution" | "fail-closed";
+  state: string;
+}
+
 export interface RunControlResult {
   ok: boolean;
   action: "exec";
   message: string;
+  error?: RunControlError;
+  authority?: RunControlAuthority;
+  notices?: string[];
   details?: unknown;
 }
 
 export interface RunControlExecutionContext {
   hostSessionId: string;
+  requestId?: string;
 }
 
 export async function executeRunControl(
@@ -211,7 +231,7 @@ export async function executeRunControl(
     if (classification.write && !classification.sessionless) {
       required(hostSessionId, "hostSessionId");
     }
-    const result = await coordinator.exec(argv, classification, hostSessionId);
+    const result = await coordinator.exec(argv, classification, hostSessionId, context?.requestId);
     const command = projectPublicRunCliResult(result.command);
     const publicArgv = projectPublicRunCliResult({
       argv,
@@ -222,6 +242,8 @@ export async function executeRunControl(
     const ownership = hostSessionId && !classification.write
       ? await coordinator.ownership(hostSessionId)
       : undefined;
+    const authority = coordinatorAuthority(coordinator);
+    const visibleOwnership = authority?.protocol === "session-cas" ? undefined : ownership;
     const commandMessage = command.stderr.trim()
       ? [command.stdout.trimEnd(), command.stderr.trimEnd()].filter(Boolean).join("\n")
       : command.stdout;
@@ -232,10 +254,14 @@ export async function executeRunControl(
       snapshot: result.snapshot,
       ...(ownership ? { ownership } : {}),
     };
-    const message = readMessage(commandMessage, ownership);
-    return command.exitCode === 0 ? success(message, details) : failure(message, details);
+    const message = readMessage(commandMessage, visibleOwnership);
+    const structuredError = command.exitCode === 0 ? undefined : extractRunControlError(command);
+    const notice = visibleOwnership ? readOwnershipNotice(visibleOwnership) : undefined;
+    return command.exitCode === 0
+      ? success(message, details, undefined, authority, notice ? [notice] : undefined)
+      : failure(message, details, structuredError, authority, notice ? [notice] : undefined);
   } catch (error) {
-    return failure(publicWorkflowErrorMessage(error));
+    return failure(publicWorkflowErrorMessage(error), undefined, errorToRunControlError(error), coordinatorAuthority(coordinator));
   }
 }
 
@@ -283,10 +309,103 @@ function readOwnershipNotice(ownership: WorkflowLeaseOwnership): string | undefi
     + `owned by Pi session ${ownership.ownerHostSessionId}.`;
 }
 
-function success(message: string, details?: unknown): RunControlResult {
-  return { ok: true, action: "exec", message, ...(details === undefined ? {} : { details }) };
+function success(
+  message: string,
+  details?: unknown,
+  error?: RunControlError,
+  authority?: RunControlAuthority,
+  notices?: string[],
+): RunControlResult {
+  return {
+    ok: true,
+    action: "exec",
+    message,
+    ...(error ? { error } : {}),
+    ...(authority ? { authority } : {}),
+    ...(notices?.length ? { notices } : {}),
+    ...(details === undefined ? {} : { details }),
+  };
 }
 
-function failure(message: string, details?: unknown): RunControlResult {
-  return { ok: false, action: "exec", message, ...(details === undefined ? {} : { details }) };
+function failure(
+  message: string,
+  details?: unknown,
+  error?: RunControlError,
+  authority?: RunControlAuthority,
+  notices?: string[],
+): RunControlResult {
+  return {
+    ok: false,
+    action: "exec",
+    message,
+    ...(error ? { error } : {}),
+    ...(authority ? { authority } : {}),
+    ...(notices?.length ? { notices } : {}),
+    ...(details === undefined ? {} : { details }),
+  };
+}
+
+function coordinatorAuthority(coordinator: WorkflowCoordinator): RunControlAuthority | undefined {
+  const candidate = coordinator as unknown as { mode?: () => WorkflowCoordinatorMode };
+  if (typeof candidate.mode !== "function") return undefined;
+  const mode = candidate.mode();
+  const protocol: RunControlAuthority["protocol"] = mode === "legacy-host"
+    ? "legacy-lease"
+    : mode === "session-v3" ? "session-cas" : mode;
+  return { protocol, state: mode };
+}
+
+function extractRunControlError(command: RunCliResult): RunControlError | undefined {
+  const parse = (text: string): RunControlError | undefined => {
+    try {
+      const value: unknown = JSON.parse(text);
+      if (!value || typeof value !== "object") return undefined;
+      const envelope = value as { error?: unknown };
+      if (!envelope.error || typeof envelope.error !== "object") return undefined;
+      const error = envelope.error as Record<string, unknown>;
+      if (typeof error.code !== "string" || typeof error.message !== "string") return undefined;
+      return {
+        code: error.code,
+        message: error.message,
+        ...(typeof error.retryable === "boolean" ? { retryable: error.retryable } : {}),
+        ...(error.details !== undefined ? { details: error.details } : {}),
+        ...(Array.isArray(error.next_actions) ? { next_actions: error.next_actions.filter((item): item is string => typeof item === "string") } : {}),
+        ...(error.details && typeof error.details === "object" && Array.isArray((error.details as Record<string, unknown>).candidates)
+          ? { candidates: (error.details as Record<string, unknown>).candidates }
+          : {}),
+      };
+    } catch {
+      return undefined;
+    }
+  };
+  const parsed = parse(command.stdout) ?? parse(command.stderr);
+  if (parsed) return parsed;
+  const match = `${command.stderr}\n${command.stdout}`.match(/(?:^|\\n)([A-Z][A-Z0-9_]+): ([^\\n]+)/);
+  return match ? { code: match[1], message: match[2] } : undefined;
+}
+
+function errorToRunControlError(error: unknown): RunControlError | undefined {
+  if (error && typeof error === "object") {
+    const value = error as {
+      code?: unknown;
+      message?: unknown;
+      retryable?: unknown;
+      details?: unknown;
+      next_actions?: unknown;
+    };
+    if (typeof value.code === "string" && typeof value.message === "string") {
+      return {
+        code: value.code,
+        message: value.message,
+        ...(typeof value.retryable === "boolean" ? { retryable: value.retryable } : {}),
+        ...(value.details !== undefined ? { details: value.details } : {}),
+        ...(Array.isArray(value.next_actions)
+          ? { next_actions: value.next_actions.filter((item): item is string => typeof item === "string") }
+          : {}),
+      };
+    }
+  }
+  const message = publicWorkflowErrorMessage(error);
+  const match = message.match(/^([A-Z][A-Z0-9_]+): (.+)$/s);
+  return match ? { code: match[1], message: match[2] } : undefined;
 }

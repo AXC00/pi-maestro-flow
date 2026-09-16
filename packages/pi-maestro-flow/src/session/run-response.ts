@@ -61,6 +61,7 @@ export type RunOperationV12 =
   | "run-cancel"
   | "run-seal"
   | "run-transition"
+  | "run-rebind"
   | "run-decide"
   | "execution-start"
   | "execution-attach"
@@ -337,7 +338,7 @@ const operationV12Schema = z.enum([
   "capabilities", "session-open", "session-migrate",
   "session-complete", "session-archive", "session-unarchive", "session-status", "session-resume-view",
   "session-chain-insert", "session-chain-skip", "session-chain-replace", "session-chain-update",
-  "run-cancel", "run-seal", "run-transition", "run-decide", "execution-start", "execution-attach",
+  "run-cancel", "run-seal", "run-transition", "run-rebind", "run-decide", "execution-start", "execution-attach",
   "execution-status", "execution-pause", "execution-resolve", "execution-resume", "execution-seal",
   "execution-handoff-prepare", "execution-handoff-accept", "execution-handoff-cancel",
   "execution-lease-status", "execution-lease-heartbeat", "execution-lease-release", "execution-lease-recover",

@@ -86,6 +86,27 @@ export interface RunCliV3Support {
  */
 export type RunCliProtocol = "session-run-v3" | "execution-v2" | "fail-closed";
 
+export interface RunCliCatalogOption {
+  names: string[];
+  required: boolean;
+  value_arity: 0 | 1 | -1;
+  repeatable: boolean;
+  choices: string[];
+}
+
+export interface RunCliCatalogCommand {
+  command: string;
+  option_specs: RunCliCatalogOption[];
+  positionals: Array<{ name: string; required: boolean; variadic: boolean; choices: string[] }>;
+}
+
+export interface RunCliCatalogError {
+  code: "UNKNOWN_OPTION" | "MISSING_VALUE" | "EXCESS_POSITIONAL" | "MISSING_REQUIRED" | "UNKNOWN_COMMAND";
+  argument: string;
+  commandPath: string;
+  suggestion?: string;
+}
+
 export interface RunCliCapabilities {
   commands: ReadonlySet<string>;
   /** Commands parsed from `session --help`; empty when the CLI has no session subcommand. */
@@ -104,6 +125,8 @@ export interface RunCliCapabilities {
   protocol: RunCliProtocol;
   /** Diagnostic for legacy/fail-closed negotiation without exposing raw command output. */
   diagnostic: string | null;
+  /** Additive command metadata from `help --json`; absent on older CLIs. */
+  commandCatalog?: ReadonlyMap<string, RunCliCatalogCommand>;
 }
 
 export interface RunPlanPublishOptions {
@@ -174,6 +197,7 @@ export class UnsupportedRunCapabilityError extends Error {
 
 export class RunCliAdapter {
   private detected?: RunCliCapabilities;
+  private commandCatalog?: ReadonlyMap<string, RunCliCatalogCommand> | null;
 
   constructor(
     readonly workflowRoot: string,
@@ -363,6 +387,12 @@ export class RunCliAdapter {
    * an explicit --workflow-root option.
    */
   async exec(argv: readonly string[]): Promise<RunCliResult> {
+    const validation = await this.validateArgv(argv);
+    if (validation.length > 0) {
+      const first = validation[0];
+      const suggestion = first.suggestion ? ` Did you mean ${first.suggestion}?` : "";
+      throw new Error(`COMMANDER_USAGE: ${first.code} ${first.argument}.${suggestion}`);
+    }
     const family = argv[0];
     const acceptsWorkflowRoot = family === "run" || family === "session" || family === "execution"
       || family === "plan" || family === "artifact";
@@ -389,6 +419,93 @@ export class RunCliAdapter {
       ...(options.insertedBy ? ["--inserted-by", options.insertedBy] : []),
       "--workflow-root", this.workflowRoot,
     ]);
+  }
+
+  private async validateArgv(argv: readonly string[]): Promise<RunCliCatalogError[]> {
+    if (!argv.length || argv[0] === "capabilities" || argv[0] === "help") return [];
+    const catalog = await this.loadCommandCatalog();
+    if (!catalog) return [];
+    const command = [...catalog.values()]
+      .filter(item => item.command.split(" ").every((token, index) => argv[index] === token))
+      .sort((left, right) => right.command.length - left.command.length)[0];
+    if (!command) return [{ code: "UNKNOWN_COMMAND", argument: argv.join(" "), commandPath: "" }];
+    const errors: RunCliCatalogError[] = [];
+    const knownOptions = command.option_specs.flatMap(option => option.names);
+    const seen = new Set<string>();
+    const positionals: string[] = [];
+    const remaining = argv.slice(command.command.split(" ").length);
+    for (let index = 0; index < remaining.length; index++) {
+      const argument = remaining[index];
+      if (argument === "--") {
+        positionals.push(...remaining.slice(index + 1));
+        break;
+      }
+      if (!argument.startsWith("-") || argument === "-") {
+        positionals.push(argument);
+        continue;
+      }
+      const [name] = argument.split("=", 1);
+      const spec = command.option_specs.find(option => option.names.includes(name));
+      if (!spec) {
+        const suggestion = closestCatalogOption(name, knownOptions);
+        errors.push({ code: "UNKNOWN_OPTION", argument: name, commandPath: command.command, ...(suggestion ? { suggestion } : {}) });
+        continue;
+      }
+      seen.add(name);
+      if (spec.value_arity !== 0 && !argument.includes("=")) {
+        const next = remaining[index + 1];
+        if (!next || (next.startsWith("-") && next !== "-")) {
+          errors.push({ code: "MISSING_VALUE", argument: name, commandPath: command.command });
+        } else {
+          index++;
+        }
+      }
+    }
+    const maxPositionals = command.positionals.some(item => item.variadic)
+      ? Number.POSITIVE_INFINITY
+      : command.positionals.length;
+    if (positionals.length > maxPositionals) {
+      errors.push({ code: "EXCESS_POSITIONAL", argument: positionals[maxPositionals] ?? "", commandPath: command.command });
+    }
+    for (const option of command.option_specs.filter(item => item.required)) {
+      if (!option.names.some(name => seen.has(name))) {
+        errors.push({ code: "MISSING_REQUIRED", argument: option.names.at(-1) ?? "", commandPath: command.command });
+      }
+    }
+    return errors;
+  }
+
+  private async loadCommandCatalog(): Promise<ReadonlyMap<string, RunCliCatalogCommand> | null> {
+    if (this.commandCatalog !== undefined) return this.commandCatalog;
+    try {
+      const result = await this.runner(["help", "--json"], this.workflowRoot);
+      if (result.exitCode !== 0) {
+        this.commandCatalog = null;
+        return null;
+      }
+      const value: unknown = JSON.parse(result.stdout);
+      if (!value || typeof value !== "object") {
+        this.commandCatalog = null;
+        return null;
+      }
+      const catalogVersion = (value as { catalog_version?: unknown }).catalog_version;
+      const commands = (value as { commands?: unknown }).commands;
+      if (catalogVersion !== "2.0" || !Array.isArray(commands)) {
+        this.commandCatalog = null;
+        return null;
+      }
+      const entries = commands.filter(isRunCliCatalogCommand)
+        .map(command => [command.command, command] as const);
+      if (entries.length === 0) {
+        this.commandCatalog = null;
+        return null;
+      }
+      this.commandCatalog = new Map(entries);
+      return this.commandCatalog;
+    } catch {
+      this.commandCatalog = null;
+      return null;
+    }
   }
 
   private async requireCommand(command: string, ...fallbacks: string[]): Promise<void> {
@@ -493,6 +610,61 @@ export class RunCliAdapter {
       throw commandFailure(args, result.exitCode, result.stderr || result.stdout);
     }
   }
+}
+
+function isRunCliCatalogCommand(value: unknown): value is RunCliCatalogCommand {
+  if (!value || typeof value !== "object") return false;
+  const item = value as { command?: unknown; option_specs?: unknown; positionals?: unknown };
+  return typeof item.command === "string"
+    && Array.isArray(item.option_specs)
+    && item.option_specs.every(isRunCliCatalogOption)
+    && Array.isArray(item.positionals)
+    && item.positionals.every(isRunCliCatalogPositional);
+}
+
+function isRunCliCatalogOption(value: unknown): value is RunCliCatalogOption {
+  if (!value || typeof value !== "object") return false;
+  const item = value as Partial<RunCliCatalogOption>;
+  return Array.isArray(item.names)
+    && item.names.every(name => typeof name === "string")
+    && typeof item.required === "boolean"
+    && (item.value_arity === 0 || item.value_arity === 1 || item.value_arity === -1)
+    && typeof item.repeatable === "boolean"
+    && Array.isArray(item.choices)
+    && item.choices.every(choice => typeof choice === "string");
+}
+
+function isRunCliCatalogPositional(value: unknown): value is RunCliCatalogCommand["positionals"][number] {
+  if (!value || typeof value !== "object") return false;
+  const item = value as RunCliCatalogCommand["positionals"][number];
+  return typeof item.name === "string"
+    && typeof item.required === "boolean"
+    && typeof item.variadic === "boolean"
+    && Array.isArray(item.choices)
+    && item.choices.every(choice => typeof choice === "string");
+}
+
+function catalogEditDistance(left: string, right: string): number {
+  const row = Array.from({ length: right.length + 1 }, (_, index) => index);
+  for (let i = 1; i <= left.length; i++) {
+    let diagonal = row[0];
+    row[0] = i;
+    for (let j = 1; j <= right.length; j++) {
+      const above = row[j];
+      row[j] = left[i - 1] === right[j - 1]
+        ? diagonal
+        : Math.min(diagonal + 1, row[j] + 1, row[j - 1] + 1);
+      diagonal = above;
+    }
+  }
+  return row[right.length];
+}
+
+function closestCatalogOption(argument: string, names: readonly string[]): string | undefined {
+  return [...names]
+    .map(name => ({ name, distance: catalogEditDistance(argument, name) }))
+    .filter(item => item.distance <= 2)
+    .sort((left, right) => left.distance - right.distance || left.name.localeCompare(right.name))[0]?.name;
 }
 
 const semver = z.string().regex(

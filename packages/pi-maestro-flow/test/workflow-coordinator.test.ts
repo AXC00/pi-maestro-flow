@@ -2142,6 +2142,9 @@ test("run-control preserves success semantics and returns failure for a sanitize
   assert.equal(projected.disposition, "control_flow");
   assert.equal(projected.error.code, "LEASE_BUSY");
   assert.equal(projected.error.details.visible, true);
+  assert.equal(failureValue.error?.code, "LEASE_BUSY");
+  assert.equal(failureValue.error?.retryable, true);
+  assert.equal(failureValue.error?.next_actions, undefined);
   assert.equal(JSON.stringify(failureValue).includes("private-"), false);
 });
 
