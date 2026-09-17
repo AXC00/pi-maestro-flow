@@ -55,20 +55,16 @@ function plainLine(line: string | undefined): string {
 	return line?.replace(ANSI_ESCAPE, "").trim() ?? "";
 }
 
-function uniqueLinePositions(lines: readonly string[]): Map<string, number> {
-	const positions = new Map<string, number>();
-	const duplicates = new Set<string>();
-	for (let index = 0; index < lines.length; index += 1) {
+function lineCounts(lines: readonly string[], start: number, end: number): Map<string, number> {
+	const counts = new Map<string, number>();
+	const lo = Math.max(0, start);
+	const hi = Math.min(end, lines.length);
+	for (let index = lo; index < hi; index += 1) {
 		const key = plainLine(lines[index]);
-		if (!key || duplicates.has(key)) continue;
-		if (positions.has(key)) {
-			positions.delete(key);
-			duplicates.add(key);
-		} else {
-			positions.set(key, index);
-		}
+		if (!key) continue;
+		counts.set(key, (counts.get(key) ?? 0) + 1);
 	}
-	return positions;
+	return counts;
 }
 
 function mutableLineIdentity(line: string | undefined): string {
@@ -98,12 +94,20 @@ function crossesViewportBoundary(
 	hiddenEnd: number,
 ): boolean {
 	if (mutableRowsCrossViewportBoundary(previousLines, nextLines, hiddenEnd)) return true;
-	const previousPositions = uniqueLinePositions(previousLines);
-	const nextPositions = uniqueLinePositions(nextLines);
-	for (const [key, previousIndex] of previousPositions) {
-		const nextIndex = nextPositions.get(key);
-		if (nextIndex === undefined) continue;
-		if ((previousIndex < hiddenEnd) !== (nextIndex < hiddenEnd)) return true;
+	// A row crosses the boundary when its hidden- and visible-side counts move
+	// in opposite directions (net flow across). Counting both regions — rather
+	// than tracking unique positions — detects crossings for duplicated lines
+	// (identical agent rows, separators) that a position map silently drops,
+	// while in-place edits of hidden rows change only one side and stay frozen.
+	const prevHidden = lineCounts(previousLines, 0, hiddenEnd);
+	const prevVisible = lineCounts(previousLines, hiddenEnd, previousLines.length);
+	const nextHidden = lineCounts(nextLines, 0, hiddenEnd);
+	const nextVisible = lineCounts(nextLines, hiddenEnd, nextLines.length);
+	const keys = new Set([...prevHidden.keys(), ...prevVisible.keys(), ...nextHidden.keys(), ...nextVisible.keys()]);
+	for (const key of keys) {
+		const hiddenDelta = (nextHidden.get(key) ?? 0) - (prevHidden.get(key) ?? 0);
+		const visibleDelta = (nextVisible.get(key) ?? 0) - (prevVisible.get(key) ?? 0);
+		if (hiddenDelta !== 0 && visibleDelta !== 0 && Math.sign(hiddenDelta) !== Math.sign(visibleDelta)) return true;
 	}
 	return false;
 }
