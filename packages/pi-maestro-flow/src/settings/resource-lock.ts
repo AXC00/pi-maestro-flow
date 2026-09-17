@@ -18,7 +18,7 @@ interface LockOptions {
 
 const OPTIONS: LockOptions = {
   realpath: false,
-  stale: 10_000,
+  stale: 30_000,
   update: 2_000,
   // Higher retry capacity than a typical settings-file lock needs, so that
   // high-contention mutations (e.g. 12 concurrent fresh-process hook-trust
