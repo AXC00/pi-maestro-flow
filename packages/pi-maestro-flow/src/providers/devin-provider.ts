@@ -28,7 +28,7 @@ import {
   refreshDevinToken,
 } from "./devin-auth.ts";
 import { discoverDevinModels } from "./devin/discovery.ts";
-import { DEVIN_MODELS, DEVIN_SEED_ROUTES } from "./devin/models.ts";
+import { DEVIN_MODEL_ALLOWLIST, DEVIN_MODELS, DEVIN_SEED_ROUTES } from "./devin/models.ts";
 import { registerDevinRoutes } from "./devin/routing.ts";
 import { DEVIN_API, DEVIN_API_BASE_URL, streamDevin } from "./devin/transport.ts";
 
@@ -118,12 +118,12 @@ function formatUtcMinute(epochMs: number): string {
 
 /**
  * pi's model refresh hook: the Cascade roster is credential-scoped, so the
- * account's own lanes, effort ladders and router entries replace the seed
- * whenever discovery succeeds. The roster is published unfiltered — which
- * models to keep is pi-side configuration, not a plugin decision. Every failure
- * path returns the previous roster — the persisted catalog when offline, else
- * the static seed — because publishing an empty list would silently strip Devin
- * out of the model picker.
+ * account's own lanes and effort ladders replace the seed whenever discovery
+ * succeeds. The roster is trimmed to DEVIN_MODEL_ALLOWLIST before publishing —
+ * the raw catalog is hundreds of lanes and would flood the model picker. Every
+ * failure path returns the previous roster — the persisted catalog when
+ * offline, else the static seed — because publishing an empty list would
+ * silently strip Devin out of the model picker.
  */
 export async function refreshDevinModels(
   context: RefreshModelsContext,
@@ -141,12 +141,15 @@ export async function refreshDevinModels(
     ...(options.baseUrl ? { baseUrl: options.baseUrl } : {}),
   });
   if (!discovered) return stored ?? [...DEVIN_MODELS];
-  registerDevinRoutes(discovered.routes);
+  const models = discovered.models.filter((model) => DEVIN_MODEL_ALLOWLIST.has(model.id));
+  if (models.length === 0) return stored ?? [...DEVIN_MODELS];
+  const routes = new Map([...discovered.routes].filter(([id]) => DEVIN_MODEL_ALLOWLIST.has(id)));
+  registerDevinRoutes(routes);
   // Persist so the discovered roster survives an offline start; ``checkedAt``
   // records when the server last confirmed it.
   await context.publish({
     persist: {
-      models: discovered.models.map((model) => ({
+      models: models.map((model) => ({
         ...model,
         api: model.api ?? DEVIN_API,
         provider: DEVIN_PROVIDER_ID,
@@ -155,7 +158,7 @@ export async function refreshDevinModels(
       checkedAt: Date.now(),
     },
   });
-  return [...discovered.models];
+  return [...models];
 }
 
 export function registerDevinProvider(pi: ExtensionAPI): void {

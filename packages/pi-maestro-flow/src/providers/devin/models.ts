@@ -7,9 +7,20 @@
  * verified live through `GetCliModelConfigs`, so it resolves synchronously
  * before any credential-scoped discovery could run.
  *
- * Discovery publishes the account's whole roster unfiltered; which of those
- * models the user keeps is decided in pi's own configuration, not here.
+ * Discovery publishes only the allowlisted lanes below: the account's Cascade
+ * roster is a few hundred entries (mostly the fusion combinatorial matrix), so
+ * exposing it verbatim floods the model picker and the teammate catalog.
  */
+
+/**
+ * Lane ids kept from a discovered roster. Everything else — fusion lanes,
+ * routers, unclassified/internal lanes — is dropped before publishing.
+ */
+export const DEVIN_MODEL_ALLOWLIST: ReadonlySet<string> = new Set([
+  "gpt-6-astra",
+  "gpt-5-6-sol",
+  "swe-2",
+]);
 
 import type { ProviderModelConfig } from "@earendil-works/pi-coding-agent";
 

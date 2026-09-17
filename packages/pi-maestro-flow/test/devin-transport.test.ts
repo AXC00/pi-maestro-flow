@@ -1097,8 +1097,8 @@ test("refreshDevinModels keeps a roster on every fallback path", async (t) => {
     await failing.close();
   }
 
-  // Online with a working catalog: the account's whole roster replaces the seed,
-  // every ladder reaches the route table, and the catalog is persisted.
+  // Online with a working catalog: the allowlisted lanes replace the seed,
+  // their ladders reach the route table, and the catalog is persisted.
   const edge = await startFakeEdge(() => ({
     chunks: [
       Buffer.from(toBinary(
@@ -1118,16 +1118,14 @@ test("refreshDevinModels keeps a roster on every fallback path", async (t) => {
       { baseUrl: edge.baseUrl },
     );
     const ids = discovered.map((model) => model.id).sort();
-    assert.ok(ids.includes("swe-2"), "the account's own SWE-2 lane must be published");
-    assert.ok(ids.includes("swe-1-7"), "the roster is published unfiltered");
-    assert.ok(ids.includes("MODEL_ROUTER"), "routers are published unfiltered");
+    assert.deepEqual(ids, ["swe-2"], "only allowlisted lanes are published");
     assert.deepEqual(lookupDevinRoute("swe-2"), {
       uid: "swe-2-high",
       byEffort: { medium: "swe-2-medium", high: "swe-2-high", max: "swe-2-max" },
       router: false,
     });
-    assert.equal(resolveDevinWireUid("swe-1-7", "xhigh"), "swe-1-7-high");
-    assert.equal(lookupDevinRoute("MODEL_ROUTER")?.router, true);
+    assert.equal(lookupDevinRoute("swe-1-7"), undefined, "non-allowlisted lanes keep no route");
+    assert.equal(lookupDevinRoute("MODEL_ROUTER"), undefined, "routers are filtered out");
     assert.equal(published.length, 1);
     const persist = published[0]?.persist;
     assert.ok(persist);
