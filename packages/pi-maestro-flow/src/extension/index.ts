@@ -1262,6 +1262,18 @@ export default function registerMaestroExtension(pi: ExtensionAPI): void {
   );
   if (process.env.PI_TEAMMATE_CHILD === "1") {
     pi.on("session_shutdown", () => disposeCompletionDurabilityProvider());
+    // Teammate children resolve --model against providers registered in their
+    // own process. Pi core composes only models.json providers by itself, so
+    // an extension-only provider like devin must be registered here too —
+    // otherwise dispatching devin/* to a teammate fails startup with
+    // "Model not found".
+    try {
+      registerDevinProvider(pi);
+    } catch (error) {
+      console.error(
+        `[maestro] Devin provider registration warning: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
     registerMaestroChildSurface(pi);
     return;
   }
