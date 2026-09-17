@@ -1,9 +1,10 @@
 /**
  * Durable Plan mode lifecycle.
  *
- * Act mode exposes plan-enter. Plan mode keeps the existing non-editing tool
- * surface plus plan-update/review/confirm/exit/status. Markdown drafts are
- * persisted by workspace and chat session; approval must commit before Act tools are restored.
+ * Act mode exposes plan-enter. Plan mode keeps the full tool surface; the
+ * tool-call hook blocks only the built-in file-editing tools until approval.
+ * Markdown drafts are persisted by workspace and chat session; approval must
+ * commit before Act tools are restored.
  */
 
 import { join } from "node:path";
@@ -19,7 +20,6 @@ import { altKey } from "../key-labels.ts";
 import type { UserAttentionHandler } from "../notify/user-attention.ts";
 import { toolCallLine, toolResultLine, resultSummary } from "pi-cockpit/src/quiet-tools.ts";
 import { buildPlanDecomposeContract, PlanDecomposeParams } from "./plan-decompose.ts";
-import { isRunControlReadAction, isRunControlReadArgv } from "./run-control.ts";
 import {
   openPlanConfirmation,
   type PlanConfirmationModelTransition,
@@ -822,86 +822,15 @@ export function onToolCallPlan(event: {
   input: Record<string, unknown>;
 }, _bypassHandoff = false): { block: true; reason: string } | undefined {
   if (mode !== "plan") return undefined;
-  const toolName = event.toolName.toLowerCase();
-  const action = typeof event.input.action === "string" ? event.input.action : "";
-  if (toolName === "run-control") {
-    const argv = Array.isArray(event.input.argv) ? event.input.argv.map(String) : [];
-    if (argv.length > 0) {
-      return isRunControlReadArgv(argv)
-        ? undefined
-        : planMutationBlock(`run-control ${argv.join(" ")}`);
-    }
-    return isRunControlReadAction(action)
-      ? undefined
-      : planMutationBlock(`run-control ${action || "mutation"}`);
-  }
-  if (toolName === "todo") {
-    return ["get", "list"].includes(action) ? undefined : planMutationBlock(`todo ${action || "mutation"}`);
-  }
-  if (toolName === "conflict") {
-    return action === "list" || action === "diff" ? undefined : planMutationBlock(`conflict ${action || "resolve"}`);
-  }
-  if (toolName === "goal") {
-    return action === "get" ? undefined : planMutationBlock(`goal ${action || "mutation"}`);
-  }
-  if (["edit", "write", "notebookedit", "notebook_edit"].includes(toolName)) {
+  // Plan mode blocks only the built-in file-editing tools. Everything else —
+  // bash, run-control, todo, teammate, MCP, unknown tools — stays available.
+  // A lexical mutation scanner is an incomplete guard anyway, and a long
+  // blocklist false-blocks read-only tools (e.g. mcp search); the plan-mode
+  // prompt carries the read-only planning convention instead.
+  if (["edit", "write", "notebookedit", "notebook_edit"].includes(event.toolName.toLowerCase())) {
     return planMutationBlock(event.toolName);
   }
-  if (toolName === "bash" || toolName === "bash_bg") {
-    if (toolName === "bash_bg" && ["status", "wait", "list"].includes(action)) return undefined;
-    const command = typeof event.input.command === "string"
-      ? event.input.command
-      : typeof event.input.task === "string" ? event.input.task : "";
-    return isMutatingPlanShell(command)
-      ? planMutationBlock(event.toolName, "the command modifies files or system state")
-      : undefined;
-  }
-  if (toolName === "computer_use") {
-    return planMutationBlock(`computer_use ${action || "unknown"}`);
-  }
-  if (toolName === "browser") {
-    return action === "open" || action === "close" ? undefined : planMutationBlock(`browser ${action || "run"}`);
-  }
-  if (toolName === "lsp") {
-    const readActions = [
-      "diagnostics", "definition", "references", "hover", "symbols", "type_definition",
-      "implementation", "status", "capabilities", "request",
-    ];
-    if (readActions.includes(action)) return undefined;
-    if (["rename", "rename_file", "code_actions"].includes(action) && event.input.apply !== true) return undefined;
-    return planMutationBlock(`lsp ${action || "mutation"}`);
-  }
-  if (toolName === "teammate") {
-    // Plan mode permits only the built-in read-only planning roles at root.
-    const readOnlyAgents = new Set(["analyst", "research", "explorer", "planner"]);
-    const topLevelAgent = typeof event.input.agent === "string" ? event.input.agent : "general";
-    const tasks = Array.isArray(event.input.tasks) ? event.input.tasks : [];
-    const agents = tasks.length > 0
-      ? tasks.map((task) => task && typeof task === "object"
-        && typeof (task as Record<string, unknown>).agent === "string"
-        ? (task as Record<string, unknown>).agent as string
-        : topLevelAgent)
-      : [topLevelAgent];
-    return agents.every((agent) => readOnlyAgents.has(agent))
-      ? undefined
-      : planMutationBlock(`teammate ${agents.join(", ")}`);
-  }
-  if (toolName === "teammate-send") {
-    // Plan mode allows targeted revision of the same read-only teammate
-    // (steer/follow_up are message injections, not project mutations), but still
-    // blocks abort, which terminates the agent and its subtree.
-    const mode = typeof event.input.mode === "string" ? event.input.mode : "steer";
-    return mode === "abort"
-      ? planMutationBlock("teammate-send abort")
-      : undefined;
-  }
-  if (new Set([
-    "read", "grep", "glob", "ls", "find", "ffgrep", "fffind", "ask-user-question",
-    "teammate-list", "teammate-watch", "observe", "search_tool_bm25", "smart_search", "source_check",
-    "resource", "session_history",
-    "plan-enter", "plan-update", "plan-review", "plan-confirm", "plan-exit", "plan-status",
-  ]).has(toolName)) return undefined;
-  return planMutationBlock(event.toolName);
+  return undefined;
 }
 
 function planMutationBlock(operation: string, detail?: string): { block: true; reason: string } {
@@ -909,128 +838,6 @@ function planMutationBlock(operation: string, detail?: string): { block: true; r
     block: true,
     reason: `Plan mode is read-only before approval; ${operation} is blocked${detail ? ` (${detail})` : ""}. Approve or exit the Plan first.`,
   };
-}
-
-/**
- * Default-allow bash in Plan mode: only clearly mutating commands are blocked.
- * The scan is lexical over the whole command; quoted strings are excluded from
- * verb matching (so `rg -rn "rm" .` is not a false positive) while `bash -c
- * "rm -rf src"` is still caught by the shell -c rule. Deliberate evasion via
- * interpreters (`node -e`, `python -c`) is out of scope: this is an
- * accidental-mutation guard, not a sandbox.
- */
-// Lookbehind instead of \b: a hyphen before the verb is a flag fragment
-// (e.g. `rg -ln`), not a command verb — \b would match inside it because `-`
-// is a word boundary.
-const MUTATING_SHELL_VERBS = /(?<![\w-])(?:rm|rmdir|unlink|mv|mkdir|touch|truncate|ln|cp|dd|shred|tee|install|chmod|chown|chgrp|mkfs\w*|mount|umount|kill|pkill|killall|systemctl|service|reboot|halt|poweroff|shutdown|scp|rsync|sftp|vim|vi|nano|make|ninja|mvn|gradle|docker|kubectl|terraform|eval|tar|gzip|gunzip|bzip2|bunzip2|xz|unxz|zstd|unzstd|zip|unzip|7z|7za|rar|unrar)\b/;
-const IN_PLACE_EDIT = /(?:^|\s)-[a-z]*i(?:[a-z]|\.|\s|$)/i;
-const SHELL_EXEC_FLAG = /(?:^|\s)-(?:[a-zA-Z]*c|Command)(?:\s|$)|(?:^|\s)\/c(?:\s|$)/;
-const SHELL_FAMILY = /\b(?:bash|sh|zsh|ksh|dash|fish|pwsh|powershell|cmd|command)\b/;
-const GIT_READ_SUBCOMMANDS = new Set([
-  "status", "diff", "log", "show", "grep", "ls-files", "ls-tree", "ls-remote",
-  "rev-parse", "rev-list", "blame", "describe", "shortlog", "branch", "tag",
-  "help", "version", "range-diff", "cherry", "whatchanged", "merge-base",
-  "cat-file", "check-ignore", "diff-tree", "name-rev",
-]);
-const NPM_WRITE_VERBS = /(?:^|\s)(?:install|add|remove|uninstall|update|upgrade|run|exec|publish|init|create|set|pack|link|unlink|dedupe|prune|rebuild|ci)(?=\s|$)/;
-const PIP_WRITE_VERBS = /(?:^|\s)(?:install|uninstall|download|wheel|build)(?=\s|$)/;
-const APT_WRITE_VERBS = /(?:^|\s)(?:install|uninstall|remove|update|upgrade|purge|autoremove|clean|dist-upgrade|full-upgrade|tap|untap|link|unlink|build|rebuild|reinstall)(?=\s|$)/;
-const CURL_WRITE_FLAGS = /(?:^|\s)-(?:[A-Za-z]*[oOD]|-d|-F|-T)(?:\s|$|=)|(?:^|\s)--(?:output(?:-document)?|data(?:-raw|-url)?|form|upload-file|cookie-jar)(?:\s|=)|(?:^|\s)-(?:X|--request)(?:\s|=)(?:POST|PUT|PATCH|DELETE)\b/i;
-// Maestro CLI read commands; everything else mutates the workflow ledger.
-const MAESTRO_READ_TOP = new Set(["search", "load", "wiki", "explore", "arch-kb", "help", "version"]);
-const MAESTRO_READ_SUB = new Map<string, Set<string>>([
-  ["run", new Set(["status", "brief", "check", "prepare"])],
-  ["session", new Set(["status"])],
-  ["spec", new Set(["history"])],
-  ["knowledge", new Set(["review", "search"])],
-]);
-
-function isMutatingPlanShell(command: string): boolean {
-  const normalized = command.trim();
-  if (!normalized) return false;
-  // Command substitution and backticks run arbitrary code: scan their payload.
-  for (const segment of normalized.match(/\$\([^()]*\)|`[^`]*`/g) ?? []) {
-    const payload = segment.startsWith("$(") ? segment.slice(2, -1) : segment.slice(1, -1);
-    if (isMutatingPlanShell(payload)) return true;
-  }
-  // Quoted strings are data, not commands: drop them before the lexical scan.
-  const unquoted = normalized.replace(/'(?:[^'\\]|\\.)*'|"(?:[^"\\]|\\.)*"/g, "");
-  // File-write redirection (`>`, `>>`, `&>`, `2>`); `>&` is fd duplication, not a write.
-  if (/>(?![&<])(?!\s*\/dev\/null\b)/.test(unquoted)) return true;
-  if (MUTATING_SHELL_VERBS.test(unquoted)) return true;
-  // In-place editing rewrites files; sed/perl/awk without -i is a read filter.
-  if (/\b(?:sed|perl|awk)\b/.test(unquoted) && IN_PLACE_EDIT.test(unquoted)) return true;
-  // Exec hooks can run arbitrary programs.
-  if (/(?:^|\s)--pre(?:=|\s|$)/.test(unquoted)) return true;
-  if (/(?:^|\s)-delete(?:\s|$)/.test(unquoted)) return true;
-  // Shell -c / cmd /c executes a script string; block rather than trust its content.
-  if (SHELL_FAMILY.test(unquoted) && SHELL_EXEC_FLAG.test(unquoted)) return true;
-  if (hasMutatingGitCall(unquoted)) return true;
-  if (hasMutatingMaestroCall(unquoted)) return true;
-  if (/\b(?:npm|npx|yarn|pnpm|bun)\b/.test(unquoted) && NPM_WRITE_VERBS.test(unquoted)) return true;
-  if (/\b(?:pip|pip3)\b/.test(unquoted) && PIP_WRITE_VERBS.test(unquoted)) return true;
-  if (/\b(?:apt|apt-get|dnf|yum|brew|scoop|choco|winget|port)\b/.test(unquoted) && APT_WRITE_VERBS.test(unquoted)) return true;
-  if (/\bcurl\b/.test(unquoted) && CURL_WRITE_FLAGS.test(unquoted)) return true;
-  // wget writes a file unless output goes to stdout (-O- / -O -).
-  if (/\bwget\b/.test(unquoted) && !/(?:-O-|-O\s+-)/.test(unquoted)) return true;
-  return false;
-}
-
-function hasMutatingGitCall(command: string): boolean {
-  const sub = gitSubcommand(command);
-  if (sub?.verb === undefined) return false;
-  if (/(?:^|\s)--(?:output(?:=|\s)|ext-diff(?:\s|$)|textconv(?:\s|$))/.test(sub.rest)) return true;
-  if (!GIT_READ_SUBCOMMANDS.has(sub.verb)) return true;
-  // branch/tag are read as bare listing but write with delete/rename/annotate flags.
-  if (sub.verb === "branch" || sub.verb === "tag") {
-    const writeFlags = sub.verb === "branch" ? "dDmMcC" : "aftdm";
-    if (new RegExp(`\\b${sub.verb}\\s+-[${writeFlags}](?:\\s|$)`).test(sub.rest)) return true;
-  }
-  return false;
-}
-
-function hasMutatingMaestroCall(command: string): boolean {
-  const sub = maestroSubcommand(command);
-  if (sub?.verb === undefined) return false;
-  if (MAESTRO_READ_TOP.has(sub.verb)) return false;
-  const readVerbs = MAESTRO_READ_SUB.get(sub.verb);
-  return !readVerbs || !readVerbs.has(sub.rest.trim().split(/\s+/)[0] ?? "");
-}
-
-function gitSubcommand(command: string): { verb: string | undefined; rest: string } | undefined {
-  const tokens = command.split(/\s+/);
-  const index = tokens.findIndex((token) => token === "git");
-  if (index < 0) return undefined;
-  let cursor = index + 1;
-  while (cursor < tokens.length) {
-    const token = tokens[cursor]!;
-    if (["-C", "--git-dir", "--work-tree", "--namespace", "-c", "--config-env"].includes(token)) {
-      cursor += 2;
-      continue;
-    }
-    if (token.startsWith("-")) {
-      cursor += 1;
-      continue;
-    }
-    return { verb: token, rest: tokens.slice(cursor).join(" ") };
-  }
-  return { verb: undefined, rest: "" };
-}
-
-function maestroSubcommand(command: string): { verb: string | undefined; rest: string } | undefined {
-  const tokens = command.split(/\s+/);
-  const index = tokens.findIndex((token) => token === "maestro");
-  if (index < 0) return undefined;
-  let cursor = index + 1;
-  while (cursor < tokens.length) {
-    const token = tokens[cursor]!;
-    if (token.startsWith("-")) {
-      cursor += 1;
-      continue;
-    }
-    return { verb: token, rest: tokens.slice(cursor + 1).join(" ") };
-  }
-  return { verb: undefined, rest: "" };
 }
 
 
@@ -2232,9 +2039,9 @@ function buildPlanEnterNote(): string {
     "<system-reminder>",
     "## Plan Mode Just Activated",
     "Plan mode was activated (via user toggle or plan-enter). The tool surface is UNCHANGED for prompt-cache stability,",
-    "but the tool-call hook enforces a read-only boundary until approval:",
-    "- Project edits, Workflow/Todo/Goal mutations, write teammates, and mutating shell/browser calls are blocked.",
-    "- Read, search, exploration, and canonical Workflow read actions remain available.",
+    "and the tool-call hook blocks only the built-in file-editing tools (Write/Edit) until approval.",
+    "Keep planning read-only by convention: research, search, and inspect freely, but do not mutate",
+    "project files, Workflow/Todo/Goal state, or external systems while shaping the draft.",
     "- Plan tools: plan-update, plan-review, plan-confirm, plan-exit, plan-status.",
     "",
     "Workflow: research → plan-update (persist draft) → plan-confirm (present to user) in the same turn.",
@@ -2255,9 +2062,9 @@ function buildPlanEnterNote(): string {
     "  prescriptive constraint. Plan candidate staging only when the quality bar is met; otherwise require",
     "  an explicit zero-candidate result. Actual knowledge writes happen after approval in Act/Run mode.",
     "",
-    "Agent boundary (the hook only lets you dispatch `explorer` and `planner`):",
-    "- Never use plan-exit to bypass a blocked role or tool. Stay in Plan mode and reshape the work",
-    "  to the allowed read-only boundary; use plan-exit only when the user wants to abandon planning.",
+    "Agent boundary (Plan-mode work stays read-only — dispatch only read-only roles):",
+    "- Never use plan-exit to bypass Plan-mode boundaries. Stay in Plan mode and reshape the work",
+    "  to the read-only planning boundary; use plan-exit only when the user wants to abandon planning.",
     "- Standard flow (broad or uncertain scope): dispatch `explorer` ONCE with batched parallel",
     "  prompts; unless the cross-module escalation below applies, dispatch one `planner`, passing",
     "  each explorer result's exact `agent://` publication ID as an immutable briefing reference",

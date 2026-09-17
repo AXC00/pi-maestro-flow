@@ -1274,7 +1274,7 @@ test("Plan hooks preserve read-only discovery and block mutations before approva
     assert.match(planPrompt, /unless the cross-module escalation below applies, dispatch one `planner`/);
     assert.match(planPrompt, /exact `agent:\/\/` publication ID as an immutable briefing reference/);
     assert.match(planPrompt, /correlation ID only when latest-turn semantics are intentional/);
-    assert.match(planPrompt, /Never use plan-exit to bypass a blocked role or tool/);
+    assert.match(planPrompt, /Never use plan-exit to bypass Plan-mode boundaries/);
     assert.match(planPrompt, /moves to background or a bounded\s+wait times out/);
     assert.match(planPrompt, /do not begin final synthesis or call plan-update \/ plan-confirm/);
     assert.match(planPrompt, /until every required result is result-ready/);
@@ -1307,137 +1307,28 @@ test("Plan hooks preserve read-only discovery and block mutations before approva
     for (const toolName of ["Read", "ffgrep", "fffind", "smart_search", "session_history"]) {
       assert.equal(onToolCallPlan({ toolName, input: {} }), undefined, toolName);
     }
-    assert.match(onToolCallPlan({ toolName: "custom-tool", input: {} })?.reason ?? "", /blocked/);
+    // Unknown tools are no longer blocked: the hook guards only file edits.
+    assert.equal(onToolCallPlan({ toolName: "custom-tool", input: {} }), undefined);
     for (const toolName of ["Write", "Edit", "NotebookEdit"]) {
       assert.match(onToolCallPlan({ toolName, input: {} })?.reason ?? "", /read-only before approval/);
     }
-    // Bash is default-allow in Plan mode: read-only discovery stays available...
-    for (const command of [
-      "rg -n Plan src",
-      "rg -ln persistAgentOutput packages",
-      "diff -u a.txt b.txt",
-      "find . -name '*.ts'",
-      "du -sh .",
-      "ls -la | head -20",
-      "ls -la && git status --short",
-      "git log --oneline -5",
-      "git -C src status",
-      "git --no-pager diff HEAD~1",
-      "git grep -n foo src",
-      "git branch -a",
-      "git rev-parse HEAD",
-      "node --version",
-      "npm ls --depth=0",
-      "curl -sI https://example.com",
-      "sed -n '1,5p' file.txt",
-      "grep -rn \"rm -rf\" docs",
-      "cat file > /dev/null",
-      "cd /tmp && ls -la",
-      "maestro search \"plan mode\" --json",
-      "maestro knowledge review --json",
-      "maestro run status --json",
-      "$(date)",
+    // The hook blocks only the built-in file-editing tools; every other tool —
+    // bash, run-control, todo, teammate, MCP, unknown tools — stays available.
+    for (const call of [
+      { toolName: "bash", input: { command: "rm -rf src" } },
+      { toolName: "bash", input: { command: "git push origin main" } },
+      { toolName: "bash", input: { command: "npm install lodash" } },
+      { toolName: "run-control", input: { action: "next" } },
+      { toolName: "run-control", input: { argv: ["run", "done", "run-1"] } },
+      { toolName: "todo", input: { action: "create" } },
+      { toolName: "goal", input: { action: "create" } },
+      { toolName: "mcp", input: { tool: "web_search", args: "{}" } },
+      { toolName: "computer_use", input: { action: "guide" } },
+      { toolName: "teammate", input: { tasks: [{ prompt: "implement", agent: "general" }] } },
+      { toolName: "teammate-send", input: { to: "planner-1", mode: "abort" } },
     ]) {
-      assert.equal(
-        onToolCallPlan({ toolName: "bash", input: { command } }),
-        undefined,
-        command,
-      );
+      assert.equal(onToolCallPlan(call), undefined, call.toolName);
     }
-    // ... only clearly mutating commands are blocked.
-    for (const command of [
-      "rm -rf src",
-      "xargs rm -f",
-      "; rm -rf src",
-      "(rm src) || true",
-      "mv a b",
-      "sed -i 's/a/b/' src/app.ts",
-      "git diff --output=review.patch",
-      "git show --ext-diff HEAD",
-      "rg --pre 'touch modified.txt' Plan src",
-      "echo hi > f.txt",
-      "git add .",
-      "git commit -m x",
-      "git push origin main",
-      "git branch -d old",
-      "git config user.name me",
-      "npm install lodash",
-      "npm run build",
-      "bash -c \"rm -rf src\"",
-      "find . -name '*.tmp' -delete",
-      "tee out.txt",
-      "curl -o f https://x",
-      "wget https://x",
-      "mkdir -p dist",
-      "maestro knowledge stage spec x",
-      "maestro run next",
-    ]) {
-      assert.match(onToolCallPlan({ toolName: "bash", input: { command } })?.reason ?? "", /blocked/, command);
-    }
-    assert.equal(onToolCallPlan({ toolName: "run-control", input: { action: "status" } }), undefined);
-    assert.equal(onToolCallPlan({ toolName: "run-control", input: { action: "brief" } }), undefined);
-    for (const action of ["next", "done", "edit"]) {
-      assert.match(onToolCallPlan({ toolName: "run-control", input: { action } })?.reason ?? "", /blocked/, action);
-    }
-    assert.equal(onToolCallPlan({ toolName: "run-control", input: { argv: ["session", "status"] } }), undefined);
-    assert.equal(onToolCallPlan({ toolName: "run-control", input: { argv: ["run", "brief", "run-1"] } }), undefined);
-    for (const argv of [
-      ["session", "next"],
-      ["run", "done", "run-1"],
-      ["run", "edit", "verify"],
-      ["session", "create", "topic"],
-    ]) {
-      assert.match(onToolCallPlan({ toolName: "run-control", input: { argv } })?.reason ?? "", /blocked/, argv.join(" "));
-    }
-    assert.equal(onToolCallPlan({ toolName: "todo", input: { action: "list" } }), undefined);
-    assert.match(onToolCallPlan({ toolName: "todo", input: { action: "create" } })?.reason ?? "", /blocked/);
-    // Plan mode dispatch allowlist permits all four built-in read-only planning roles.
-    for (const role of ["analyst", "research", "explorer", "planner"]) {
-      assert.equal(onToolCallPlan({
-        toolName: "teammate",
-        input: { tasks: [{ prompt: "inspect the Plan", agent: role }] },
-      }), undefined, role);
-    }
-    assert.equal(onToolCallPlan({
-      toolName: "teammate",
-      input: {
-        tasks: [
-          { prompt: "find entry points", agent: "explorer" },
-          { prompt: "analyze constraints", agent: "analyst" },
-        ],
-      },
-    }), undefined, "mixed read-only roles");
-    assert.match(onToolCallPlan({
-      toolName: "teammate",
-      input: { tasks: [{ prompt: "implement", agent: "general" }] },
-    })?.reason ?? "", /blocked/, "general");
-    // Plan mode allows targeted revision of a read-only teammate via teammate-send
-    // (steer/follow_up are message injections), but blocks abort (terminates the agent).
-    assert.equal(onToolCallPlan({
-      toolName: "teammate-send",
-      input: { to: "planner-1", message: "revise section 3", mode: "follow_up" },
-    }), undefined);
-    assert.equal(onToolCallPlan({
-      toolName: "teammate-send",
-      input: { to: "planner-1", message: "stop and rewrite", mode: "steer" },
-    }), undefined);
-    assert.match(onToolCallPlan({
-      toolName: "teammate-send",
-      input: { to: "planner-1", mode: "abort" },
-    })?.reason ?? "", /blocked/);
-    // Default mode (omitted) is steer — allowed.
-    assert.equal(onToolCallPlan({
-      toolName: "teammate-send",
-      input: { to: "planner-1", message: "revise section 3" },
-    }), undefined);
-    assert.match(onToolCallPlan({ toolName: "computer_use", input: { action: "guide" } })?.reason ?? "", /blocked/);
-    assert.match(onToolCallPlan({ toolName: "computer_use", input: { action: "capabilities" } })?.reason ?? "", /blocked/);
-    assert.equal(onToolCallPlan({ toolName: "goal", input: { action: "get" } }), undefined);
-    assert.match(onToolCallPlan({ toolName: "goal", input: { action: "create" } })?.reason ?? "", /blocked/);
-    assert.match(onToolCallPlan({
-      toolName: "teammate",
-      input: { tasks: [{ prompt: "write", mode: "write" }] },
-    })?.reason ?? "", /blocked/);
 
     await onAgentEndPlan({
       messages: [{ role: "assistant", content: "<proposed_plan>\n# Legacy plan\n</proposed_plan>" }],
