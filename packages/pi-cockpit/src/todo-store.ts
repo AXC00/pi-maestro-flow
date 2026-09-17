@@ -85,6 +85,8 @@ export function mapStatus(raw: unknown): TodoState | "deleted" {
 // The snapshot is authoritative for both cold start and live refresh.
 export class TodoStore {
 	private items = new Map<string, TodoItem>();
+	/** Bumped on every accepted mutation; render memo fingerprints read it. */
+	revision = 0;
 
 	hydrateFromEntries(entries: readonly RawEntry[]): boolean {
 		let entry: RawEntry | undefined;
@@ -134,6 +136,7 @@ export class TodoStore {
 		});
 		if (!changed) return false;
 		this.items = next;
+		this.revision += 1;
 		return true;
 	}
 
@@ -146,6 +149,8 @@ export class TodoStore {
 	}
 
 	clear(): void {
+		if (this.items.size === 0) return;
 		this.items.clear();
+		this.revision += 1;
 	}
 }

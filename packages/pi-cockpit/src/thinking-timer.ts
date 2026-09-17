@@ -82,6 +82,8 @@ export interface ThinkingTimerOptions {
 	isStatic?: () => boolean;
 	/** Global label fallback for when no component instance is reachable. */
 	setGlobalLabel: (label: string | undefined) => void;
+	/** Optional patch-health sink: called once per finished run with target-found. */
+	reportPatchHealth?: (active: boolean, reason?: string) => void;
 	now?: () => number;
 	/** How long the fallback final label lingers before the base returns. */
 	settleMs?: number;
@@ -96,6 +98,8 @@ export class ThinkingFoldTimer {
 	#ticker: ReturnType<typeof setInterval> | undefined;
 	#settleTimer: ReturnType<typeof setTimeout> | undefined;
 	#target: ThinkingLabelTarget | undefined;
+	/** True once a run found a live component target; reported at finish. */
+	#targetSeen = false;
 	#lastElapsedSecond: number | undefined;
 	// Invalidates pending settle restores across stop/reset boundaries so a
 	// late timer can never rewrite a label a newer run already owns.
@@ -205,6 +209,11 @@ export class ThinkingFoldTimer {
 		this.#clearTimers();
 		this.#startedAt = undefined;
 		this.#lastElapsedSecond = undefined;
+		// One report per run: a found component target means the tree walk still
+		// matches pi's internals; a miss means the label fell back to the global
+		// path (still correct, but the patch is inert).
+		this.#options.reportPatchHealth?.(this.#targetSeen, this.#targetSeen ? undefined : "no-target");
+		this.#targetSeen = false;
 		const duration = formatThinkingDuration(this.#now() - startedAt);
 		const base = this.#options.getBaseLabel() ?? tuiT("thinking.thoughts");
 		this.#paint(`${base}${this.#options.getGlyphs().separator}${duration}`, true);
@@ -229,6 +238,7 @@ export class ThinkingFoldTimer {
 	#rebuildTarget(): void {
 		const tui = this.#options.getTui();
 		this.#target = tui ? findThinkingLabelTargets(tui).at(-1) : undefined;
+		if (this.#target) this.#targetSeen = true;
 	}
 
 	#paintGlobal(label: string, settle: boolean): void {

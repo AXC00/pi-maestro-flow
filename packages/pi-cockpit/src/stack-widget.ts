@@ -8,6 +8,7 @@ import { resolveGlyphs } from "./icons.ts";
 import { agentPanelRows, panelRows } from "./viewport.ts";
 import type { AgentRow, CockpitConfig, TodoItem } from "./types.ts";
 import { agentListWindowRows, scrollWindowStart, type AgentScrollState } from "./agent-scroll.ts";
+import { agentRowsKey, memoizedLines, refId, todoItemsKey } from "./render-memo.ts";
 import { tuiT } from "./tui-i18n.ts";
 
 export interface TodoWidgetDeps {
@@ -67,6 +68,7 @@ export function visibleAgentRows(rows: AgentRow[]): AgentRow[] {
 export function makeTodoWidget(deps: TodoWidgetDeps) {
 	return (tui: TUI, theme: Theme) => {
 		const paint: PaintTheme = theme;
+		const memo = memoizedLines();
 		return {
 			render(width: number): string[] {
 				const cfg = deps.getConfig();
@@ -84,7 +86,10 @@ export function makeTodoWidget(deps: TodoWidgetDeps) {
 					expanded,
 					maxRows: panelRows(terminalRows(tui)),
 				};
-				return renderTodos(todos, expanded ? "list" : cfg.todoMode, liveWidth, paint, UTILS, opts);
+				// Host-driven frames (assistant stream, other widgets) repaint this
+				// component without touching todo state; skip the rebuild on them.
+				const key = [liveWidth, refId(paint), cfg.todoMode, expanded, cfg.icons.mode, opts.maxRows, todoItemsKey(todos)].join(";");
+				return memo(key, () => renderTodos(todos, expanded ? "list" : cfg.todoMode, liveWidth, paint, UTILS, opts));
 			},
 			invalidate(): void {},
 			dispose(): void {},
@@ -96,6 +101,96 @@ export function makeTodoWidget(deps: TodoWidgetDeps) {
 export function makeAgentWidget(deps: AgentWidgetDeps) {
 	return (tui: TUI, theme: Theme) => {
 		const paint: PaintTheme = theme;
+		const memo = memoizedLines();
+		const renderRoster = (
+			agents: AgentRow[],
+			cfg: CockpitConfig,
+			g: ReturnType<typeof resolveGlyphs>,
+			now: number,
+			liveWidth: number,
+		): string[] => {
+			// Row-leading status glyphs never spin (see todo widget above).
+			const spin = g.dotRunning;
+			const running = deps.isRunning();
+
+			const dot = theme.fg(running ? "success" : "muted", running ? g.dotRunning : g.dotIdle);
+			const displayStatuses = agents.map((agent) => effectiveAgentStatus(agent, now));
+			const failedCount = displayStatuses.filter((status) => status === "failed").length;
+			const terminatedCount = displayStatuses.filter((status) => status === "terminated").length;
+			const stalledCount = displayStatuses.filter((status) => status === "stalled").length;
+			const runCount = displayStatuses.filter((status) => status === "running" || status === "retrying").length;
+			const pendingCount = displayStatuses.filter((status) => status === "pending").length;
+			const sleepingCount = displayStatuses.filter((status) => status === "sleeping").length;
+			// This header owns the roster summary, so compact mode must not print
+			// its own count line right underneath saying the same thing.
+			const headerSegs: PrioritizedSegment[] = [
+				{ text: dot, priority: 100, clippable: false },
+				{ text: theme.fg("muted", tuiT("widget.agents.title")), priority: 90, clippable: false },
+			];
+			if (failedCount) {
+				headerSegs.push({ text: theme.fg("error", tuiT("common.failed", { count: failedCount })), priority: 95, clippable: false });
+			}
+			if (stalledCount) headerSegs.push({ text: theme.fg("error", tuiT("common.stalled", { count: stalledCount })), priority: 94, clippable: false });
+			if (terminatedCount) headerSegs.push({ text: theme.fg("warning", tuiT("common.terminated", { count: terminatedCount })), priority: 85, clippable: false });
+			if (runCount) headerSegs.push({ text: theme.fg("dim", tuiT("common.running", { count: runCount })), priority: 80, clippable: false });
+			if (pendingCount) headerSegs.push({ text: theme.fg("dim", tuiT("common.pending", { count: pendingCount })), priority: 60, clippable: false });
+			if (sleepingCount) headerSegs.push({ text: theme.fg("dim", tuiT("common.sleeping", { count: sleepingCount })), priority: 50, clippable: false });
+			const headerLine = fitLineByPriority(headerSegs, liveWidth, UTILS, theme.fg("dim", g.separator), g.ellipsis);
+			// Focused-session priority: while a selected session's detail block is
+			// open, it owns the Agent height allowance and the roster collapses to
+			// this one-line summary. The per-agent rows stay reachable through the
+			// session bar and its Alt+R selection flow, so monitoring is preserved
+			// while the session content gains the released rows.
+			if (deps.hasSessionDetail?.()) return [headerLine];
+
+			// The panel budget covers the roster header and its rows.
+			// Oldest-first storage makes the following suffix the newest activity;
+			// renderAgents restores the tree's newest-first presentation.
+			const panel = agentPanelRows(terminalRows(tui));
+			const rosterRows = panel === undefined
+				? undefined
+				: Math.max(1, panel - 1);
+			const ordered = [...agents].sort(
+				(a, b) => a.lastActivityAt - b.lastActivityAt || a.correlationId.localeCompare(b.correlationId),
+			);
+			const windowRows = agentListWindowRows(
+				tui.terminal?.columns,
+				terminalRows(tui),
+				ordered.length,
+				panel,
+			);
+			const scroll = deps.getScroll?.() ?? { offset: 0, following: true };
+			const start = scrollWindowStart(ordered.length, windowRows, scroll);
+			const visible = ordered.slice(start, start + windowRows);
+			const above = start;
+			const below = Math.max(0, ordered.length - start - windowRows);
+			const opts = {
+				glyphs: g,
+				spin,
+				now,
+				maxRows: rosterRows,
+				hideLiveDuration: cfg.staticMode,
+				agentContextRows: agents,
+			};
+			const lines: string[] = [];
+			// Was the one line in the package pushed without any width clipping.
+			lines.push(headerLine);
+			const marker = above > 0 || below > 0
+				? truncateToWidth(
+					theme.fg("dim", [
+						above > 0 ? `↑ ${tuiT("common.more", { count: above })}` : "",
+						below > 0 ? `↓ ${tuiT("common.more", { count: below })}` : "",
+					].filter(Boolean).join(` ${g.separator} `)),
+					liveWidth,
+					g.ellipsis,
+				)
+				: undefined;
+			if (marker && above > 0) lines.push(marker);
+			lines.push(...renderAgents(visible, cfg.agentsMode, liveWidth, paint, UTILS, { ...opts, withHead: false, maxRows: windowRows + 1 }));
+			if (marker && above === 0) lines.push(marker);
+			return lines;
+		};
+
 		return {
 			render(width: number): string[] {
 				const cfg = deps.getConfig();
@@ -117,86 +212,19 @@ export function makeAgentWidget(deps: AgentWidgetDeps) {
 					: roster;
 				const g = resolveGlyphs(cfg.icons.mode);
 				const now = Date.now();
-				// Row-leading status glyphs never spin (see todo widget above).
-				const spin = g.dotRunning;
-				const running = deps.isRunning();
-
-				const dot = theme.fg(running ? "success" : "muted", running ? g.dotRunning : g.dotIdle);
-				const displayStatuses = agents.map((agent) => effectiveAgentStatus(agent, now));
-				const failedCount = displayStatuses.filter((status) => status === "failed").length;
-				const terminatedCount = displayStatuses.filter((status) => status === "terminated").length;
-				const stalledCount = displayStatuses.filter((status) => status === "stalled").length;
-				const runCount = displayStatuses.filter((status) => status === "running" || status === "retrying").length;
-				const pendingCount = displayStatuses.filter((status) => status === "pending").length;
-				const sleepingCount = displayStatuses.filter((status) => status === "sleeping").length;
-				// This header owns the roster summary, so compact mode must not print
-				// its own count line right underneath saying the same thing.
-				const headerSegs: PrioritizedSegment[] = [
-					{ text: dot, priority: 100, clippable: false },
-					{ text: theme.fg("muted", tuiT("widget.agents.title")), priority: 90, clippable: false },
-				];
-				if (failedCount) {
-					headerSegs.push({ text: theme.fg("error", tuiT("common.failed", { count: failedCount })), priority: 95, clippable: false });
-				}
-				if (stalledCount) headerSegs.push({ text: theme.fg("error", tuiT("common.stalled", { count: stalledCount })), priority: 94, clippable: false });
-				if (terminatedCount) headerSegs.push({ text: theme.fg("warning", tuiT("common.terminated", { count: terminatedCount })), priority: 85, clippable: false });
-				if (runCount) headerSegs.push({ text: theme.fg("dim", tuiT("common.running", { count: runCount })), priority: 80, clippable: false });
-				if (pendingCount) headerSegs.push({ text: theme.fg("dim", tuiT("common.pending", { count: pendingCount })), priority: 60, clippable: false });
-				if (sleepingCount) headerSegs.push({ text: theme.fg("dim", tuiT("common.sleeping", { count: sleepingCount })), priority: 50, clippable: false });
-				const headerLine = fitLineByPriority(headerSegs, liveWidth, UTILS, theme.fg("dim", g.separator), g.ellipsis);
-				// Focused-session priority: while a selected session's detail block is
-				// open, it owns the Agent height allowance and the roster collapses to
-				// this one-line summary. The per-agent rows stay reachable through the
-				// session bar and its Alt+R selection flow, so monitoring is preserved
-				// while the session content gains the released rows.
-				if (deps.hasSessionDetail?.()) return [headerLine];
-
-				// The panel budget covers the roster header and its rows.
-				// Oldest-first storage makes the following suffix the newest activity;
-				// renderAgents restores the tree's newest-first presentation.
-				const panel = agentPanelRows(terminalRows(tui));
-				const rosterRows = panel === undefined
-					? undefined
-					: Math.max(1, panel - 1);
-				const ordered = [...agents].sort(
-					(a, b) => a.lastActivityAt - b.lastActivityAt || a.correlationId.localeCompare(b.correlationId),
-				);
-				const windowRows = agentListWindowRows(
-					tui.terminal?.columns,
-					terminalRows(tui),
-					ordered.length,
-					panel,
-				);
+				// Host-driven frames repaint this widget without touching agent state.
+				// The wall clock only matters while a live duration is on screen.
+				const needsClock = !cfg.staticMode
+					&& agents.some((row) => row.status === "running" || row.status === "retrying");
 				const scroll = deps.getScroll?.() ?? { offset: 0, following: true };
-				const start = scrollWindowStart(ordered.length, windowRows, scroll);
-				const visible = ordered.slice(start, start + windowRows);
-				const above = start;
-				const below = Math.max(0, ordered.length - start - windowRows);
-				const opts = {
-					glyphs: g,
-					spin,
-					now,
-					maxRows: rosterRows,
-					hideLiveDuration: cfg.staticMode,
-					agentContextRows: agents,
-				};
-				const lines: string[] = [];
-				// Was the one line in the package pushed without any width clipping.
-				lines.push(headerLine);
-				const marker = above > 0 || below > 0
-					? truncateToWidth(
-						theme.fg("dim", [
-							above > 0 ? `↑ ${tuiT("common.more", { count: above })}` : "",
-							below > 0 ? `↓ ${tuiT("common.more", { count: below })}` : "",
-						].filter(Boolean).join(` ${g.separator} `)),
-						liveWidth,
-						g.ellipsis,
-					)
-					: undefined;
-				if (marker && above > 0) lines.push(marker);
-				lines.push(...renderAgents(visible, cfg.agentsMode, liveWidth, paint, UTILS, { ...opts, withHead: false, maxRows: windowRows + 1 }));
-				if (marker && above === 0) lines.push(marker);
-				return lines;
+				const memoKey = [
+					liveWidth, refId(paint), cfg.agentsMode, cfg.icons.mode, cfg.staticMode, cfg.quietMode,
+					deps.isRunning(), deps.hasSessionDetail?.() === true,
+					scroll.offset, scroll.following, terminalRows(tui),
+					needsClock ? Math.floor(now / 1000) : "-",
+					agentRowsKey(agents),
+				].join(";");
+				return memo(memoKey, () => renderRoster(agents, cfg, g, now, liveWidth));
 			},
 			invalidate(): void {},
 			dispose(): void {},

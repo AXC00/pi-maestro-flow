@@ -1,6 +1,11 @@
 /**
  * Extension system types.
  *
+ * @deprecated Stale snapshot of pi's extension types (pre-0.84). Nothing in the
+ * workspace imports this file; the authoritative types live in
+ * `node_modules/@earendil-works/pi-coding-agent/dist/core/extensions/types.d.ts`.
+ * Kept for external tooling that may reference it by path.
+ *
  * Extensions are TypeScript modules that can:
  * - Subscribe to agent lifecycle events
  * - Register LLM-callable tools

@@ -1,5 +1,6 @@
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import { readFileSync, statSync } from "node:fs";
+import { createRequire } from "node:module";
 import { getAgentDir, type ExtensionAPI, type ExtensionCommandContext, type ExtensionContext, type Theme, type ThemeColor } from "@earendil-works/pi-coding-agent";
 import type { TUI } from "@earendil-works/pi-tui";
 import { ambientKeysShouldYield, capturingOverlayVisible } from "./capturing-overlay.ts";
@@ -25,6 +26,8 @@ import { MaestroStore } from "./maestro-store.ts";
 import { createSidebarController, type SidebarController } from "./sidebar-controller.ts";
 import { COCKPIT_SPLIT_PANE_MARKER } from "./split-pane.ts";
 import { attachViewportStability, type ViewportStabilityPatch } from "./viewport-stability.ts";
+import { patchSummary, reportPatch } from "./patch-health.ts";
+import { agentRowsKey, bashJobsKey, memoized, memoizedLines, refId } from "./render-memo.ts";
 import { attachCompactionStyle, type CompactionStylePatch } from "./compaction-style.ts";
 import {
 	COCKPIT_EDITOR_BOTTOM_MARKER,
@@ -78,7 +81,7 @@ import {
 import { makeWindowThreadWidget } from "./window-thread-view.ts";
 import { agentPanelRows, panelRows } from "./viewport.ts";
 import { createZenBrowseController, type ZenBrowseController } from "./zen-browse.ts";
-import { enumerateZenNavRows, renderZenStack } from "./zen-render.ts";
+import { buildZenStack } from "./zen-render.ts";
 import {
 	ZenSheet,
 	buildZenMissionSheet,
@@ -386,6 +389,25 @@ export default function (pi: ExtensionAPI): void {
 	let stabilityTui: TUI | undefined;
 	let viewportStabilityPatch: ViewportStabilityPatch | undefined;
 	let compactionStylePatch: CompactionStylePatch | undefined;
+
+	// pi-tui versions the host patches were validated against. A mismatch does
+	// not block anything — every patch fails closed — but the user should know
+	// the cockpit is running on an unverified host shape.
+	const VERIFIED_PI_TUI = /^(0\.83\.|0\.84\.)/;
+	let hostVersionWarned = false;
+	const checkHostVersion = (ctx: ExtensionContext): void => {
+		if (hostVersionWarned) return;
+		try {
+			const require = createRequire(import.meta.url);
+			const pkgPath = require.resolve("@earendil-works/pi-tui/package.json");
+			const version = (JSON.parse(readFileSync(pkgPath, "utf8")) as { version?: string }).version;
+			if (!version || VERIFIED_PI_TUI.test(version)) return;
+			hostVersionWarned = true;
+			ctx.ui.notify(tuiT("notice.hostVersion", { version }), "warning");
+		} catch {
+			// version probe is best-effort; never block session start
+		}
+	};
 	const ensureViewportStability = (tui: TUI): void => {
 		// Native fullscreen owns a fixed application viewport and has no main-screen
 		// applyLineResets hook. Do not cache that expected miss: the same dynamic TUI
@@ -394,6 +416,7 @@ export default function (pi: ExtensionAPI): void {
 		if (stabilityTui === tui && viewportStabilityPatch?.active) return;
 		viewportStabilityPatch?.detach();
 		const patch = attachViewportStability(tui);
+		reportPatch("viewport-stability", patch.active, patch.reason);
 		viewportStabilityPatch = patch;
 		stabilityTui = patch.active ? tui : undefined;
 	};
@@ -496,6 +519,7 @@ export default function (pi: ExtensionAPI): void {
 		getTheme: () => lastCtx?.ui.theme,
 		getGlyphs: () => resolveGlyphs(config.icons.mode),
 	});
+	reportPatch("compaction-style", compactionStylePatch.active, compactionStylePatch.reason);
 	// Guarded edit replaces the built-in edit (same name, same execution, plus a
 	// UTF-8 gate): editing a non-UTF-8 file would otherwise corrupt its bytes.
 	registerGuardedEditTool(pi);
@@ -526,6 +550,7 @@ export default function (pi: ExtensionAPI): void {
 				// non-TUI or mid-teardown
 			}
 		},
+		reportPatchHealth: (active, reason) => reportPatch("thinking-label", active, reason),
 	});
 
 	// The streaming line, the tab title and the footer status slot are all fed from
@@ -1033,7 +1058,12 @@ export default function (pi: ExtensionAPI): void {
 			(tui) => {
 				capturedTui = tui;
 				ensureViewportStability(tui);
-				controller.attach(tui);
+				try {
+					controller.attach(tui);
+					reportPatch("editor-bottom", true);
+				} catch (error) {
+					reportPatch("editor-bottom", false, error instanceof Error ? error.message : "attach-error");
+				}
 				controller.show();
 				return createEditorBottomSentinel();
 			},
@@ -1080,6 +1110,7 @@ export default function (pi: ExtensionAPI): void {
 			claudeEditorInstalled = false;
 		}
 		if (current) {
+			reportPatch("custom-editor", false, "foreign-owner");
 			if (!claudeEditorForeignWarned) {
 				claudeEditorForeignWarned = true;
 				ctx.ui.notify(
@@ -1105,6 +1136,7 @@ export default function (pi: ExtensionAPI): void {
 			),
 		}));
 		claudeEditorInstalled = true;
+		reportPatch("custom-editor", true);
 	};
 
 	const clearClaudeEditor = (ctx: ExtensionContext): void => {
@@ -1170,7 +1202,12 @@ export default function (pi: ExtensionAPI): void {
 			COCKPIT_FULLSCREEN_WIDGET_KEY,
 			(tui) => {
 				capturedTui = tui;
-				controller.attach(tui);
+				try {
+					controller.attach(tui);
+					reportPatch("fullscreen", true);
+				} catch (error) {
+					reportPatch("fullscreen", false, error instanceof Error ? error.message : "attach-error");
+				}
 				return { render: () => [] as string[], invalidate() {} };
 			},
 			{ placement: "aboveEditor" },
@@ -1259,6 +1296,7 @@ export default function (pi: ExtensionAPI): void {
 					getExpanded: effectiveTodoExpanded,
 					isAnimating,
 				})(tui, theme);
+				const zenMemo = memoized<ReturnType<typeof buildZenStack>>();
 				// stackStyle is dispatched per render, not per install, so a settings
 				// toggle switches the projection live without re-registering widgets.
 				return {
@@ -1267,20 +1305,36 @@ export default function (pi: ExtensionAPI): void {
 							zenNavRows = [];
 							return todoWidget.render(width);
 						}
-						const input = {
+						const agentRows = sessionUi.mode === "window" ? [] : visibleAgentRows(agents.snapshot());
+						const jobs = bashBg.snapshot();
+						const now = Date.now();
+						// The wall clock only feeds live durations; when nothing is live a
+						// host-driven frame (assistant stream) can reuse the last build.
+						const needsClock = !config.staticMode
+							&& (agentRows.some((row) => row.status === "running" || row.status === "retrying")
+								|| jobs.some((job) => job.status === "running" || job.status === "stopping"));
+						const browse = browseController.state();
+						const memoKey = [
+							width, refId(theme), config.icons.mode, config.staticMode, config.todoExpanded,
+							effectiveTodoExpanded(), sessionUi.mode, panelRows(terminalRows(tui)),
+							browse?.selectedId ?? "", browse?.expandedId ?? "",
+							needsClock ? Math.floor(now / 1000) : "-",
+							maestro.contentRevision, todos.revision, bashBg.revision, agentRowsKey(agentRows), bashJobsKey(jobs),
+						].join(";");
+						const stack = zenMemo(memoKey, () => buildZenStack({
 							maestro: maestro.snapshot(),
 							todos: todos.snapshot(),
-							agents: sessionUi.mode === "window" ? [] : visibleAgentRows(agents.snapshot()),
-							jobs: bashBg.snapshot(),
+							agents: agentRows,
+							jobs,
 							config: { ...config, todoExpanded: effectiveTodoExpanded() },
 							width,
 							theme,
-							now: Date.now(),
+							now,
 							maxRows: panelRows(terminalRows(tui)),
-							browse: browseController.state(),
-						};
-						zenNavRows = enumerateZenNavRows(input);
-						return renderZenStack(input);
+							browse,
+						}));
+						zenNavRows = stack.navIds;
+						return stack.lines;
 					},
 					invalidate(): void { todoWidget.invalidate(); },
 					dispose(): void { todoWidget.dispose(); },
@@ -1506,6 +1560,7 @@ export default function (pi: ExtensionAPI): void {
 			}, WIDTH_POLL_INTERVAL_MS);
 			widthTimer.unref?.();
 			const unsubscribeBranch = footerData.onBranchChange(() => tui.requestRender());
+			const footerMemo = memoizedLines();
 			const component = {
 				render(width: number): string[] {
 					if (Number.isFinite(width) && width > 0) observedWidth = width;
@@ -1514,8 +1569,9 @@ export default function (pi: ExtensionAPI): void {
 					const extensionStatuses = collectExtensionStatuses(footerData.getExtensionStatuses());
 					const glyphs = resolveGlyphs(config.icons.mode);
 					const now = nowSnapshot;
+					const jobs = bashBg.snapshot();
 					const bashBgStatus = renderBashBgSummary(
-						bashBg.snapshot(),
+						jobs,
 						width,
 						theme,
 						FOOTER_UTILS,
@@ -1526,7 +1582,24 @@ export default function (pi: ExtensionAPI): void {
 							hideLiveDuration: config.staticMode,
 						},
 					)[0];
-					return renderFooter({
+					const totals = getUsageTotals(ctx.sessionManager.getEntries());
+					const usageStatus = config.usage.enabled && config.usage.footer
+						? usageSubsystem?.getStatus(theme, config.usage.barWidth)
+						: undefined;
+					const maestroWorkflow = maestro.workflow();
+					// Host-driven frames repaint the footer without touching its data;
+					// fingerprint the rendered inputs and skip the rebuild on them.
+					const footerKey = [
+						width, refId(theme), config.icons.mode, config.staticMode,
+						ctx.model?.id ?? "no-model", ctx.model?.provider ?? "", pi.getThinkingLevel(),
+						formatCwd(ctx.sessionManager.getCwd()),
+						cu?.percent ?? 0, cu?.tokens ?? 0, cu?.contextWindow ?? ctx.model?.contextWindow ?? 0,
+						refId(totals), config.currency ?? "", config.currencyRate ?? "",
+						branch ?? "", bashBgStatus ?? "", usageStatus ?? "",
+						extensionStatuses.map((status) => `${status.key}:${status.text}`).join("|"),
+						refId(maestroWorkflow), maestro.contentRevision,
+					].join(";");
+					return footerMemo(footerKey, () => renderFooter({
 						width,
 						model: ctx.model?.id ?? "no-model",
 						provider: ctx.model?.provider,
@@ -1535,21 +1608,19 @@ export default function (pi: ExtensionAPI): void {
 						ctxPct: cu?.percent ?? 0,
 						ctxTokens: cu?.tokens ?? 0,
 						ctxWindow: cu?.contextWindow ?? ctx.model?.contextWindow ?? 0,
-						totals: getUsageTotals(ctx.sessionManager.getEntries()),
+						totals,
 						currency: config.currency,
 						currencyRate: config.currencyRate,
 						git: branch ?? undefined,
 						bashBgStatus,
-						usageStatus: config.usage.enabled && config.usage.footer
-							? usageSubsystem?.getStatus(theme, config.usage.barWidth)
-							: undefined,
+						usageStatus,
 						workflowStatus: extensionStatuses.find((status) => status.key === WORKFLOW_STATUS_KEY)?.text,
-						maestroWorkflow: maestro.workflow(),
+						maestroWorkflow,
 						extensionStatuses: extensionStatuses.filter((status) => status.key !== WORKFLOW_STATUS_KEY),
 						glyphs,
 						theme,
 						utils: FOOTER_UTILS,
-					});
+					}));
 				},
 				invalidate(): void {},
 				dispose(): void {
@@ -1912,6 +1983,7 @@ export default function (pi: ExtensionAPI): void {
 	pi.on("session_start", (_e, ctx) => {
 		lastCtx = ctx;
 		uiPromptDepth = 0;
+		checkHostVersion(ctx);
 		ambientSurfaces.reset();
 		agentReads.bindSession(ctx.sessionManager.getSessionId());
 		agents = agentReads.current;
@@ -3287,7 +3359,9 @@ export default function (pi: ExtensionAPI): void {
 						settingsCursor = (settingsCursor + delta + rows.length) % rows.length;
 					} else if (matchesKey(data, Key.enter) || data === " " || decodeKittyPrintable(data) === " ") {
 						const row = rows[settingsCursor];
-						if (row.kind === "text") {
+						if (row.kind === "info") {
+							// read-only status row — nothing to apply
+						} else if (row.kind === "text") {
 							// Enter on a text row opens the editor with the stored value
 							// (not the "(rule-based)" display string) as the draft.
 							editingText = row.key;

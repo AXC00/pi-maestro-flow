@@ -31,8 +31,8 @@ export interface SettingsRow {
 	value: string;
 	/** What pressing Enter/Space/accel switches to — shown so the cycle is visible. */
 	next: string;
-	/** "cycle" (default) toggles on Enter; "text" opens an edit field; "select" opens a picker sub-view. */
-	kind?: "text" | "select";
+	/** "cycle" (default) toggles on Enter; "text" opens an edit field; "select" opens a picker sub-view; "info" is read-only status. */
+	kind?: "text" | "select" | "info";
 }
 
 const VIEW_MODES: ViewMode[] = ["list", "compact"];
@@ -82,10 +82,13 @@ function localizedLegacyValue(value: string): string {
 export interface LiveRowState {
 	/** pi's effective hideThinkingBlock; the thinking row is a pass-through. */
 	thinkingHidden: boolean;
+	/** One-line host-patch health summary ("5/6 · split-pane: no-slot"); empty hides the row. */
+	patchSummary?: string;
 }
 
 export function buildRows(config: CockpitConfig, live?: LiveRowState): SettingsRow[] {
 	const thinkingHidden = live?.thinkingHidden ?? false;
+	const patchSummary = live?.patchSummary ?? "";
 	const rows: SettingsRow[] = [
 		{
 			key: "enabled",
@@ -288,6 +291,18 @@ export function buildRows(config: CockpitConfig, live?: LiveRowState): SettingsR
 			next: "picker…",
 			kind: "select",
 		},
+		// Read-only status row: which pi-internal patches are actually live.
+		// Hidden entirely until the first patch attempt reports in.
+		...(patchSummary
+			? [{
+				key: "hostPatches",
+				accel: "",
+				label: "host patches",
+				value: patchSummary,
+				next: "",
+				kind: "info" as const,
+			}]
+			: []),
 	];
 	return rows.map((row) => ({
 		...row,

@@ -51,6 +51,11 @@ export class MaestroStore {
 		return this.value === undefined ? undefined : structuredClone(this.value);
 	}
 
+	/** Content fingerprint for render memoization; changes on every accepted update. */
+	get contentRevision(): string {
+		return `${this.sessionGeneration ?? "-"}/${this.revision ?? "-"}`;
+	}
+
 	/** Live workflow view for hot render paths; not a defensive copy. */
 	workflow(): MaestroWorkflowV1 | null | undefined {
 		return this.value?.workflow;

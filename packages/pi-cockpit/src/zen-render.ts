@@ -445,38 +445,33 @@ function buildRows(input: ZenRenderInput, glyphs: IconGlyphs): ZenRow[] {
 	return sections.flat();
 }
 
-/** Browsable row ids that remain visible after expansion and height folding. */
-export function enumerateZenNavRows(input: ZenRenderInput): string[] {
-	if (Math.trunc(input.width) <= 0) return [];
-	const glyphs = resolveGlyphs(input.config.icons.mode);
-	const built = buildRows(input, glyphs);
-	const positions: Array<{ id: string; row: number }> = [];
-	let renderedRows = 0;
-	for (const row of built) {
-		if (row.id !== undefined) positions.push({ id: row.id, row: renderedRows });
-		renderedRows += 1;
-		if (input.browse?.expandedId === row.id && row.expansion) renderedRows += row.expansion().length;
-	}
-	const maxRows = input.maxRows !== undefined && Number.isFinite(input.maxRows)
-		? Math.max(1, Math.trunc(input.maxRows))
-		: undefined;
-	const visibleRows = maxRows !== undefined && renderedRows > maxRows ? maxRows - 1 : renderedRows;
-	return positions.filter(({ row }) => row < visibleRows).map(({ id }) => id);
+export interface ZenStackOutput {
+	/** Final rendered lines (browse markers, expansion, fold, width truncation applied). */
+	lines: string[];
+	/** Browsable row ids that remain visible after expansion and height folding. */
+	navIds: string[];
 }
 
-export function renderZenStack(input: ZenRenderInput): string[] {
+/**
+ * Single-pass stack build: one `buildRows` feeds both the rendered lines and
+ * the browse-nav id list. The widget render path uses this so nav enumeration
+ * never pays a second row build per frame.
+ */
+export function buildZenStack(input: ZenRenderInput): ZenStackOutput {
 	const viewportWidth = Math.max(0, Math.trunc(input.width));
-	if (viewportWidth <= 0) return [];
+	if (viewportWidth <= 0) return { lines: [], navIds: [] };
 	// Zen rows carry live task, agent and job state. Leave the terminal's final
 	// column untouched so a differential repaint cannot arm auto-wrap.
 	const width = Math.max(1, viewportWidth - 1);
 	const glyphs = resolveGlyphs(input.config.icons.mode);
 	const built = buildRows(input, glyphs);
-	if (built.length === 0) return [];
+	if (built.length === 0) return { lines: [], navIds: [] };
 
 	const browse = input.browse;
+	const positions: Array<{ id: string; row: number }> = [];
 	let rows: string[] = [];
 	for (const row of built) {
+		if (row.id !== undefined) positions.push({ id: row.id, row: rows.length });
 		// Browse mode indents every row by two columns so the selection marker
 		// never reflows content when it moves between rows.
 		const marker = browse
@@ -493,6 +488,8 @@ export function renderZenStack(input: ZenRenderInput): string[] {
 	const maxRows = input.maxRows !== undefined && Number.isFinite(input.maxRows)
 		? Math.max(1, Math.trunc(input.maxRows))
 		: undefined;
+	const visibleRows = maxRows !== undefined && rows.length > maxRows ? maxRows - 1 : rows.length;
+	const navIds = positions.filter(({ row }) => row < visibleRows).map(({ id }) => id);
 	if (maxRows !== undefined && rows.length > maxRows) {
 		const kept = Math.max(0, maxRows - 1);
 		const hidden = rows.length - kept;
@@ -501,5 +498,14 @@ export function renderZenStack(input: ZenRenderInput): string[] {
 			input.theme.fg("dim", `  ${glyphs.ellipsis} ${tuiT("common.more", { count: hidden })}`),
 		];
 	}
-	return rows.map((row) => truncateToWidth(row, width, glyphs.ellipsis));
+	return { lines: rows.map((row) => truncateToWidth(row, width, glyphs.ellipsis)), navIds };
+}
+
+/** Browsable row ids that remain visible after expansion and height folding. */
+export function enumerateZenNavRows(input: ZenRenderInput): string[] {
+	return buildZenStack(input).navIds;
+}
+
+export function renderZenStack(input: ZenRenderInput): string[] {
+	return buildZenStack(input).lines;
 }

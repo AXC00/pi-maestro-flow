@@ -50,10 +50,53 @@ function buildSections(input: SidebarRenderInput): SidebarSection[] {
 	].filter((section) => section.rows.length > 0);
 }
 
+/**
+ * Row counts per section without paying for row formatting. Nav enumeration
+ * only needs `${title}:${index}` ids, so it walks the same visibility rules
+ * (empty sections drop, compact clamps to one item row) but skips painting.
+ */
+function buildSectionCounts(input: SidebarRenderInput): Array<{ title: SidebarSectionTitle; count: number }> {
+	const compact = input.width <= 35 || input.config.sidebar.density === "compact";
+	const counts: Array<{ title: SidebarSectionTitle; count: number }> = [];
+	const push = (title: SidebarSectionTitle, count: number): void => {
+		if (count > 0) counts.push({ title, count });
+	};
+
+	const workflow = input.maestro?.workflow;
+	if (workflow) {
+		// session + optional run + progress + gates + optional next
+		// (compact: session + run/progress)
+		push("Workflow", compact ? 2 : 3 + (workflow.run ? 1 : 0) + (workflow.next ? 1 : 0));
+	}
+	const goals = input.maestro?.goals ?? [];
+	if (goals.length > 0) {
+		const goal = goals.find((candidate) => candidate.id === input.maestro?.currentGoalId)
+			?? goals.find((candidate) => /running|active|progress|pause/i.test(candidate.status))
+			?? goals[0];
+		// objective + status + tokens/time + optional pause + optional multi-goal
+		push("Goal", compact ? 2 : 3 + (goal?.pauseReason ? 1 : 0) + (goals.length > 1 ? 1 : 0));
+	}
+	if (input.todos.length > 0) {
+		// summary + visible items (compact keeps one)
+		push("Tasks", 1 + (compact ? Math.min(1, input.todos.length) : input.todos.length));
+	}
+	if (input.agents.length > 0) {
+		push("Agents", 1 + (compact ? Math.min(1, input.agents.length) : input.agents.length));
+	}
+	if (input.jobs.length > 0) {
+		push("Jobs", 1 + (compact ? Math.min(1, input.jobs.length) : input.jobs.length));
+	}
+	if (input.maestro?.swarm) {
+		// objective + iteration + workers + optional best
+		push("Swarm", compact ? 2 : 3 + (input.maestro.swarm.best ? 1 : 0));
+	}
+	return counts;
+}
+
 /** Nav-row ids in the same order the sidebar renders them (browse-mode keyboard navigation). */
 export function enumerateNavRows(input: SidebarRenderInput): string[] {
-	return buildSections(input).flatMap((section) =>
-		section.rows.map((_, index) => `${section.title}:${index}`),
+	return buildSectionCounts(input).flatMap((section) =>
+		Array.from({ length: section.count }, (_, index) => `${section.title}:${index}`),
 	);
 }
 

@@ -29,6 +29,8 @@ interface ApplyLineResetsSlot {
 
 export interface ViewportStabilityPatch {
 	active: boolean;
+	/** Machine-readable reason when the host shape rejected the patch. */
+	reason?: string;
 	detach(): void;
 }
 
@@ -172,10 +174,10 @@ export function attachViewportStability(tui: TUI): ViewportStabilityPatch {
 		// Native fullscreen has an application-owned fixed viewport. Its inherited
 		// applyLineResets method is not part of that renderer's diff path, so patching
 		// it would report a false-positive attachment on the shared TUI base class.
-		if (tui.mode === "fullscreen") return { active: false, detach() {} };
+		if (tui.mode === "fullscreen") return { active: false, reason: "fullscreen-mode", detach() {} };
 		const internals = tui as unknown as ViewportTuiInternals;
 		const slot = resolveApplyLineResetsSlot(internals);
-		if (!slot) return { active: false, detach() {} };
+		if (!slot) return { active: false, reason: "no-slot", detach() {} };
 		const { original } = slot;
 		const existing = markerOf(original);
 		if (existing) return { active: true, detach: existing.retain() };
@@ -234,11 +236,11 @@ export function attachViewportStability(tui: TUI): ViewportStabilityPatch {
 		})();
 		if (!installed || !dispatched) {
 			if (slot.current() === wrapped) slot.restore();
-			return { active: false, detach() {} };
+			return { active: false, reason: installed ? "dispatch-probe" : "install-failed", detach() {} };
 		}
 
 		return { active: true, detach: once(release) };
 	} catch {
-		return { active: false, detach() {} };
+		return { active: false, reason: "attach-error", detach() {} };
 	}
 }

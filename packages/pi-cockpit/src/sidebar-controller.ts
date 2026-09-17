@@ -9,6 +9,7 @@ import {
 	type SplitPaneController,
 } from "./split-pane.ts";
 import type { AgentRow, BashBgJob, CockpitConfig, TodoItem } from "./types.ts";
+import { reportPatch } from "./patch-health.ts";
 import { tuiT } from "./tui-i18n.ts";
 
 /** No-op theme used only to count rows while building nav ids; never rendered. */
@@ -249,8 +250,9 @@ export function createSidebarController(options: SidebarControllerOptions): Side
 		}
 	};
 	const focusVisibleRows = (): number => Math.max(1, Math.trunc((options.getHeight?.() ?? 12) - 4));
+	// Callers rebuild nav rows first; reconciling only re-anchors the selection
+	// and clamps the scroll window (one buildSections per browse interaction).
 	const reconcileFocus = (): void => {
-		rebuildNav();
 		if (navRows.length === 0) {
 			focusScroll = 0;
 			return;
@@ -271,7 +273,10 @@ export function createSidebarController(options: SidebarControllerOptions): Side
 	};
 	const moveFocus = (delta: number): void => {
 		rebuildNav();
-		if (navRows.length === 0) return;
+		if (navRows.length === 0) {
+			focusScroll = 0;
+			return;
+		}
 		const current = focusSelectedId ? navRows.findIndex((row) => row.id === focusSelectedId) : -1;
 		const next = current < 0 ? 0 : Math.max(0, Math.min(navRows.length - 1, current + delta));
 		focusSelectedId = navRows[next]?.id;
@@ -304,12 +309,14 @@ export function createSidebarController(options: SidebarControllerOptions): Side
 			return { consume: true };
 		}
 		if (matchesKey(data, Key.home)) {
+			rebuildNav();
 			focusSelectedId = navRows[0]?.id;
 			reconcileFocus();
 			requestOverlayRender?.();
 			return { consume: true };
 		}
 		if (matchesKey(data, Key.end)) {
+			rebuildNav();
 			focusSelectedId = navRows[navRows.length - 1]?.id;
 			reconcileFocus();
 			requestOverlayRender?.();
@@ -380,6 +387,7 @@ export function createSidebarController(options: SidebarControllerOptions): Side
 		enabled = true;
 		const currentGeneration = ++generation;
 		if (!safely(split.show)) {
+			reportPatch("split-pane", false, "show-failed");
 			enabled = false;
 			generation += 1;
 			stopAnimation();
@@ -398,6 +406,7 @@ export function createSidebarController(options: SidebarControllerOptions): Side
 			const pending = options.ctx.ui.custom<void>(
 				(tui, theme, _keybindings, _done) => {
 					const attached = safely(() => split.attach(tui));
+					reportPatch("split-pane", attached === true, attached === true ? undefined : "attach-failed");
 					if (!attached) {
 						enabled = false;
 						generation += 1;

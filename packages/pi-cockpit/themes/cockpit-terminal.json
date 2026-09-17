@@ -1,0 +1,37 @@
+{
+  "$schema": "https://raw.githubusercontent.com/earendil-works/pi/main/packages/coding-agent/src/modes/interactive/theme/theme-schema.json",
+  "name": "cockpit-terminal",
+  "vars": {
+    "accent": 6,
+    "blue": 4,
+    "green": 2,
+    "red": 1,
+    "orange": 3,
+    "purple": 5,
+    "pink": 13,
+    "gray": 8,
+    "text": "",
+    "muted": "",
+    "dim": 8,
+    "border": 8,
+    "selected": 8,
+    "message": "",
+    "pending": 8,
+    "successBg": "",
+    "errorBg": ""
+  },
+  "colors": {
+    "accent": "accent", "border": "border", "borderAccent": "accent", "borderMuted": "border",
+    "success": "green", "error": "red", "warning": "orange", "muted": "muted", "dim": "dim", "text": "text", "thinkingText": "muted",
+    "selectedBg": "selected", "userMessageBg": "message", "userMessageText": "text", "customMessageBg": "message", "customMessageText": "text", "customMessageLabel": "accent",
+    "toolPendingBg": "pending", "toolSuccessBg": "successBg", "toolErrorBg": "errorBg", "toolTitle": "text", "toolOutput": "muted",
+    "mdHeading": "text", "mdLink": "blue", "mdLinkUrl": "dim", "mdCode": "accent", "mdCodeBlock": "text", "mdCodeBlockBorder": "border",
+    "mdQuote": "muted", "mdQuoteBorder": "border", "mdHr": "border", "mdListBullet": "green",
+    "toolDiffAdded": "green", "toolDiffRemoved": "red", "toolDiffContext": "muted",
+    "syntaxComment": "dim", "syntaxKeyword": "purple", "syntaxFunction": "text", "syntaxVariable": "blue", "syntaxString": "green",
+    "syntaxNumber": "orange", "syntaxType": "accent", "syntaxOperator": "text", "syntaxPunctuation": "muted",
+    "thinkingOff": "dim", "thinkingMinimal": "muted", "thinkingLow": "blue", "thinkingMedium": "accent", "thinkingHigh": "purple", "thinkingXhigh": "pink", "thinkingMax": "red",
+    "bashMode": "green"
+  },
+  "export": { "pageBg": "#000000", "cardBg": "#111111", "infoBg": "#1a1a1a" }
+}

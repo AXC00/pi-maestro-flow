@@ -51,6 +51,8 @@ interface CompactionStyleMarker {
 
 export interface CompactionStylePatch {
 	active: boolean;
+	/** Machine-readable reason when the host shape rejected the patch. */
+	reason?: string;
 	detach(): void;
 }
 
@@ -188,7 +190,7 @@ export function attachCompactionStyle(provider: StyleProvider): CompactionStyleP
 		const prototype = CompactionSummaryMessageComponent.prototype as unknown as object;
 		const descriptor = Object.getOwnPropertyDescriptor(prototype, "updateDisplay");
 		if (!descriptor || typeof descriptor.value !== "function" || descriptor.writable !== true) {
-			return { active: false, detach() {} };
+			return { active: false, reason: "no-slot", detach() {} };
 		}
 		const existing = markerOf(descriptor.value);
 		if (existing) return { active: true, detach: existing.retain(provider) };
@@ -224,10 +226,10 @@ export function attachCompactionStyle(provider: StyleProvider): CompactionStyleP
 		});
 		Object.defineProperty(prototype, "updateDisplay", { ...descriptor, value: wrapped });
 		if (Object.getOwnPropertyDescriptor(prototype, "updateDisplay")?.value !== wrapped) {
-			return { active: false, detach() {} };
+			return { active: false, reason: "install-failed", detach() {} };
 		}
 		return { active: true, detach: once(() => release(provider)) };
 	} catch {
-		return { active: false, detach() {} };
+		return { active: false, reason: "attach-error", detach() {} };
 	}
 }

@@ -4,7 +4,7 @@
 // tick presence) into these functions so the static-mode matrix is unit-testable
 // without instantiating the extension. Three independent gates exist because the
 // surfaces they drive have different stakes:
-// - the main 250ms tick must keep running while failed/sleeping rows need
+// - the main 500ms tick must keep running while failed/sleeping rows need
 //   expiry (failure retention is correctness, not animation);
 // - the spinner frame gate additionally requires the tick to actually exist, so
 //   a frozen mid-cycle spinner never claims "busy";
@@ -26,7 +26,7 @@ export interface TickPolicyState {
 }
 
 /**
- * Whether the main 250ms redraw loop should run.
+ * Whether the main 500ms redraw loop should run.
  *
  * Dynamic mode: any activity keeps it alive. Static mode: only lingering rows
  * do — they expire through read-driven pruning, so the loop must outlive them;

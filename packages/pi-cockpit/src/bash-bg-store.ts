@@ -4,6 +4,8 @@ const STATUSES = new Set<BashBgStatus>(["running", "stopping", "completed", "fai
 
 export class BashBgStore {
 	private jobs = new Map<string, BashBgJob>();
+	/** Bumped on every accepted mutation; render memo fingerprints read it. */
+	revision = 0;
 
 	applySnapshot(payload: unknown): boolean {
 		if (!isRecord(payload) || !Array.isArray(payload.jobs)) return false;
@@ -13,6 +15,7 @@ export class BashBgStore {
 			if (job) next.set(job.id, job);
 		}
 		this.jobs = next;
+		this.revision += 1;
 		return true;
 	}
 
@@ -31,7 +34,9 @@ export class BashBgStore {
 	}
 
 	clear(): void {
+		if (this.jobs.size === 0) return;
 		this.jobs.clear();
+		this.revision += 1;
 	}
 }
 

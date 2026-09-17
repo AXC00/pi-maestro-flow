@@ -141,7 +141,7 @@ The tab title is `frame + pi - <session> - <working state>`. The session part fo
 
 ## Sidebar compatibility
 
-The split-pane wrapper depends on Pi's current TUI renderer shape and is verified against Pi `0.83.0`. A render integration failure disables the split and retries the original renderer at full width.
+The split-pane wrapper depends on Pi's current TUI renderer shape and is verified against Pi `0.84.4`. A render integration failure disables the split and retries the original renderer at full width. The `/cockpit` panel exposes a read-only "host patches" row showing which pi-internal patches are live; a pi-tui version outside the verified range triggers a one-time warning at session start.
 
 Do not enable `pi-cockpit`'s dock and `pi-atelier@0.7.0`'s sidebar together. Both reserve columns by wrapping the same renderer, and `pi-atelier@0.7.0` does not participate in Cockpit's split-owner marker protocol. Use `"sidebar": { "mode": "off" }` when running Atelier.
 
