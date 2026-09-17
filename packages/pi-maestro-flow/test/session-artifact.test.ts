@@ -44,6 +44,7 @@ function planDocuments(): LoadedPlanArtifactDocument[] {
         path: "current.md",
       },
       markdown: "# Current Plan\n\n- ship artifacts",
+      absolutePath: "D:/pi-home/plans/current.md",
     },
     {
       entry: {
@@ -56,6 +57,7 @@ function planDocuments(): LoadedPlanArtifactDocument[] {
         role: "reviewer",
       },
       markdown: "# Review\n\nAdd copy/export acceptance checks.",
+      absolutePath: "D:/pi-home/plans/reviews/review.md",
     },
   ];
 }
@@ -88,7 +90,7 @@ function knowledgeReview(): KnowledgeReviewView {
   };
 }
 
-function commandContext(actions: Array<"copy" | "export" | "close">) {
+function commandContext(actions: Array<"copy" | "copyPath" | "export" | "close">) {
   const notifications: Array<{ message: string; level: string }> = [];
   const renders: string[] = [];
   const ctx = {
@@ -108,7 +110,9 @@ function commandContext(actions: Array<"copy" | "export" | "close">) {
         );
         renders.push(component.render(100).join("\n"));
         const action = actions.shift() ?? "close";
-        component.handleInput(action === "copy" ? "c" : action === "export" ? "e" : "\x1b");
+        component.handleInput(
+          action === "copy" ? "c" : action === "copyPath" ? "p" : action === "export" ? "e" : "\x1b",
+        );
         return result;
       },
     },
@@ -150,6 +154,43 @@ test("Artifact overlay previews Markdown, switches narrow mode, and exposes copy
   assert.match(overlay.render(40).join("\n"), /Plan/);
   overlay.handleInput("c");
   assert.deepEqual(action, { kind: "copy", selectedId: "plan-current" });
+});
+
+test("Artifact overlay switches artifacts with left/right and scrolls preview with up/down", () => {
+  const longMarkdown = Array.from({ length: 40 }, (_, index) => `line ${index + 1}`).join("\n");
+  const artifacts: SessionArtifactItem[] = [
+    { id: "a", source: "plan", title: "First", detail: "", markdown: longMarkdown, path: "D:/plans/a.md" },
+    { id: "b", source: "plan", title: "Second", detail: "", markdown: "# Second\n\nshort", path: "D:/plans/b.md" },
+  ];
+  let action: SessionArtifactOverlayAction | undefined;
+  const overlay = new SessionArtifactOverlay({
+    sessionLabel: "Pi session-1",
+    artifacts,
+    theme,
+    requestRender() {},
+    done(value) { action = value; },
+  });
+
+  // Wide mode: left/right switch artifacts, up/down scroll the preview.
+  overlay.render(100);
+  overlay.handleInput("\x1b[C"); // right
+  assert.match(overlay.render(100).join("\n"), /› \[P\] Second/);
+  overlay.handleInput("\x1b[D"); // left
+  const wide = overlay.render(100).join("\n");
+  assert.match(wide, /› \[P\] First/);
+  assert.match(wide, /line 1/);
+  overlay.handleInput("\x1b[B"); // down scrolls preview, does not switch
+  const scrolled = overlay.render(100).join("\n");
+  assert.match(scrolled, /› \[P\] First/);
+  assert.match(scrolled, /2-\d+\/40/);
+  overlay.handleInput("p");
+  assert.deepEqual(action, { kind: "copyPath", selectedId: "a" });
+
+  // Narrow preview: left/right switches artifacts directly.
+  overlay.render(40);
+  overlay.handleInput("\r");
+  overlay.handleInput("\x1b[C"); // right inside preview
+  assert.match(overlay.render(40).join("\n"), /Second/);
 });
 
 test("/artifact aggregates session Plan, Review, and staged Knowledge documents and copies Markdown", async () => {

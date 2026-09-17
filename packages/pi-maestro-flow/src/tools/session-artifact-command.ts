@@ -57,6 +57,7 @@ export async function executeArtifactCommand(
   if (knowledgeSessionId) {
     try {
       const review = await (options.loadKnowledgeReview ?? defaultKnowledgeLoader)(ctx.cwd, knowledgeSessionId);
+      const deltaPath = join(ctx.cwd, ".workflow", "sessions", review.session_id, "knowledge-delta.json");
       artifacts.push(...review.candidates.map((candidate): SessionArtifactItem => ({
         id: `knowledge:${review.session_id}:${candidate.candidate_id}`,
         source: "knowledge",
@@ -64,6 +65,7 @@ export async function executeArtifactCommand(
         detail: `Knowledge ${candidate.target} · ${candidate.status} · ${candidate.candidate_id}`,
         markdown: candidate.content,
         createdAt: candidate.last_recorded_at,
+        path: deltaPath,
       })));
       await options.onKnowledgeLoaded?.(review.session_id, review.candidates.length);
     } catch (error) {
@@ -98,6 +100,18 @@ export async function executeArtifactCommand(
       const copied = await tryCopyToClipboard(selected.markdown, options.copy ?? copyToClipboard);
       ctx.ui.notify(
         copied ? `已复制 Artifact：${selected.title}` : `复制 Artifact 失败：${selected.title}`,
+        copied ? "info" : "warning",
+      );
+      continue;
+    }
+    if (action.kind === "copyPath") {
+      if (!selected.path) {
+        ctx.ui.notify(`该 Artifact 没有源文件路径：${selected.title}`, "warning");
+        continue;
+      }
+      const copied = await tryCopyToClipboard(selected.path, options.copy ?? copyToClipboard);
+      ctx.ui.notify(
+        copied ? `已复制路径：${selected.path}` : `复制路径失败：${selected.title}`,
         copied ? "info" : "warning",
       );
       continue;
@@ -181,6 +195,7 @@ export function planArtifactItem(document: LoadedPlanArtifactDocument): SessionA
       detail: `Review & Refine · revision ${entry.revision} · ${displayTimestamp(entry.createdAt)}`,
       markdown,
       createdAt: entry.createdAt,
+      path: document.absolutePath,
     };
   }
   const kind = entry.kind === "approved" ? "Approved Plan" : entry.kind === "draft" ? "Plan draft" : "Current Plan";
@@ -191,6 +206,7 @@ export function planArtifactItem(document: LoadedPlanArtifactDocument): SessionA
     detail: `${entry.kind} · revision ${entry.revision} · ${displayTimestamp(entry.createdAt)}`,
     markdown,
     createdAt: entry.createdAt,
+    path: document.absolutePath,
   };
 }
 

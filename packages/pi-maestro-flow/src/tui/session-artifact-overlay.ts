@@ -26,11 +26,14 @@ export interface SessionArtifactItem {
   detail: string;
   markdown: string;
   createdAt?: string;
+  /** Absolute source file path, when the artifact is backed by one. */
+  path?: string;
 }
 
 export type SessionArtifactOverlayAction =
   | { kind: "close"; selectedId?: string }
   | { kind: "copy"; selectedId: string }
+  | { kind: "copyPath"; selectedId: string }
   | { kind: "export"; selectedId: string };
 
 export interface SessionArtifactOverlayParams {
@@ -52,6 +55,7 @@ export class SessionArtifactOverlay implements Component, Focusable {
   focused = false;
   private selected: number;
   private previewScroll = 0;
+  private previewMaxScroll = 0;
   private previewMode = false;
   private lastWide = true;
   private readonly artifacts: SessionArtifactItem[];
@@ -63,6 +67,7 @@ export class SessionArtifactOverlay implements Component, Focusable {
       title: sanitizeTerminalText(artifact.title),
       detail: sanitizeTerminalText(artifact.detail),
       markdown: sanitizeTerminalText(artifact.markdown),
+      ...(artifact.path ? { path: sanitizeTerminalText(artifact.path) } : {}),
     }));
     const selected = params.initialSelectedId
       ? this.artifacts.findIndex((artifact) => artifact.id === params.initialSelectedId)
@@ -126,10 +131,10 @@ export class SessionArtifactOverlay implements Component, Focusable {
 
     rows.push("─".repeat(inner));
     const footer = !wide && this.previewMode
-      ? "Esc 返回 · c 复制 · e 导出 · ↑↓/PgUp/PgDn 滚动"
+      ? "←→ 切换 · ↑↓/PgUp/PgDn 滚动 · c 复制 · p 复制路径 · e 导出 · Esc 返回"
       : wide
-        ? "↑↓ 选择 · PgUp/PgDn 滚动 · c 复制 · e 导出 · Esc 关闭"
-        : "↑↓ 选择 · Enter 预览 · c 复制 · e 导出 · Esc 关闭";
+        ? "←→ 切换 · ↑↓/PgUp/PgDn 滚动 · c 复制 · p 复制路径 · e 导出 · Esc 关闭"
+        : "↑↓/←→ 选择 · Enter 预览 · c 复制 · p 复制路径 · e 导出 · Esc 关闭";
     rows.push(this.params.theme.fg("dim", truncateToWidth(footer, inner, "…")));
     return frameBox(rows, safeWidth, this.params.theme);
   }
@@ -141,6 +146,7 @@ export class SessionArtifactOverlay implements Component, Focusable {
     const rendered = markdown.render(safeWidth);
     const visible = Math.max(1, budget - 3);
     const maxScroll = Math.max(0, rendered.length - visible);
+    this.previewMaxScroll = maxScroll;
     this.previewScroll = Math.min(Math.max(0, this.previewScroll), maxScroll);
     const end = Math.min(rendered.length, this.previewScroll + visible);
     const body = rendered.slice(this.previewScroll, end).map((line) => truncateToWidth(line, safeWidth, "…"));
@@ -162,20 +168,40 @@ export class SessionArtifactOverlay implements Component, Focusable {
       return;
     }
     const selected = () => this.artifacts[this.selected]!;
+    const switchArtifact = (delta: number) => {
+      this.selected = wrapIndex(this.selected + delta, this.artifacts.length);
+      this.previewScroll = 0;
+    };
+    const scrollPreview = (delta: number) => {
+      this.previewScroll = delta < 0
+        ? Math.max(0, this.previewScroll + delta)
+        : Math.min(this.previewMaxScroll, this.previewScroll + delta);
+    };
     if (!this.lastWide && this.previewMode) {
       if (matchesKey(data, Key.escape)) {
         this.previewMode = false;
         this.previewScroll = 0;
+      } else if (matchesKey(data, Key.left)) {
+        switchArtifact(-1);
+      } else if (matchesKey(data, Key.right)) {
+        switchArtifact(1);
       } else if (matchesKey(data, Key.up)) {
-        this.previewScroll = Math.max(0, this.previewScroll - 1);
+        scrollPreview(-1);
       } else if (matchesKey(data, Key.down)) {
-        this.previewScroll += 1;
+        scrollPreview(1);
       } else if (matchesKey(data, Key.pageUp)) {
-        this.previewScroll = Math.max(0, this.previewScroll - 8);
+        scrollPreview(-8);
       } else if (matchesKey(data, Key.pageDown)) {
-        this.previewScroll += 8;
+        scrollPreview(8);
+      } else if (matchesKey(data, Key.home)) {
+        this.previewScroll = 0;
+      } else if (matchesKey(data, Key.end)) {
+        this.previewScroll = this.previewMaxScroll;
       } else if (data === "c" || data === "C") {
         this.params.done({ kind: "copy", selectedId: selected().id });
+        return;
+      } else if (data === "p" || data === "P") {
+        this.params.done({ kind: "copyPath", selectedId: selected().id });
         return;
       } else if (data === "e" || data === "E") {
         this.params.done({ kind: "export", selectedId: selected().id });
@@ -185,21 +211,32 @@ export class SessionArtifactOverlay implements Component, Focusable {
       return;
     }
 
-    if (matchesKey(data, Key.up)) {
-      this.selected = wrapIndex(this.selected - 1, this.artifacts.length);
-      this.previewScroll = 0;
+    if (matchesKey(data, Key.left)) {
+      switchArtifact(-1);
+    } else if (matchesKey(data, Key.right)) {
+      switchArtifact(1);
+    } else if (matchesKey(data, Key.up)) {
+      if (this.lastWide) scrollPreview(-1);
+      else switchArtifact(-1);
     } else if (matchesKey(data, Key.down)) {
-      this.selected = wrapIndex(this.selected + 1, this.artifacts.length);
-      this.previewScroll = 0;
+      if (this.lastWide) scrollPreview(1);
+      else switchArtifact(1);
     } else if (matchesKey(data, Key.pageUp)) {
-      this.previewScroll = Math.max(0, this.previewScroll - 8);
+      scrollPreview(-8);
     } else if (matchesKey(data, Key.pageDown)) {
-      this.previewScroll += 8;
+      scrollPreview(8);
+    } else if (matchesKey(data, Key.home)) {
+      this.previewScroll = 0;
+    } else if (matchesKey(data, Key.end)) {
+      this.previewScroll = this.previewMaxScroll;
     } else if (matchesKey(data, Key.enter) && !this.lastWide) {
       this.previewMode = true;
       this.previewScroll = 0;
     } else if (data === "c" || data === "C") {
       this.params.done({ kind: "copy", selectedId: selected().id });
+      return;
+    } else if (data === "p" || data === "P") {
+      this.params.done({ kind: "copyPath", selectedId: selected().id });
       return;
     } else if (data === "e" || data === "E") {
       this.params.done({ kind: "export", selectedId: selected().id });

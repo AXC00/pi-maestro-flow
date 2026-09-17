@@ -109,6 +109,8 @@ export interface PlanNewContextPayload {
 export interface LoadedPlanArtifactDocument {
   entry: PlanArtifactEntry;
   markdown: string;
+  /** Absolute path of the artifact file under the store's plansDir. */
+  absolutePath: string;
 }
 
 export interface PlanArtifactSummary {
@@ -343,6 +345,7 @@ export async function loadCurrentPlanArtifacts(ctx: PlanContext): Promise<Loaded
   return Promise.all(entries.map(async (entry) => ({
     entry,
     markdown: await store.readArtifact(entry),
+    absolutePath: join(store.plansDir, entry.path),
   })));
 }
 
