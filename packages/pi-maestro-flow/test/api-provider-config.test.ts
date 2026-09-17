@@ -253,16 +253,19 @@ test("Provider enable/disable preserves config and controls runtime registration
   }, modelsPath);
   await setApiProviderEnabled("maestro-openai", false, modelsPath);
 
-  const registered: string[] = [];
+  const registered: Array<{ name: string; config: any }> = [];
   const unregistered: string[] = [];
   const commands = new Map<string, any>();
   let refreshes = 0;
   registerApiProviderConfigs({
-    registerProvider(name: string) { registered.push(name); },
+    registerProvider(name: string, config: any) { registered.push({ name, config }); },
     unregisterProvider(name: string) { unregistered.push(name); },
     registerCommand(name: string, command: any) { commands.set(name, command); },
   } as any, { modelsPath });
-  assert.deepEqual(registered, []);
+  // A disabled provider is suspended via an empty-models overlay: unregistering
+  // alone cannot hide it because pi recomposes the models.json layer on refresh.
+  assert.deepEqual(registered.map((entry) => entry.name), ["maestro-openai"]);
+  assert.deepEqual(registered[0]?.config.models, []);
 
   const notifications: string[] = [];
   const ctx = {
@@ -272,9 +275,12 @@ test("Provider enable/disable preserves config and controls runtime registration
     ui: { notify(message: string) { notifications.push(message); } },
   };
   await commands.get("api-manager").handler("enable openai", ctx);
-  assert.deepEqual(registered, ["maestro-openai"]);
+  assert.equal(registered.at(-1)?.name, "maestro-openai");
+  assert.deepEqual(registered.at(-1)?.config.models.map((model: any) => model.id), ["model-a"]);
   await commands.get("api-manager").handler("disable openai", ctx);
-  assert.deepEqual(unregistered, ["maestro-openai"]);
+  assert.equal(registered.at(-1)?.name, "maestro-openai");
+  assert.deepEqual(registered.at(-1)?.config.models, []);
+  assert.deepEqual(unregistered, []);
   await commands.get("api-manager").handler("list", ctx);
   assert.match(notifications.at(-1) ?? "", /maestro-openai.*停用/);
   assert.equal(refreshes, 2);

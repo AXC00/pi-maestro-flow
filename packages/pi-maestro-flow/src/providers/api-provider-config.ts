@@ -545,6 +545,17 @@ export function registerApiProviderConfigs(
       if (findPreset(id) || !hasEnabledProviderSync(id, modelsPath)) continue;
       pi.registerProvider(id, configuredProviderRegistration(id, modelsPath));
     }
+    // Disabled providers stay in models.json, and pi recomposes that layer on
+    // every refresh — unregistering alone would not hide their models. The
+    // empty-models overlay does. A broken entry must not abort startup.
+    for (const id of providerIdsInModels(modelsPath)) {
+      if (hasEnabledProviderSync(id, modelsPath)) continue;
+      try {
+        suspendProviderRegistration(pi, id);
+      } catch {
+        // Leave the provider as-is; a malformed disabled entry is not fatal.
+      }
+    }
   }
   // Persisted cache tiers: main-flow retention lands on PI_CACHE_RETENTION
   // (pi-ai reads it per request), the agent tier on PI_TEAMMATE_CACHE_RETENTION
@@ -3057,6 +3068,7 @@ import {
   saveModelThinkingDefault,
   serializeMutation,
   setPiThinkingLevel,
+  suspendProviderRegistration,
   recordApiKeyFailureAndAdvance,
   resolveApiKey,
   showProvider,
@@ -3223,7 +3235,11 @@ export async function applyModelFilters(
     list.push(model);
     byProvider.set(model.provider, list);
   }
+  const modelsPath = join(dirname(defaultsPath), "models.json");
   for (const [providerId, filter] of Object.entries(filters)) {
+    // A disabled provider is suspended via an empty-models overlay; re-applying
+    // its saved filter would resurrect the models the user just hid.
+    if (providerIdsInModels(modelsPath).includes(providerId) && !hasEnabledProviderSync(providerId, modelsPath)) continue;
     const providerModels = byProvider.get(providerId);
     if (!providerModels || providerModels.length === 0) continue;
     const survivorIds = new Set(applyProviderModelFilter(providerId, providerModels.map((m) => m.id), filter));

@@ -334,6 +334,17 @@ export async function removeProviderKey(
   notifySaved(ctx, displayName, result, "已注销；连接配置和 API key 已移除");
 }
 
+/**
+ * Hide a provider's models without dropping its registration. `unregisterProvider`
+ * only removes the extension overlay — pi recomposes the provider from its
+ * models.json entry on the next refresh, so the models come straight back.
+ * Registering `models: []` replaces that layer instead, which keeps the
+ * provider's config/auth intact while exposing no models to /model.
+ */
+export function suspendProviderRegistration(pi: ExtensionAPI, providerId: string): void {
+  pi.registerProvider(providerId, { models: [] });
+}
+
 export async function toggleProvider(
   pi: ExtensionAPI,
   providerId: string,
@@ -362,7 +373,7 @@ export async function toggleProvider(
   }
   const result = await setApiProviderEnabled(providerId, enabled, modelsPath);
   if (enabled) pi.registerProvider(providerId, configuredProviderRegistration(providerId, modelsPath));
-  else pi.unregisterProvider(providerId);
+  else suspendProviderRegistration(pi, providerId);
   ctx.modelRegistry.refresh();
   notifySaved(ctx, displayName, result, enabled ? "已启用；models 已恢复到 /model" : "已停用；配置仍完整保留");
 }
@@ -2776,7 +2787,7 @@ export function reloadProviderRegistration(
   if (hasEnabledProviderSync(providerId, modelsPath)) {
     pi.registerProvider(providerId, configuredProviderRegistration(providerId, modelsPath));
   } else {
-    pi.unregisterProvider(providerId);
+    suspendProviderRegistration(pi, providerId);
   }
 }
 
