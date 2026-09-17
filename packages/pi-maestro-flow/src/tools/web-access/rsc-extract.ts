@@ -276,7 +276,12 @@ export function extractRSCContent(html: string): RSCExtractResult | null {
     walkTable(props.children);
     if (rows.length === 0) return "";
 
-    const colCount = Math.max(...rows.map(r => r.length));
+    // Loop instead of Math.max(...rows): row count comes from external RSC
+    // content and can overflow the argument stack when spread.
+    let colCount = 0;
+    for (const r of rows) {
+      if (r.length > colCount) colCount = r.length;
+    }
     let md = "";
     for (let i = 0; i < rows.length; i++) {
       const row = rows[i].concat(Array(colCount - rows[i].length).fill(""));
