@@ -56,6 +56,45 @@ export interface DiagnosticLogConfig {
 	retentionDays: number;
 }
 
+// ---------------------------------------------------------------------------
+// TUI console guard
+// ---------------------------------------------------------------------------
+
+/**
+ * True while the interactive TUI owns the screen. The TUI puts stdin in raw
+ * mode for its whole lifetime and restores it on stop; print/rpc/child modes
+ * never set it. A raw stdout/stderr write during TUI scrolls the terminal
+ * outside the renderer's line model, which froze stale agent-widget rows into
+ * the transcript (the "ghost rows" bug).
+ */
+function tuiOwnsScreen(): boolean {
+	return process.stdin.isRaw === true;
+}
+
+let consoleGuardInstalled = false;
+
+/**
+ * Redirect every `console.*` call to a no-op while the TUI owns the screen.
+ * The TUI writes via `process.stdout.write` directly, so it is unaffected.
+ * Idempotent; a no-op outside TUI mode (the check is per-call, so console
+ * output is fully preserved in print/rpc/CLI contexts).
+ */
+export function installTuiConsoleGuard(): void {
+	if (consoleGuardInstalled) return;
+	consoleGuardInstalled = true;
+	for (const method of ["log", "info", "warn", "error", "debug", "trace"] as const) {
+		const original = console[method].bind(console);
+		console[method] = (...args: unknown[]) => {
+			if (tuiOwnsScreen()) return;
+			original(...args);
+		};
+	}
+}
+
+// Self-install on module load: this sink is imported by every teammate
+// diagnostic call site, so the guard is live whenever the extension runs.
+installTuiConsoleGuard();
+
 export const DEFAULT_DIAGNOSTIC_CONFIG: DiagnosticLogConfig = {
 	rootDir: DEFAULT_ROOT_DIR,
 	maxFileBytes: DEFAULT_MAX_FILE_BYTES,
@@ -213,7 +252,8 @@ class DiagnosticLoggerImpl implements DiagnosticLogger {
 		// Mirror warnings/errors to stderr so CLI/child-mode runs still emit a
 		// visible diagnostic when a log file is unwritable. Errors via
 		// console.error, warns via console.warn — kept here, at the sink, so
-		// the 67 call sites stay single-purpose.
+		// the 67 call sites stay single-purpose. While the interactive TUI owns
+		// the screen these are suppressed by the console guard installed below.
 		if (level === "error") {
 			// eslint-disable-next-line no-console
 			console.error(line.trimEnd());
