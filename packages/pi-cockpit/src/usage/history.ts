@@ -138,7 +138,12 @@ function utcMidnight(ts: number): number {
  */
 export function aggregateDailyTokens(records: readonly UsageRecord[], days: number, nowMs: number = Date.now()): DailyBucket[] {
 	const count = Math.max(1, Math.floor(days));
-	const anchor = records.length > 0 ? Math.max(...records.map((r) => r.ts)) : nowMs;
+	// Loop instead of Math.max(...records): spreading a large record array
+	// overflows the argument stack (RangeError: Maximum call stack size).
+	let anchor = nowMs;
+	for (const r of records) {
+		if (r.ts > anchor) anchor = r.ts;
+	}
 	const endDay = utcMidnight(anchor);
 	const startDay = endDay - (count - 1) * DAY_MS;
 	const map = new Map<number, DailyBucket>();

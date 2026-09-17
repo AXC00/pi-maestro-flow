@@ -221,10 +221,18 @@ async function readIndex(): Promise<SessionIndex> {
 
 function indexEntryFor(sessionId: string, records: readonly UsageRecord[]): SessionIndexEntry | undefined {
 	if (records.length === 0) return undefined;
+	// Loop instead of Math.min/max(...records): spreading a large record
+	// array overflows the argument stack (RangeError: Maximum call stack size).
+	let firstTs = Infinity;
+	let lastTs = -Infinity;
+	for (const record of records) {
+		if (record.ts < firstTs) firstTs = record.ts;
+		if (record.ts > lastTs) lastTs = record.ts;
+	}
 	return {
 		sessionId,
-		firstTs: Math.min(...records.map((record) => record.ts)),
-		lastTs: Math.max(...records.map((record) => record.ts)),
+		firstTs,
+		lastTs,
 		recordCount: records.length,
 		totalCost: round4(records.reduce((sum, record) => sum + record.cost.total, 0)),
 		modelCount: new Set(records.map((record) => record.model)).size,
@@ -348,7 +356,11 @@ async function readJsonl(file: string): Promise<UsageRecord[]> {
 
 async function readSessionRecordsLocked(sessionId: string): Promise<UsageRecord[]> {
 	const records: UsageRecord[] = [];
-	for (const file of await existingSessionFiles(sessionId)) records.push(...await readJsonl(file));
+	// push(...fileRecords) would spread a large JSONL file onto the argument
+	// stack (RangeError: Maximum call stack size); extend one record at a time.
+	for (const file of await existingSessionFiles(sessionId)) {
+		for (const record of await readJsonl(file)) records.push(record);
+	}
 	return records;
 }
 

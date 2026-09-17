@@ -211,7 +211,12 @@ export class UsageStatsOverlay implements Component {
 		const heatLabelCol = 4;
 		const heatWeeks = Math.max(1, Math.floor((Math.max(0, inner - heatLabelCol) + heatGap) / (heatCellWidth + heatGap)) - 1);
 		// Span from the earliest record day (aligned to its Monday) through today.
-		const earliest = this.records.length > 0 ? Math.min(...this.records.map((r) => r.ts)) : now;
+		// Loop instead of Math.min(...records): spreading a large record array
+		// overflows the argument stack (RangeError: Maximum call stack size).
+		let earliest = now;
+		for (const r of this.records) {
+			if (r.ts < earliest) earliest = r.ts;
+		}
 		const heatStart = Math.min(utcMidnight(earliest), todayMid - (heatWeeks * 7 - 1) * 86_400_000);
 		const heatSeries = daySeries(this.records, "tokens", heatStart, todayMid);
 		const cells: HeatmapCell[] = heatSeries.map((b) => ({ ts: b.ts, value: b.value }));
