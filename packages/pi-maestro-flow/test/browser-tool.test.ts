@@ -5,7 +5,8 @@ import * as fs from "node:fs/promises";
 import * as http from "node:http";
 import * as path from "node:path";
 import { BrowserParams, createBrowserTool } from "../src/tools/browser-tool.ts";
-import { BrowserManager, browserRunErrorHint, canonicalizeBrowserOpenOptions, compileRunCode, observeBrowserRunApis, settleBrowserDialog, type BrowserManagerLike, type BrowserManagerStatus, type BrowserOpenOptions, type BrowserRunOutput, type BrowserTabInfo } from "../src/tools/browser/manager.ts";
+import { BrowserManager, browserRunErrorHint, canonicalizeBrowserOpenOptions, compileRunCode, observeBrowserRunApis, settleBrowserDialog, type BrowserManagerLike, type BrowserManagerStatus, type BrowserOpenOptions, type BrowserPickCaptureCallback, type BrowserPickResult, type BrowserRunOutput, type BrowserTabInfo } from "../src/tools/browser/manager.ts";
+import { PICKER_INJECT_JS, PICKER_POLL_JS, PICKER_TEARDOWN_JS } from "../src/tools/browser/picker.ts";
 import { STEALTH_INIT_JS, STEALTH_LAUNCH_ARGS } from "../src/tools/browser/stealth.ts";
 
 class FakeBrowserManager implements BrowserManagerLike {
@@ -71,6 +72,13 @@ class FakeBrowserManager implements BrowserManagerLike {
       url: "https://example.com",
     };
   }
+  pickResult: BrowserPickResult = { captures: [], status: "sent", errorCount: 0 };
+  pickCalls: Array<{ name: string; timeoutMs: number; hadCallback: boolean }> = [];
+  async pick(name: string, onCapture: BrowserPickCaptureCallback | undefined, _signal: AbortSignal | undefined, timeoutMs: number): Promise<BrowserPickResult> {
+    this.pickCalls.push({ name, timeoutMs, hadCallback: onCapture !== undefined });
+    if (onCapture && this.pickResult.captures.length > 0) onCapture(this.pickResult.captures);
+    return this.pickResult;
+  }
   async status(): Promise<BrowserManagerStatus> { return structuredClone(this.statusResult); }
   async pair(requestId: string, code: string) {
     return { requestId, port: 19222, installationId: `11111111-1111-4111-8111-${code.repeat(2)}` };
@@ -113,7 +121,7 @@ test("browser dialog settlement reports unexpected failures", async () => {
 });
 
 test("browser schema preserves legacy actions and adds explicit status/pair surfaces", () => {
-  assert.deepEqual((BrowserParams.properties.action as { enum: string[] }).enum, ["open", "close", "run", "guide", "status", "pair"]);
+  assert.deepEqual((BrowserParams.properties.action as { enum: string[] }).enum, ["open", "close", "run", "guide", "status", "pair", "pick"]);
   assert.deepEqual(Object.keys(BrowserParams.properties).sort(), [
     "action", "all", "app", "code", "dialogs", "kill", "name", "request_id", "timeout", "topic", "url", "viewport", "visible", "wait_until",
   ]);
@@ -126,6 +134,8 @@ test("browser schema preserves legacy actions and adds explicit status/pair surf
   assert.equal(Check(BrowserParams, { action: "pair" }), false);
   assert.equal(Check(BrowserParams, { action: "pair", request_id: "request", code: "123456" }), true);
   assert.equal(Check(BrowserParams, { action: "pair", request_id: "request", code: "wrong" }), false);
+  assert.equal(Check(BrowserParams, { action: "pick" }), true);
+  assert.equal(Check(BrowserParams, { action: "pick", name: "docs", timeout: 60 }), true);
   assert.match((BrowserParams.properties.timeout as { description?: string }).description ?? "", /total wall-clock/i);
 });
 
@@ -832,4 +842,63 @@ test("browser run wrapper exposes every helper when the user does not shadow it"
   assert.equal(waited, true);
   assert.deepEqual(displays, ["P", "hello t"]);
   assert.equal(returnValue, "no-signal");
+});
+
+test("browser pick pastes captures into the user editor and reports status", async () => {
+  const manager = new FakeBrowserManager();
+  manager.pickResult = {
+    status: "sent",
+    errorCount: 2,
+    captures: [
+      { kind: "element", tagName: "button", id: "save", selector: "body > div > button", outerHtml: "<button id=\"save\">Save</button>", text: "Save", reactComponentName: "SaveButton", vueComponentName: null, filePath: "src/Save.tsx", line: 42 },
+      { kind: "console", errors: ["TypeError: boom"] },
+    ],
+  };
+  const tool = createBrowserTool(manager);
+  const pasted: string[] = [];
+  const ctx = { cwd: "D:/workspace", ui: { pasteToEditor: (text: string) => pasted.push(text) } } as never;
+  const result = await tool.execute("pick", { action: "pick", name: "docs", timeout: 60 }, undefined, undefined, ctx);
+  assert.equal(manager.pickCalls.length, 1);
+  assert.equal(manager.pickCalls[0].name, "docs");
+  assert.equal(manager.pickCalls[0].hadCallback, true, "pick must receive an onCapture callback when an editor exists");
+  assert.equal(pasted.length, 1, "one paste per drained batch");
+  assert.match(pasted[0], /\[Browser capture #1: <button> <SaveButton \/> src\/Save\.tsx:42\]/);
+  assert.match(pasted[0], /<button id="save">Save<\/button>/);
+  assert.match(pasted[0], /\[Browser console errors \(1\)\]\nTypeError: boom/);
+  assert.equal(result.details?.action, "pick");
+  assert.equal(result.details?.pick?.status, "sent");
+  assert.match(result.details?.result ?? "", /pasted into the user's input box/);
+});
+
+test("browser pick without an editor returns captures inline instead of pasting", async () => {
+  const manager = new FakeBrowserManager();
+  manager.pickResult = {
+    status: "escape",
+    errorCount: 0,
+    captures: [
+      { kind: "element", tagName: "div", id: null, selector: "body > div", outerHtml: "<div>x</div>", text: "x", reactComponentName: null, vueComponentName: "Panel", filePath: null, line: null },
+    ],
+  };
+  const tool = createBrowserTool(manager);
+  const ctx = { cwd: "D:/workspace" } as never;
+  const result = await tool.execute("pick", { action: "pick" }, undefined, undefined, ctx);
+  assert.equal(manager.pickCalls[0].hadCallback, false, "no editor means no onCapture callback");
+  const text = result.details?.result ?? "";
+  assert.match(text, /status: escape/);
+  assert.match(text, /returned inline/);
+  assert.match(text, /\[Browser capture #1: <div> <Panel \/>\]/);
+});
+
+test("browser picker scripts parse as valid JavaScript", () => {
+  for (const [name, source] of [["PICKER_INJECT_JS", PICKER_INJECT_JS], ["PICKER_POLL_JS", PICKER_POLL_JS], ["PICKER_TEARDOWN_JS", PICKER_TEARDOWN_JS]] as const) {
+    assert.doesNotThrow(() => new Function(source), `${name} must parse`);
+  }
+  // The poll must not drain the live console.error buffer — that belongs to the
+  // in-page Send errors button.
+  assert.doesNotMatch(PICKER_POLL_JS, /errors\.splice/);
+  assert.match(PICKER_INJECT_JS, /__piElementPick/);
+  assert.match(PICKER_INJECT_JS, /__reactFiber\$|__reactInternalInstance\$/);
+  assert.match(PICKER_INJECT_JS, /_debugSource|__source|_debugStack/);
+  assert.match(PICKER_INJECT_JS, /__vueParentComponent/);
+  assert.match(PICKER_INJECT_JS, /console\.error/);
 });

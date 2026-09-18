@@ -6,6 +6,7 @@ import * as path from "node:path";
 import type { Browser, CDPSession, CookieParam, Dialog, ElementHandle, Frame, HTTPRequest, HTTPResponse, KeyInput, Page, Target, WaitForOptions } from "puppeteer-core";
 import puppeteer from "puppeteer-core";
 import { PROBE_JS, FIND_LISTS_JS, foldListsJs, monitorStartJs, MONITOR_STOP_JS, optimizeHtmlForTokens, smartTruncate, diffHtml, type HtmlDiff } from "./simplify.ts";
+import { PICKER_INJECT_JS, PICKER_POLL_JS, PICKER_TEARDOWN_JS } from "./picker.ts";
 import { STEALTH_INIT_JS, STEALTH_LAUNCH_ARGS } from "./stealth.ts";
 import { runOcr, runDetect, isLocalVisionError, type OcrOutcome, type DetectOutcome } from "../../providers/local-vision.ts";
 import {
@@ -74,6 +75,37 @@ export interface BrowserRunOutput {
   navigated?: boolean;
   newTabs?: Array<{ url: string }>;
 }
+
+export type BrowserPickStatus = "sent" | "escape" | "timeout" | "navigated" | "closed";
+
+export interface BrowserElementCapture {
+  kind: "element";
+  tagName: string;
+  id: string | null;
+  selector: string;
+  outerHtml: string;
+  text: string;
+  reactComponentName: string | null;
+  vueComponentName: string | null;
+  filePath: string | null;
+  line: number | null;
+}
+
+export interface BrowserConsoleCapture {
+  kind: "console";
+  errors: string[];
+}
+
+export type BrowserCapture = BrowserElementCapture | BrowserConsoleCapture;
+
+export interface BrowserPickResult {
+  captures: BrowserCapture[];
+  status: BrowserPickStatus;
+  /** Live console.error buffer size at pick end (unsent errors are discarded). */
+  errorCount: number;
+}
+
+export type BrowserPickCaptureCallback = (captures: BrowserCapture[]) => void;
 
 class BrowserOutputCollector {
   private bytes = 0;
@@ -160,6 +192,7 @@ export interface BrowserManagerStatus {
 export interface BrowserManagerLike {
   open(options: BrowserOpenOptions): Promise<BrowserTabInfo>;
   run(name: string, code: string, cwd: string, signal: AbortSignal | undefined, timeoutMs: number, maxOutputBytes?: number): Promise<BrowserRunOutput>;
+  pick(name: string, onCapture: BrowserPickCaptureCallback | undefined, signal: AbortSignal | undefined, timeoutMs: number): Promise<BrowserPickResult>;
   status(signal?: AbortSignal): Promise<BrowserManagerStatus>;
   pair(requestId: string, code: string, signal?: AbortSignal): Promise<PairingApproval>;
   close(name: string): Promise<boolean>;
@@ -205,6 +238,8 @@ interface BaseEntry {
   connection: BrowserConnectionInfo;
   ownedTempFiles: Set<string>;
   busy: boolean;
+  /** Aborts an in-progress pick() poll loop; set only while pick owns the tab. */
+  pickAbort?: AbortController;
 }
 
 interface PuppeteerEntry extends BaseEntry {
@@ -500,6 +535,90 @@ export class BrowserManager implements BrowserManagerLike {
     return this.#runPuppeteer(entry, code, cwd, signal, timeoutMs, maxOutputBytes);
   }
 
+  // In-page element/component picker (Devin browser_preview port, see
+  // devin-re/BROWSER_PREVIEW.md). Injects the picker script into the live page,
+  // then polls window.__piElementPick because the extension bridge's CDP path
+  // is attach→send→detach and cannot deliver Runtime.bindingCalled events.
+  // Each drained batch goes to onCapture so the tool layer can paste it into
+  // the user's input box (user-in-the-loop delivery, same as Devin).
+  async pick(name: string, onCapture: BrowserPickCaptureCallback | undefined, signal: AbortSignal | undefined, timeoutMs: number): Promise<BrowserPickResult> {
+    const entry = this.#tabs.get(name);
+    if (!entry) throw new Error(`No tab named "${name}". Open it first.`);
+    if (entry.busy) throw new Error(`Tab "${name}" is busy.`);
+    throwIfAborted(signal);
+    if (entry.backend === "extension") assertExtensionEntryActive(entry, signal);
+    else if (entry.page.isClosed()) throw new Error(`Tab "${name}" page is closed.`);
+
+    const pickAbort = new AbortController();
+    const combined = combineSignals(signal, pickAbort.signal, this.#lifecycle.signal);
+    entry.busy = true;
+    entry.pickAbort = pickAbort;
+    const captures: BrowserCapture[] = [];
+    let status: BrowserPickStatus = "sent";
+    let errorCount = 0;
+    const evaluate = async (code: string): Promise<unknown> => {
+      if (entry.backend === "extension") {
+        const result = await awaitExtensionBridge(
+          entry.bridgeIdentity,
+          combined.signal,
+          timeoutMs,
+          () => browserBridge.sendTracked("exec", { tabId: entry.tabId, code }, timeoutMs, entry.bridgeIdentity),
+          entry,
+        );
+        assertExtensionEntryActive(entry, combined.signal);
+        return result.data;
+      }
+      if (entry.page.isClosed()) throw new Error(`Tab "${name}" page is closed.`);
+      return raceAbort(entry.page.evaluate(code), combined.signal, timeoutMs);
+    };
+    try {
+      await evaluate(PICKER_INJECT_JS);
+      const deadline = Date.now() + timeoutMs;
+      for (;;) {
+        throwIfAborted(combined.signal);
+        const remaining = deadline - Date.now();
+        if (remaining <= 0) { status = "timeout"; break; }
+        let poll: unknown;
+        try {
+          poll = await evaluate(PICKER_POLL_JS);
+        } catch (error) {
+          if (isInterruptError(error)) {
+            status = (error as Error).name === "AbortError" ? "closed" : "timeout";
+            break;
+          }
+          throw error;
+        }
+        if (!isRecord(poll)) throw new Error("Browser pick poll returned an unexpected value.");
+        if (poll.missing === true) { status = "navigated"; break; }
+        const batch = Array.isArray(poll.captures) ? (poll.captures as BrowserCapture[]) : [];
+        if (batch.length > 0) {
+          captures.push(...batch);
+          try { onCapture?.(batch); } catch { /* delivery failure must not kill the pick */ }
+        }
+        if (typeof poll.errorCount === "number") errorCount = poll.errorCount;
+        if (typeof poll.done === "string" && poll.done) {
+          status = poll.done === "sent" ? "sent" : "escape";
+          break;
+        }
+        await abortableDelay(Math.min(500, Math.max(50, remaining)), combined.signal);
+      }
+    } catch (error) {
+      if (isInterruptError(error)) {
+        // Caller abort or close()/closeAll() via pickAbort: keep whatever was
+        // already drained (it was already pasted) and report a graceful end.
+        status = (error as Error).name === "AbortError" ? "closed" : "timeout";
+      } else {
+        throw error;
+      }
+    } finally {
+      try { await evaluate(PICKER_TEARDOWN_JS); } catch { /* page may be gone */ }
+      entry.busy = false;
+      entry.pickAbort = undefined;
+      combined.dispose();
+    }
+    return { captures, status, errorCount };
+  }
+
   async #runTrackedExtension(
     entry: ExtensionEntry,
     code: string,
@@ -718,6 +837,7 @@ export class BrowserManager implements BrowserManagerLike {
   async close(name: string): Promise<boolean> {
     const entry = this.#tabs.get(name);
     if (entry) {
+      entry.pickAbort?.abort();
       if (entry.backend === "extension") {
         entry.closed = true;
         entry.acceptingCommands = false;
@@ -750,6 +870,7 @@ export class BrowserManager implements BrowserManagerLike {
     this.#lifecycle.abort();
     this.#lifecycle = new AbortController();
     for (const entry of entries) {
+      entry.pickAbort?.abort();
       if (entry.backend === "extension") {
         entry.closed = true;
         entry.acceptingCommands = false;
@@ -813,6 +934,7 @@ export class BrowserManager implements BrowserManagerLike {
 
   async #discardEntry(entry: PuppeteerEntry): Promise<void> {
     if (this.#tabs.get(entry.name) !== entry) return;
+    entry.pickAbort?.abort();
     this.#tabs.delete(entry.name);
     await disposeEntry(entry);
   }

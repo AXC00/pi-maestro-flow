@@ -6,9 +6,11 @@ import { Type } from "typebox";
 import {
   browserManager,
   canonicalizeBrowserOpenOptions,
+  type BrowserCapture,
   type BrowserConnectionInfo,
   type BrowserManagerLike,
   type BrowserManagerStatus,
+  type BrowserPickResult,
 } from "./browser/manager.ts";
 import type { PairingApproval } from "./browser/bridge-server.ts";
 import { getSopRegistry, SOP_INDEX_EXTRAS, SOP_INDEX_HEADERS } from "./sop/sop-registry-singleton.ts";
@@ -22,10 +24,10 @@ type BrowserDialogPolicy = "accept" | "dismiss";
 // rules. `guide` with no topic returns the registry index; `guide` + topic loads
 // one document. Knowhow updates flow through `maestro knowledge stage → promote`.
 
-const BrowserAction = Type.Unsafe<"open" | "close" | "run" | "guide" | "status" | "pair">({
+const BrowserAction = Type.Unsafe<"open" | "close" | "run" | "guide" | "status" | "pair" | "pick">({
   type: "string",
-  enum: ["open", "close", "run", "guide", "status", "pair"],
-  description: "open: launch or attach a tab; close: close one or all tabs; run: execute JavaScript in a tab; guide: return the SOP registry index; status: start/probe the extension bridge and list pending pairings; pair: approve one pending request with request_id + code",
+  enum: ["open", "close", "run", "guide", "status", "pair", "pick"],
+  description: "open: launch or attach a tab; close: close one or all tabs; run: execute JavaScript in a tab; guide: return the SOP registry index; status: start/probe the extension bridge and list pending pairings; pair: approve one pending request with request_id + code; pick: inject an in-page element/component selector and paste the user's captures into their input box",
 });
 const WaitUntil = Type.Unsafe<BrowserWaitUntil>({
   type: "string",
@@ -82,7 +84,7 @@ export const BrowserParams = Type.Object({
 });
 
 export interface BrowserToolDetails {
-  action: "open" | "close" | "run" | "guide" | "status" | "pair";
+  action: "open" | "close" | "run" | "guide" | "status" | "pair" | "pick";
   name?: string;
   url?: string;
   browser?: "headless" | "headed" | "connected" | "extension";
@@ -94,6 +96,7 @@ export interface BrowserToolDetails {
   newTabs?: Array<{ url: string }>;
   status?: BrowserManagerStatus;
   pairingApproval?: PairingApproval;
+  pick?: BrowserPickResult;
 }
 
 export function createBrowserTool(manager: BrowserManagerLike = browserManager): ToolDefinition<typeof BrowserParams, BrowserToolDetails> {
@@ -102,8 +105,8 @@ export function createBrowserTool(manager: BrowserManagerLike = browserManager):
   return {
     name: "browser",
     label: "Browser",
-    description: "Control Chromium through named tabs. Open or attach a browser, inspect live bridge/named-tab status, run trusted host-level JavaScript with page/browser/tab helpers, capture screenshots, and close one or all tabs. The run action requires non-empty code, is shell-equivalent, and is blocked in Plan mode. For managed/profile/cdp entries, page is a puppeteer-core Page (page.setViewport({width,height}), page.goto, page.evaluate, page.screenshot — Puppeteer, not Playwright) and browser is a puppeteer Browser. Extension entries instead expose limited honest adapters: page.url/title/goto/evaluate, browser.pages, and tab.url/title/goto/evaluate/cdp/cdpBatch/cookies/tabs/screenshot; every other call fails closed with the capability list.\\n\\nBEFORE ANY browser operation: call action: guide to get the SOP registry index, then load the relevant document by topic (core: mode choice, Turnstile recipe, helpers, pitfalls; captcha-strategies; automation-antipatterns; network-mocking; auth-flows; form-widgets; list-scraping; antibot-landscape). Acting before reading the SOP risks silent failure.\\n\\nCAPABILITY MAP (when to use which):\\n  - Extension setup: status starts the default server range 19222..19231; the loaded extension moves from unpaired to pendingPairings; pair only delivers credentials, then challenge-response reconnect produces authenticatedConnected; PI_BROWSER_BRIDGE_PORT custom anchors also require popup Advanced port\\n  - Pure scraping (no login/CAPTCHA) → open with visible:false (headless default) + tab.extract('probe')\\n  - Login state / CAPTCHA / real fingerprint → FIRST call action:guide, then open with visible:true + app.attach_user_profile + app.user_profile_dir (attach the user's daily browser; pi auto-launches Chrome with --remote-debugging-port=9222 if no live debug port, or reuses a running instance; pure stealth is NOT enough for Cloudflare managed challenges)\\n  - Raw CDP domain call → tab.cdp(method, params) (e.g. Page.captureScreenshot, Network.getCookies, DOM.setFileInputFiles)\\n  - Cookie read/write → tab.cookies.get/set/delete (session-level; in attach mode the user's login cookies are present)\\n  - File upload → tab.uploadFile(selector, ...paths); transient <input type=file> without a persistent DOM node → tab.cdp('DOM.setFileInputFiles', ...)\\n  - Cross-origin iframe JS → tab.evalInFrame(matcher, fn, ...args) (matcher = url substring/RegExp/predicate)\\n  - Open Shadow DOM → tab.pierce(selector) → {x,y}; follow with tab.cdpClick(x,y)\\n  - Canvas / non-DOM / hover-dependent click → tab.cdpClick(x, y, {hoverMs?}) (CDP Input 3-event sequence)\\n  - Chrome autofill release → tab.autofillRelease(selector) (brings tab to front, clicks, re-dispatches input/change)\\n  - Download-dialog bypass → tab.setDownloadBehavior(dirPath)\\n  - Multi-CDP chain → tab.cdpBatch([{method,params},...]) with '$N.path' references\\n  - On-page OCR / visual localization -> tab.ocr({region?,langs?}) returns {text, lines:[{bbox,text,confidence}]}; tab.detect({mode?,langs?}) returns {items:[{bbox,type,label,confidence}]} for canvas/non-DOM buttons. Follow with tab.cdpClick(cx, cy). Default langs is eng; pass eng+chi_sim for Chinese. Uses the shared local RapidOCR/OmniParser service and manifest-listed model assets; unavailable or unverified models return structured errors and OmniParser fails closed. For text-only needs without local models, describe_image can read text but cannot return reliable pixel coordinates\\n  - DOM observation → tab.observe() (interactive elements + numeric ids), tab.extract('probe'|'list'|'text'|'html'), tab.snapshot() + tab.diff(before) for change detection, tab.monitorStart/Stop for transient text\\n  - Navigation/new-tab detection is auto-reported in run output (navigated, newTabs).\\nSOP registry: action: guide returns the index; load a document with topic.\\nPass visible: true to open a headed (visible) browser window; the default is headless.",
-    promptSnippet: "Use browser for interactive web navigation, DOM observation, form input, screenshots, and live connection status. Managed/profile/cdp run code receives a puppeteer-core Page and full tab helper. app.channel='extension' is opt-in and receives limited adapters (page.url/title/goto/evaluate, browser.pages, tab.url/title/goto/evaluate/cdp/cdpBatch/cookies/tabs/screenshot); unsupported calls fail closed and the channel never falls back to managed Chromium. First-time extension setup is zero-copy on the default 19222..19231 range: action:'status' reports pendingPairings; action:'pair' only delivers credentials, then challenge-response reconnect establishes authenticatedConnected. PI_BROWSER_BRIDGE_PORT changes the server anchor but a custom anchor must also be entered in popup Advanced settings; manual port/token is recovery only. Pass visible:true when Pi must launch a visible browser; for CAPTCHA/login use the profile channel with app.user_profile_dir.",
+    description: "Control Chromium through named tabs. Open or attach a browser, inspect live bridge/named-tab status, run trusted host-level JavaScript with page/browser/tab helpers, capture screenshots, and close one or all tabs. The run action requires non-empty code, is shell-equivalent, and is blocked in Plan mode. For managed/profile/cdp entries, page is a puppeteer-core Page (page.setViewport({width,height}), page.goto, page.evaluate, page.screenshot — Puppeteer, not Playwright) and browser is a puppeteer Browser. Extension entries instead expose limited honest adapters: page.url/title/goto/evaluate, browser.pages, and tab.url/title/goto/evaluate/cdp/cdpBatch/cookies/tabs/screenshot; every other call fails closed with the capability list.\\n\\nBEFORE ANY browser operation: call action: guide to get the SOP registry index, then load the relevant document by topic (core: mode choice, Turnstile recipe, helpers, pitfalls; captcha-strategies; automation-antipatterns; network-mocking; auth-flows; form-widgets; list-scraping; antibot-landscape). Acting before reading the SOP risks silent failure.\\n\\nCAPABILITY MAP (when to use which):\\n  - Extension setup: status starts the default server range 19222..19231; the loaded extension moves from unpaired to pendingPairings; pair only delivers credentials, then challenge-response reconnect produces authenticatedConnected; PI_BROWSER_BRIDGE_PORT custom anchors also require popup Advanced port\\n  - Pure scraping (no login/CAPTCHA) → open with visible:false (headless default) + tab.extract('probe')\\n  - Login state / CAPTCHA / real fingerprint → FIRST call action:guide, then open with visible:true + app.attach_user_profile + app.user_profile_dir (attach the user's daily browser; pi auto-launches Chrome with --remote-debugging-port=9222 if no live debug port, or reuses a running instance; pure stealth is NOT enough for Cloudflare managed challenges)\\n  - Raw CDP domain call → tab.cdp(method, params) (e.g. Page.captureScreenshot, Network.getCookies, DOM.setFileInputFiles)\\n  - Cookie read/write → tab.cookies.get/set/delete (session-level; in attach mode the user's login cookies are present)\\n  - File upload → tab.uploadFile(selector, ...paths); transient <input type=file> without a persistent DOM node → tab.cdp('DOM.setFileInputFiles', ...)\\n  - Cross-origin iframe JS → tab.evalInFrame(matcher, fn, ...args) (matcher = url substring/RegExp/predicate)\\n  - Open Shadow DOM → tab.pierce(selector) → {x,y}; follow with tab.cdpClick(x,y)\\n  - Canvas / non-DOM / hover-dependent click → tab.cdpClick(x, y, {hoverMs?}) (CDP Input 3-event sequence)\\n  - Chrome autofill release → tab.autofillRelease(selector) (brings tab to front, clicks, re-dispatches input/change)\\n  - Download-dialog bypass → tab.setDownloadBehavior(dirPath)\\n  - Multi-CDP chain → tab.cdpBatch([{method,params},...]) with '$N.path' references\\n  - On-page OCR / visual localization -> tab.ocr({region?,langs?}) returns {text, lines:[{bbox,text,confidence}]}; tab.detect({mode?,langs?}) returns {items:[{bbox,type,label,confidence}]} for canvas/non-DOM buttons. Follow with tab.cdpClick(cx, cy). Default langs is eng; pass eng+chi_sim for Chinese. Uses the shared local RapidOCR/OmniParser service and manifest-listed model assets; unavailable or unverified models return structured errors and OmniParser fails closed. For text-only needs without local models, describe_image can read text but cannot return reliable pixel coordinates\\n  - DOM observation → tab.observe() (interactive elements + numeric ids), tab.extract('probe'|'list'|'text'|'html'), tab.snapshot() + tab.diff(before) for change detection, tab.monitorStart/Stop for transient text\\n  - User-driven component pick → action:pick injects an in-page selector toolbar (hover shows <ComponentName />, click selects, Ctrl/Cmd/Shift multi-select, Send element / Send errors buttons, Esc exits); captures are pasted into the USER's input box for them to send — you will not receive them unless they do\n  - Navigation/new-tab detection is auto-reported in run output (navigated, newTabs).\\nSOP registry: action: guide returns the index; load a document with topic.\\nPass visible: true to open a headed (visible) browser window; the default is headless.",
+    promptSnippet: "Use browser for interactive web navigation, DOM observation, form input, screenshots, user-driven component picking (action:pick pastes captures into the user's input box), and live connection status. Managed/profile/cdp run code receives a puppeteer-core Page and full tab helper. app.channel='extension' is opt-in and receives limited adapters (page.url/title/goto/evaluate, browser.pages, tab.url/title/goto/evaluate/cdp/cdpBatch/cookies/tabs/screenshot); unsupported calls fail closed and the channel never falls back to managed Chromium. First-time extension setup is zero-copy on the default 19222..19231 range: action:'status' reports pendingPairings; action:'pair' only delivers credentials, then challenge-response reconnect establishes authenticatedConnected. PI_BROWSER_BRIDGE_PORT changes the server anchor but a custom anchor must also be entered in popup Advanced settings; manual port/token is recovery only. Pass visible:true when Pi must launch a visible browser; for CAPTCHA/login use the profile channel with app.user_profile_dir.",
     promptGuidelines: [
       "Before ANY browser operation, call action:guide to get the SOP registry index, then read the relevant topic documents: core (mode choice, Turnstile recipe, helpers, CDP pitfalls), captcha-strategies, automation-antipatterns, network-mocking, auth-flows (login/2FA/OAuth), form-widgets (rich text/select/date/drag), list-scraping (infinite scroll/pagination), antibot-landscape (identify the WAF first). THEN choose the browser mode by scenario: pure scraping (no login/CAPTCHA) → open with visible:false (headless); login state / CAPTCHA / real fingerprint → open with visible:true + app.attach_user_profile + app.user_profile_dir. pi auto-launches Chrome with --remote-debugging-port=9222 if no live debug port is found (or reuses a running instance). Pure stealth patches are NOT enough for Cloudflare managed challenges — attaching the user's real browser is the working path.",
       "Match the helper to the target: DOM elements → tab.observe()/tab.click()/tab.fill(); canvas / non-DOM / hover-dependent components → tab.cdpClick(x,y); open Shadow DOM → tab.pierce(selector) then tab.cdpClick; cross-origin iframe → tab.evalInFrame(matcher, fn); file upload → tab.uploadFile(selector, paths) or tab.cdp('DOM.setFileInputFiles') for transient inputs; raw CDP domain → tab.cdp(method, params).",
@@ -135,6 +138,7 @@ export function createBrowserTool(manager: BrowserManagerLike = browserManager):
       "Bypass the \"download multiple files\" dialog with tab.setDownloadBehavior(dirPath) (relative to cwd) — sets CDP Browser.setDownloadBehavior to allow so Chrome does not block JS on the prompt.",
       "Chain multiple CDP commands in one round-trip with tab.cdpBatch([{method, params}, ...]); later params may reference earlier results via \"$N.dotted.path\" strings (0-indexed). Check each result's ok flag — a failed prior command makes $N references undefined.",
       "Optional browser-bridge extension: install with /install browser-bridge, then explicitly open app.channel='extension' with app.target to borrow an existing tab or url to create an owned tab. Each named entry keeps its fixed tabId; close only closes owned tabs. The limited adapter supports URL/title, goto/evaluate, raw CDP and batch, cookies, tab listing, and CDP screenshot. Disconnects and unsupported calls fail closed with no managed-browser fallback.",
+      "Let the user point at a UI element with action:pick — it injects a selector toolbar into the named tab's page (works on managed/profile/cdp and extension channels): hover highlights the element and shows its React/Vue component name, click selects, Ctrl/Cmd/Shift adds to the selection, [Send element] pastes the capture(s) into the user's input box, [Send errors] pastes buffered console.error output (up to 100), Esc exits. Captures include tag, CSS selector, trimmed outerHTML, and component source file:line when the page runs a dev build (production builds yield component names only). The tool call blocks until the user sends or exits; you do NOT receive the captures unless the user sends them.",
     ],
     parameters: BrowserParams,
     executionMode: "sequential",
@@ -201,6 +205,42 @@ export function createBrowserTool(manager: BrowserManagerLike = browserManager):
           const text = `Approved browser pairing ${approval.requestId} on port ${approval.port}. The extension will store the credentials and reconnect with authenticated authority.`;
           return success(text, { action: "pair", pairingApproval: approval, result: text });
         }
+        if (params.action === "pick") {
+          // Devin browser_preview semantics: captures go into the USER's input
+          // box for them to send — the agent does not receive them unless the
+          // user sends. When no editor is available (RPC/print/test contexts)
+          // the captures degrade to the tool result instead.
+          const ui = (ctx as { ui?: { pasteToEditor?: (text: string) => void } }).ui;
+          const canPaste = typeof ui?.pasteToEditor === "function";
+          let counter = 0;
+          const onCapture = canPaste
+            ? (batch: BrowserCapture[]) => {
+                const text = batch.map((capture) => formatBrowserCapture(capture, ++counter)).join("\n");
+                try { ui.pasteToEditor!(text); } catch { /* editor delivery is best-effort */ }
+              }
+            : undefined;
+          const pick = await manager.pick(name, onCapture, signal, timeoutMs);
+          const elementCount = pick.captures.filter((capture) => capture.kind === "element").length;
+          const consoleBatches = pick.captures.filter((capture) => capture.kind === "console").length;
+          const statusNote = pick.status === "sent"
+            ? ""
+            : pick.status === "escape"
+              ? " The user pressed Esc before sending."
+              : pick.status === "navigated"
+                ? " The page navigated mid-pick and wiped the picker; reopen pick if still needed."
+                : pick.status === "closed"
+                  ? " The pick was interrupted (tab closed or run aborted)."
+                  : " The pick timed out waiting for the user.";
+          const delivery = canPaste
+            ? "Captures were pasted into the user's input box — they reach you only if the user sends them."
+            : "No input editor is available, so captures are returned inline below.";
+          let text = `Pick on tab ${JSON.stringify(name)} finished (status: ${pick.status}): ${elementCount} element(s), ${consoleBatches} console batch(es), ${pick.errorCount} console error(s) buffered.${statusNote} ${delivery}`;
+          if (!canPaste && pick.captures.length > 0) {
+            counter = 0;
+            text += "\n" + pick.captures.map((capture) => formatBrowserCapture(capture, ++counter)).join("\n");
+          }
+          return success(text, { action: "pick", name, pick, result: text });
+        }
         if (!params.code?.trim()) throw new Error("Browser run requires non-empty code.");
         const output = await manager.run(name, params.code, ctx.cwd, signal, timeoutMs);
         const content = [...output.displays];
@@ -246,6 +286,23 @@ export function createBrowserTool(manager: BrowserManagerLike = browserManager):
 
 function success(text: string, details: BrowserToolDetails): AgentToolResult<BrowserToolDetails> {
   return { content: [{ type: "text", text }], details } as AgentToolResult<BrowserToolDetails>;
+}
+
+// Mirrors Devin's "[Browser capture #N: …]" paste format: component/source line
+// first, then the trimmed outerHTML the user can review before sending.
+function formatBrowserCapture(capture: BrowserCapture, index: number): string {
+  if (capture.kind === "console") {
+    const lines = capture.errors.length > 0 ? capture.errors : ["(no console errors buffered)"];
+    return `[Browser console errors (${capture.errors.length})]\n${lines.join("\n")}`;
+  }
+  const component = capture.reactComponentName
+    ? ` <${capture.reactComponentName} />`
+    : capture.vueComponentName
+      ? ` <${capture.vueComponentName} />`
+      : "";
+  const source = capture.filePath ? ` ${capture.filePath}${capture.line ? `:${capture.line}` : ""}` : "";
+  const header = `[Browser capture #${index}: <${capture.tagName}>${component}${source}]`;
+  return `${header}\n${capture.outerHtml}`;
 }
 
 function formatValue(value: unknown): string {
