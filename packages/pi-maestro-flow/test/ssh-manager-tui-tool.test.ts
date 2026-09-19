@@ -5,6 +5,7 @@ import { Value } from "typebox/value";
 import {
   createBoundSshToolContext,
   MaskedSecretInput,
+  parseSshToolInput,
   SshExecutor,
   SshHostManagerOverlay,
   SshHostPickerOverlay,
@@ -191,9 +192,9 @@ test("SSH manager Keys view renders metadata only and exposes managed-key CRUD",
 });
 
 test("LLM SSH tool schema keeps legacy commands and Gateway actions hostless", async () => {
-  assert.equal(Value.Check(SshToolParams, { command: "id", cwd: "/srv", timeout: 5 }), true);
-  assert.equal(Value.Check(SshToolParams, { action: "describe", tool: "host" }), true);
-  assert.equal(Value.Check(SshToolParams, { command: "id", action: "status" }), false);
+  assert.doesNotThrow(() => parseSshToolInput({ command: "id", cwd: "/srv", timeout: 5 }));
+  assert.doesNotThrow(() => parseSshToolInput({ action: "describe", tool: "host" }));
+  assert.throws(() => parseSshToolInput({ command: "id", action: "status" }));
   assert.equal(Value.Check(SshToolParams, { action: "status", host: "alpha.example.test" }), false);
   assert.equal(Value.Check(SshToolParams, { action: "call", tool: "host", auth: {}, password: "secret" }), false);
 

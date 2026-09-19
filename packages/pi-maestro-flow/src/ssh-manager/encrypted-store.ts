@@ -36,6 +36,7 @@ import {
   validateSshManagerData,
   validateSshManagerDataV2,
   validateSshManagerDataV3,
+  SSH_HOST_KEY_PATTERN,
   type LegacySshManagerData,
   type SshGatewayBinding,
   type SshGatewayLaunchBinding,
@@ -45,6 +46,7 @@ import {
   type SshManagerDataV2,
   type SshManagerDataV3,
 } from "./model.ts";
+import { lookupKnownHostFingerprints } from "./known-hosts.ts";
 
 const ENVELOPE_VERSION = 1 as const;
 const KDF_NAME = "scrypt" as const;
@@ -242,6 +244,16 @@ export class EncryptedSshStore {
     const key = this.requireData().keys.find((candidate) => candidate.id === id);
     if (!key) throw new Error("SSH key was not found");
     return cloneSshKey(key);
+  }
+  knownHostKeys(hostname: string, port: number): Promise<readonly string[]> {
+    return lookupKnownHostFingerprints(hostname, port);
+  }
+  async rememberHostKey(id: string, fingerprint: string): Promise<void> {
+    if (!SSH_HOST_KEY_PATTERN.test(fingerprint)) return;
+    const host = this.getHosts().find((candidate) => candidate.id === id);
+    if (!host || host.hostKey === fingerprint) return;
+    if (host.hostKey !== null) return;
+    await this.updateHost(id, { ...host, hostKey: fingerprint });
   }
   getReverseDependencyClosure(hostId: string): string[] { return reverseSshHostDependencyClosure(this.requireData().hosts, hostId); }
   getEffectiveHostDigest(hostId: string): string { return effectiveSshHostDigest(this.requireData(), hostId); }

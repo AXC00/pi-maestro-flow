@@ -26,11 +26,12 @@ import {
   SshGatewayCapabilityError,
   SshGatewayClientPool,
   type SshGatewayActionResult,
+  type SshGatewayInput,
 } from "./gateway-client.ts";
 import { SshGatewayBootstrapManager } from "./gateway-bootstrap.ts";
 import { GatewayCompletionRouter } from "./gateway-completion-router.ts";
 import { pairSshGateway, sshGatewayGuide, unpairSshGateway } from "./guide.ts";
-import { SshToolParams, type SshToolInput } from "./llm-tool.ts";
+import { SshToolParams, parseSshToolInput, type ParsedSshToolInput, type SshToolInput } from "./llm-tool.ts";
 import {
   SSH_HOST_ID_PATTERN,
   SSH_HOST_KEY_PATTERN,
@@ -51,6 +52,7 @@ import {
   type OpenSshDiscoveryResult,
   type OpenSshImportCandidate,
 } from "./openssh-config.ts";
+import { pinUntrustedHostsFromKnownHosts } from "./known-hosts.ts";
 import { SshStatusMonitor, type SshHostOperationalStatus } from "./status-monitor.ts";
 import {
   TeammateRemoteChannelBroker,
@@ -308,6 +310,7 @@ export function registerSshManager(
   const refreshStore = async (): Promise<void> => {
     if (store.locked) throw new Error("SSH manager is locked. Send #ssh or open /ssh to unlock it.");
     await store.reload();
+    await pinUntrustedHostsFromKnownHosts(store.getHosts(), (host, fingerprint) => store.updateHost(host.id, { ...host, hostKey: fingerprint }));
   };
 
   const prepareAttachmentSelection = async (ctx: ExtensionContext): Promise<boolean> => {
@@ -387,7 +390,18 @@ Use action=targets to list provider-owned target ids, then pass targetId on a co
       params: SshToolInput,
       signal: AbortSignal,
     ) {
-      const requestedTargetId = "targetId" in params ? params.targetId : undefined;
+      let parsed: ParsedSshToolInput;
+      try {
+        parsed = parseSshToolInput(params);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        return {
+          content: [{ type: "text" as const, text: message }],
+          isError: true,
+          details: { exitCode: null, signal: null, durationMs: 0, summary: "invalid arguments" },
+        };
+      }
+      const requestedTargetId = parsedTargetId(parsed);
       const details = (
         result?: SshExecutionResult,
         host?: SshHost,
@@ -407,7 +421,7 @@ Use action=targets to list provider-owned target ids, then pass targetId on a co
         signal: result?.signal ?? null,
         durationMs: result?.durationMs ?? gatewayResult?.durationMs ?? 0,
       });
-      if ("action" in params && params.action === "guide") {
+      if (parsed.kind === "guide") {
         return {
           content: [{ type: "text" as const, text: sshGatewayGuide() }],
           details: {
@@ -424,7 +438,7 @@ Use action=targets to list provider-owned target ids, then pass targetId on a co
       try {
         await refreshStore();
         scheduleActiveMonitoring();
-        if ("action" in params && params.action === "targets") {
+        if (parsed.kind === "targets") {
           const selectedIds = new Set(selectedHostsForDisplay().map((host) => host.id));
           const targets = store.getHosts().map((host) => ({
             targetId: host.id,
@@ -444,9 +458,12 @@ Use action=targets to list provider-owned target ids, then pass targetId on a co
           };
         }
         executionHost = resolveExecutionHost(requestedTargetId);
-        if ("command" in params) {
-          const { targetId: _targetId, ...commandInput } = params;
-          const result = await executor.execute(executionHost, commandInput, { signal });
+        if (parsed.kind === "command") {
+          const result = await executor.execute(executionHost, {
+            command: parsed.command,
+            ...(parsed.cwd ? { cwd: parsed.cwd } : {}),
+            ...(parsed.timeout !== undefined ? { timeout: parsed.timeout } : {}),
+          }, { signal });
           const output = [
             result.stdout ? `stdout:\n${result.stdout}` : "",
             result.stderr ? `stderr:\n${result.stderr}` : "",
@@ -458,10 +475,10 @@ Use action=targets to list provider-owned target ids, then pass targetId on a co
             details: details(result, executionHost),
           };
         }
-        if (params.action === "sync_pi_config") {
+        if (parsed.kind === "sync_pi_config") {
           const fence = connectionFence(executionHost.id);
           const syncResult = await syncPiConfig({
-            categories: params.categories,
+            categories: parsed.categories,
             source: configSource,
             transport: configSyncTransport(executionHost),
             signal,
@@ -480,7 +497,7 @@ Use action=targets to list provider-owned target ids, then pass targetId on a co
             },
           };
         }
-        if (params.action === "ensure_gateway") {
+        if (parsed.kind === "ensure_gateway") {
           const effectiveDigest = store.getEffectiveHostDigest(executionHost.id);
           const cacheFence = connectionFence(executionHost.id);
           const bootstrap = await gatewayBootstrap.ensure(
@@ -503,7 +520,7 @@ Use action=targets to list provider-owned target ids, then pass targetId on a co
                 throw error;
               }
             },
-            { timeoutSeconds: params.timeout, signal },
+            { timeoutSeconds: parsed.timeout, signal },
           );
           const summary = bootstrap.started
             ? "gateway started · local-session"
@@ -517,20 +534,19 @@ Use action=targets to list provider-owned target ids, then pass targetId on a co
             },
           };
         }
-        const startPiContext = params.action === "start_pi"
+        const startPiContext = parsed.kind === "start_pi"
           ? {
               piSessionRef: activeContext?.sessionManager.getSessionId?.() ?? "",
               todos: getVisibleTasks(),
             }
           : undefined;
-        if (params.action === "start_pi" && !startPiContext?.piSessionRef) {
+        if (parsed.kind === "start_pi" && !startPiContext?.piSessionRef) {
           throw new Error("start_pi requires an active local Pi session");
         }
-        const { targetId: _targetId, ...gatewayInput } = params;
         const gatewayResult = await gatewayPool.execute(
           executionHost,
           store.getEffectiveHostDigest(executionHost.id),
-          gatewayInput,
+          sshGatewayExecuteInput(parsed),
           signal,
           startPiContext,
           connectionFence(executionHost.id),
@@ -548,11 +564,7 @@ Use action=targets to list provider-owned target ids, then pass targetId on a co
           isError: true,
           details: {
             ...details(undefined, executionHost),
-            ...("action" in params ? {
-              action: params.action,
-              ...(params.action === "describe" || params.action === "call" ? { tool: params.tool } : {}),
-              summary: params.action === "targets" ? "target listing failed" : params.action === "sync_pi_config" ? "configuration sync failed" : params.action === "ensure_gateway" ? "gateway bootstrap failed" : "gateway failed",
-            } : {}),
+            ...sshToolFailureDetails(parsed),
           },
         };
       }
@@ -1252,7 +1264,7 @@ function dependencyClosureForKey(hosts: readonly SshHost[], keyId: string): stri
   return [...affected];
 }
 
-/** Test is the sole trust-on-first-use entry point and fences persistence by id, digest, pin, and revision. */
+/** Test remains the explicit TOFU confirm path. Unique known_hosts matches pin without Test. */
 export async function testAndTrustSshHost(ctx: ExtensionContext, store: EncryptedSshStore, executor: SshExecutor, snapshot: SshHost): Promise<string> {
   const revision = store.revision;
   const digest = store.getEffectiveHostDigest(snapshot.id);
@@ -1348,7 +1360,7 @@ async function importOpenSshWizard(ctx: ExtensionContext, store: EncryptedSshSto
     if (await ctx.ui.confirm(`Import OpenSSH host ${candidate.alias}?`, summary)) accepted.push(candidate);
   }
   if (accepted.length === 0) return "OpenSSH import cancelled";
-  if (!await ctx.ui.confirm(`Import ${accepted.length} OpenSSH host(s)?`, "New hosts start untrusted with monitoring off.")) return "OpenSSH import cancelled";
+  if (!await ctx.ui.confirm(`Import ${accepted.length} OpenSSH host(s)?`, "Unique known_hosts identities are pinned automatically; remaining hosts stay untrusted with monitoring off.")) return "OpenSSH import cancelled";
   const existing = store.getHosts();
   const existingKeys = store.getKeys();
   const importedKeys: SshKey[] = [];
@@ -1381,8 +1393,13 @@ async function importOpenSshWizard(ctx: ExtensionContext, store: EncryptedSshSto
     }
     additions.push(validateSshHost({ id: ids.get(candidate.alias), label: candidate.alias, host: candidate.hostName, user, port: candidate.port, shell: "bash", hostKey: null, auth, tags: [], jumpHostId, monitorEnabled: false }));
   }
+  await pinUntrustedHostsFromKnownHosts(additions, async (host, fingerprint) => {
+    const index = additions.findIndex((candidate) => candidate.id === host.id);
+    if (index >= 0) additions[index] = { ...host, hostKey: fingerprint };
+  });
   await store.saveConfiguration([...existing, ...additions], [...existingKeys, ...importedKeys]);
-  return `Imported ${additions.length} OpenSSH host(s)${importedKeys.length ? ` and ${importedKeys.length} encrypted key(s)` : "; identities remain explicit path references"}`;
+  const pinned = additions.filter((host) => host.hostKey !== null).length;
+  return `Imported ${additions.length} OpenSSH host(s)${pinned ? ` (${pinned} pinned from known_hosts)` : ""}${importedKeys.length ? ` and ${importedKeys.length} encrypted key(s)` : "; identities remain explicit path references"}`;
 }
 
 async function hasPrivateKeyFiles(directory = join(homedir(), ".ssh")): Promise<boolean> {
@@ -1453,6 +1470,49 @@ function sshToolTargetDetails(host: SshHost): SshToolTargetDetails {
 function formatSshAddress(host: string, port: number): string {
   const address = host.includes(":") && !host.startsWith("[") ? `[${host}]` : host;
   return `${address}:${port}`;
+}
+
+function parsedTargetId(parsed: ParsedSshToolInput): string | undefined {
+  return parsed.kind === "guide" || parsed.kind === "targets" ? undefined : parsed.targetId;
+}
+
+function sshGatewayExecuteInput(parsed: ParsedSshToolInput): Exclude<SshGatewayInput, { action: "guide" }> {
+  if (parsed.kind === "status" || parsed.kind === "list") return { action: parsed.kind };
+  if (parsed.kind === "describe") return { action: "describe", tool: parsed.tool };
+  if (parsed.kind === "call") {
+    return {
+      action: "call",
+      tool: parsed.tool,
+      ...(parsed.args ? { args: parsed.args } : {}),
+      ...(parsed.timeout !== undefined ? { timeout: parsed.timeout } : {}),
+    };
+  }
+  if (parsed.kind === "start_pi") {
+    return {
+      action: "start_pi",
+      requestId: parsed.requestId,
+      ...(parsed.todoIds ? { todoIds: parsed.todoIds } : {}),
+      ...(parsed.objective ? { objective: parsed.objective } : {}),
+      ...(parsed.agent ? { agent: parsed.agent } : {}),
+      ...(parsed.timeout !== undefined ? { timeout: parsed.timeout } : {}),
+    };
+  }
+  throw new Error("SSH Gateway action is not executable");
+}
+
+function sshToolFailureDetails(parsed: ParsedSshToolInput): Partial<SshToolDetails> {
+  if (parsed.kind === "command") return {};
+  return {
+    action: parsed.kind,
+    ...(parsed.kind === "describe" || parsed.kind === "call" ? { tool: parsed.tool } : {}),
+    summary: parsed.kind === "targets"
+      ? "target listing failed"
+      : parsed.kind === "sync_pi_config"
+        ? "configuration sync failed"
+        : parsed.kind === "ensure_gateway"
+          ? "gateway bootstrap failed"
+          : "gateway failed",
+  };
 }
 
 function formatSshToolArgument(args: Partial<SshToolInput>, target?: SshToolTargetDetails): string {
