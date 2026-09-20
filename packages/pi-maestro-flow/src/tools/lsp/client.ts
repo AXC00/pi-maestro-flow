@@ -264,9 +264,9 @@ export class LspClient implements LspClientLike {
         if (isAbortError(error)) throw error;
       }
     }
-    if (this.#diagnostics.has(uri)) return this.#touchDiagnostics(uri);
+    if (this.#diagnostics.has(normalizeUriKey(uri))) return this.#touchDiagnostics(uri);
     await this.#waitForDiagnostics(uri, waitMs, signal);
-    return this.#diagnostics.has(uri) ? this.#touchDiagnostics(uri) : [];
+    return this.#diagnostics.has(normalizeUriKey(uri)) ? this.#touchDiagnostics(uri) : [];
   }
 
   async shutdown(): Promise<void> {
@@ -333,6 +333,7 @@ export class LspClient implements LspClientLike {
   }
 
   #setDiagnostics(uri: string, diagnostics: Diagnostic[]): void {
+    uri = normalizeUriKey(uri);
     const bytes = Buffer.byteLength(JSON.stringify(diagnostics), "utf8");
     this.#deleteDiagnostics(uri);
     if (bytes > this.cacheLimits.maxDiagnosticBytes) return;
@@ -351,6 +352,7 @@ export class LspClient implements LspClientLike {
   }
 
   #touchDiagnostics(uri: string): Diagnostic[] {
+    uri = normalizeUriKey(uri);
     const diagnostics = this.#diagnostics.get(uri) ?? [];
     this.#diagnostics.delete(uri);
     this.#diagnostics.set(uri, diagnostics);
@@ -358,6 +360,7 @@ export class LspClient implements LspClientLike {
   }
 
   #deleteDiagnostics(uri: string): void {
+    uri = normalizeUriKey(uri);
     if (!this.#diagnostics.has(uri)) return;
     this.#diagnosticBytes -= this.#diagnosticWeights.get(uri) ?? 0;
     this.#diagnostics.delete(uri);
@@ -365,6 +368,7 @@ export class LspClient implements LspClientLike {
   }
 
   #wakeDiagnosticWaiters(uri: string): void {
+    uri = normalizeUriKey(uri);
     for (const wake of [...(this.#diagnosticWaiters.get(uri) ?? [])]) wake();
   }
 
@@ -510,6 +514,7 @@ export class LspClient implements LspClientLike {
       return Promise.reject(new Error(`Too many pending LSP diagnostic waiters (max ${this.cacheLimits.maxDiagnosticWaiters}).`));
     }
     return new Promise((resolve, reject) => {
+      uri = normalizeUriKey(uri);
       const waiters = this.#diagnosticWaiters.get(uri) ?? new Set<() => void>();
       this.#diagnosticWaiters.set(uri, waiters);
       let settled = false;
@@ -611,6 +616,23 @@ function validateTransportLimits(limits: Readonly<LspTransportLimits>): void {
   if (limits.maxHeaderBytes + 4 + limits.maxContentLengthBytes > bufferConstants.MAX_LENGTH) {
     throw new RangeError("Combined LSP transport limits exceed the maximum Buffer length.");
   }
+}
+
+// Some language servers (notably typescript-language-server via tsserver on
+// Windows) publish diagnostics under a differently-cased or percent-encoded
+// URI (e.g. file:///c%3A/...) than pathToFileURL produces (file:///C:/...).
+// Diagnostics and waiter maps must key on a canonical form or every pushed
+// diagnostic is dropped.
+function normalizeUriKey(uri: string): string {
+  if (!uri.startsWith("file://")) return uri;
+  let decoded: string;
+  try {
+    decoded = decodeURIComponent(uri);
+  } catch {
+    return uri;
+  }
+  const match = /^(file:\/\/\/?)([a-zA-Z]):(\/.*)$/.exec(decoded);
+  return match ? `${match[1]}${match[2].toLowerCase()}:${match[3]}` : decoded;
 }
 
 function waitForExit(child: ChildProcessWithoutNullStreams, timeoutMs: number): Promise<boolean> {

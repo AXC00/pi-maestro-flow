@@ -88,6 +88,66 @@ process.stdin.on('data', chunk => {
   }
 });
 
+test("LSP client matches diagnostics published under a differently-cased or percent-encoded URI", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "maestro-lsp-urikey-"));
+  const server = path.join(root, "fake-lsp.mjs");
+  const shim = path.join(root, "fake-lsp.cmd");
+  const source = path.join(root, "sample.ts");
+  await fs.writeFile(source, "const value = 1;\n", "utf8");
+  await fs.writeFile(server, `
+let buffer = Buffer.alloc(0);
+function send(message) {
+  const body = Buffer.from(JSON.stringify(message));
+  process.stdout.write('Content-Length: ' + body.length + '\\r\\n\\r\\n');
+  process.stdout.write(body);
+}
+// Mimic tsserver on Windows: reply with file:///c%3A/... (lowercase drive,
+// percent-encoded colon) instead of echoing the client's file:///C:/...
+function mangle(uri) {
+  const decoded = decodeURIComponent(uri);
+  return decoded.replace(/^(file:\\/\\/\\/?)([A-Za-z]):/, (m, p, d) => p + d.toLowerCase() + '%3A');
+}
+process.stdin.on('data', chunk => {
+  buffer = Buffer.concat([buffer, chunk]);
+  while (true) {
+    const headerEnd = buffer.indexOf('\\r\\n\\r\\n');
+    if (headerEnd < 0) return;
+    const header = buffer.subarray(0, headerEnd).toString('ascii');
+    const match = /Content-Length:\\s*(\\d+)/i.exec(header);
+    if (!match) return;
+    const length = Number(match[1]);
+    const start = headerEnd + 4;
+    if (buffer.length < start + length) return;
+    const message = JSON.parse(buffer.subarray(start, start + length).toString('utf8'));
+    buffer = buffer.subarray(start + length);
+    if (message.method === 'initialize') send({ jsonrpc: '2.0', id: message.id, result: { capabilities: {} } });
+    else if (message.method === 'textDocument/didOpen') {
+      send({ jsonrpc: '2.0', method: 'textDocument/publishDiagnostics', params: { uri: mangle(message.params.textDocument.uri), diagnostics: [{ range: { start: { line: 0, character: 0 }, end: { line: 0, character: 5 } }, severity: 1, message: 'mangled-uri error' }] } });
+    }
+    else if (message.method === 'shutdown') send({ jsonrpc: '2.0', id: message.id, result: null });
+    else if (message.method === 'exit') process.exit(0);
+  }
+});
+`, "utf8");
+  await fs.writeFile(shim, `@echo off\r\n"${process.execPath}" "${server}" %*\r\n`, "utf8");
+
+  const client = await LspClient.start({
+    name: "fake",
+    command: process.platform === "win32" ? shim : process.execPath,
+    args: process.platform === "win32" ? [] : [server],
+    fileTypes: [".ts"],
+    rootMarkers: [],
+  }, root);
+  try {
+    const uri = await client.ensureFileOpen(source);
+    const diagnostics = await client.getDiagnostics(uri, 1_000);
+    assert.equal(diagnostics[0]?.message, "mangled-uri error");
+  } finally {
+    await client.shutdown();
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
 test("LSP shutdown kills a server that ignores shutdown and exit", async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "maestro-lsp-shutdown-"));
   const server = path.join(root, "stubborn-lsp.mjs");
