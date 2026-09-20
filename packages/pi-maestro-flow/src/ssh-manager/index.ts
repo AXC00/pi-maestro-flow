@@ -2,6 +2,7 @@ export * from "./model.ts";
 export * from "./encrypted-store.ts";
 export * from "./executor.ts";
 export * from "./openssh-config.ts";
+export * from "./known-hosts.ts";
 export * from "./status-monitor.ts";
 export * from "./tui.ts";
 export * from "./llm-tool.ts";

@@ -7,13 +7,17 @@ import {
   truncateToWidth,
   visibleWidth,
 } from "@earendil-works/pi-tui";
-import { makeBorderFrame, resolveGlyphs } from "pi-maestro-settings-core/ui";
-
-const FRAME_GLYPHS = resolveGlyphs("nerd");
-const FRAME_UTILS = {
-  measure: visibleWidth,
-  clip: (text: string, width: number, ellipsis: string) => truncateToWidth(text, width, ellipsis),
-};
+import {
+  ansiToSpans,
+  line,
+  openOverlay,
+  resolveGlyphs,
+  span,
+  type Frame,
+  type OverlayController,
+  type OverlayKeys,
+  type OverlayTheme,
+} from "pi-maestro-settings-core/ui";
 import type {
   PlanExecutionBackend,
   PlanExecutionChoice,
@@ -92,253 +96,269 @@ export async function openPlanConfirmation(
 ): Promise<PlanConfirmationDecision> {
   if (!ctx.hasUI || options.signal?.aborted) return { action: "close" };
 
-  const result = await ctx.ui.custom<PlanConfirmationDecision>(
-    (tui, theme, _keybindings, done) => {
-      const currentTargetAvailable = options.workflow?.current?.available === true;
-      const workflowAvailable = currentTargetAvailable || options.workflow?.allowNew === true;
-      let backend: PlanExecutionBackend = options.defaultExecution?.backend === "workflow" && workflowAvailable
-        ? "workflow"
-        : "standalone";
-      let workflowTarget: PlanWorkflowTarget = preferredWorkflowTarget(options, currentTargetAvailable);
-      let contextMode: PlanExecutionContextMode = options.defaultExecution?.context === "compact"
-        && options.canCompactContext !== false
-        ? "compact"
-        : "current";
-      const decisionDocs = options.decisionDocuments ?? [];
-      let selectedSource: string | undefined = options.defaultExecution?.sourceDocument
-        && decisionDocs.includes(options.defaultExecution.sourceDocument)
-        ? options.defaultExecution.sourceDocument
-        : decisionDocs[0];
-      const actions: ActionItem[] = [
-        { action: "execute", label: "Execute", description: "Approve with the selected execution settings" },
-        { action: "modify", label: "View / modify Plan", description: "Open the full-screen Markdown editor" },
-        { action: "refine", label: "Review & Refine", description: "Open the role-based review & refine panel (reviewer / decomposer / optimizer / brainstormer)" },
-        ...(options.drafts?.length
-          ? [{ action: "rollback" as const, label: "Rollback to draft version", description: "Restore a previous Plan draft from the archived history" }]
-          : []),
-        { action: "continue", label: "Continue discussion", description: "Enter feedback or a question" },
-        { action: "exit-plan", label: "Exit Plan mode", description: "Keep the draft without approval" },
-      ];
-      const markdown = new Markdown(options.markdown, 0, 0, markdownTheme(theme));
-      let selected = 0;
-      let previewOffset = 0;
-      let previewMaxOffset = 0;
-      let status = "";
-      let lastWidth = 80;
+  const currentTargetAvailable = options.workflow?.current?.available === true;
+  const workflowAvailable = currentTargetAvailable || options.workflow?.allowNew === true;
+  let backend: PlanExecutionBackend = options.defaultExecution?.backend === "workflow" && workflowAvailable
+    ? "workflow"
+    : "standalone";
+  let workflowTarget: PlanWorkflowTarget = preferredWorkflowTarget(options, currentTargetAvailable);
+  let contextMode: PlanExecutionContextMode = options.defaultExecution?.context === "compact"
+    && options.canCompactContext !== false
+    ? "compact"
+    : "current";
+  const decisionDocs = options.decisionDocuments ?? [];
+  let selectedSource: string | undefined = options.defaultExecution?.sourceDocument
+    && decisionDocs.includes(options.defaultExecution.sourceDocument)
+    ? options.defaultExecution.sourceDocument
+    : decisionDocs[0];
+  const actions: ActionItem[] = [
+    { action: "execute", label: "Execute", description: "Approve with the selected execution settings" },
+    { action: "modify", label: "View / modify Plan", description: "Open the full-screen Markdown editor" },
+    { action: "refine", label: "Review & Refine", description: "Open the role-based review & refine panel (reviewer / decomposer / optimizer / brainstormer)" },
+    ...(options.drafts?.length
+      ? [{ action: "rollback" as const, label: "Rollback to draft version", description: "Restore a previous Plan draft from the archived history" }]
+      : []),
+    { action: "continue", label: "Continue discussion", description: "Enter feedback or a question" },
+    { action: "exit-plan", label: "Exit Plan mode", description: "Keep the draft without approval" },
+  ];
+  let markdown: Markdown | undefined;
+  let selected = 0;
+  let previewOffset = 0;
+  let previewMaxOffset = 0;
+  let status = "";
+  let lastWidth = 80;
+  let host: { requestRender(): void; close(result?: PlanConfirmationDecision): void } | undefined;
 
-      const rows = (): SelectionRow[] => [
-        { kind: "backend" },
-        ...(backend === "workflow" ? [{ kind: "target" } as const] : []),
-        { kind: "context" },
-        ...(decisionDocs.length > 0 ? [{ kind: "source" } as const] : []),
-        ...actions.map((item): SelectionRow => ({ kind: "action", item })),
-      ];
+  const rows = (): SelectionRow[] => [
+    { kind: "backend" },
+    ...(backend === "workflow" ? [{ kind: "target" } as const] : []),
+    { kind: "context" },
+    ...(decisionDocs.length > 0 ? [{ kind: "source" } as const] : []),
+    ...actions.map((item): SelectionRow => ({ kind: "action", item })),
+  ];
 
-      function actionFooter(width: number, segments: string[]): string {
-        let value = "";
-        for (const segment of segments) {
-          const next = value ? `${value} · ${segment}` : segment;
-          if (visibleWidth(next) <= width) value = next;
-        }
-        return value || segments[0] || "";
+  function actionFooter(width: number, segments: string[]): string {
+    let value = "";
+    for (const segment of segments) {
+      const next = value ? `${value} · ${segment}` : segment;
+      if (visibleWidth(next) <= width) value = next;
+    }
+    return value || segments[0] || "";
+  }
+
+  function executionChoice(): PlanExecutionChoice {
+    const base = backend === "workflow"
+      ? { backend, context: contextMode, workflowTarget }
+      : { backend, context: contextMode };
+    return selectedSource ? { ...base, sourceDocument: selectedSource } : base;
+  }
+
+  let settled = false;
+  function complete(action: PlanConfirmationAction): void {
+    if (settled) return;
+    settled = true;
+    options.signal?.removeEventListener("abort", onAbort);
+    host?.close(action === "execute"
+      ? { action, execution: executionChoice() }
+      : { action });
+  }
+  const onAbort = () => complete("close");
+  options.signal?.addEventListener("abort", onAbort, { once: true });
+  if (options.signal?.aborted) queueMicrotask(onAbort);
+
+  function changeControl(row: SelectionRow, direction: -1 | 1): void {
+    status = "";
+    if (row.kind === "backend") {
+      if (!workflowAvailable && backend === "standalone") {
+        status = workflowUnavailableMessage(options);
+        return;
       }
-
-      function executionChoice(): PlanExecutionChoice {
-        const base = backend === "workflow"
-          ? { backend, context: contextMode, workflowTarget }
-          : { backend, context: contextMode };
-        return selectedSource ? { ...base, sourceDocument: selectedSource } : base;
+      backend = backend === "standalone" ? "workflow" : "standalone";
+      return;
+    }
+    if (row.kind === "target") {
+      const available = availableWorkflowTargets(options);
+      if (available.length < 2) {
+        status = available[0] === "current"
+          ? "Only the current Workflow Session is available."
+          : "Only creating a new Workflow Session is available.";
+        return;
       }
-
-      let settled = false;
-      function complete(action: PlanConfirmationAction): void {
-        if (settled) return;
-        settled = true;
-        options.signal?.removeEventListener("abort", onAbort);
-        done(action === "execute"
-          ? { action, execution: executionChoice() }
-          : { action });
+      const index = available.indexOf(workflowTarget);
+      workflowTarget = available[(index + direction + available.length) % available.length] ?? available[0]!;
+      return;
+    }
+    if (row.kind === "context") {
+      if (options.canCompactContext === false) {
+        status = "New Context is unavailable for this confirmation path.";
+        return;
       }
-      const onAbort = () => complete("close");
-      options.signal?.addEventListener("abort", onAbort, { once: true });
-      if (options.signal?.aborted) queueMicrotask(onAbort);
+      contextMode = contextMode === "current" ? "compact" : "current";
+      return;
+    }
+    if (row.kind === "source") {
+      const choices: (string | undefined)[] = [undefined, ...decisionDocs];
+      const index = choices.indexOf(selectedSource);
+      selectedSource = choices[(index + direction + choices.length) % choices.length];
+      return;
+    }
+  }
 
-      function changeControl(row: SelectionRow, direction: -1 | 1): void {
-        status = "";
-        if (row.kind === "backend") {
-          if (!workflowAvailable && backend === "standalone") {
-            status = workflowUnavailableMessage(options);
-            return;
-          }
-          backend = backend === "standalone" ? "workflow" : "standalone";
-          return;
-        }
-        if (row.kind === "target") {
-          const available = availableWorkflowTargets(options);
-          if (available.length < 2) {
-            status = available[0] === "current"
-              ? "Only the current Workflow Session is available."
-              : "Only creating a new Workflow Session is available.";
-            return;
-          }
-          const index = available.indexOf(workflowTarget);
-          workflowTarget = available[(index + direction + available.length) % available.length] ?? available[0]!;
-          return;
-        }
-        if (row.kind === "context") {
-          if (options.canCompactContext === false) {
-            status = "New Context is unavailable for this confirmation path.";
-            return;
-          }
-          contextMode = contextMode === "current" ? "compact" : "current";
-          return;
-        }
-        if (row.kind === "source") {
-          const choices: (string | undefined)[] = [undefined, ...decisionDocs];
-          const index = choices.indexOf(selectedSource);
-          selectedSource = choices[(index + direction + choices.length) % choices.length];
-          return;
-        }
-      }
+  function choose(row = rows()[selected]): void {
+    if (!row) return;
+    if (row.kind === "action") {
+      complete(row.item.action);
+      return;
+    }
+    changeControl(row, 1);
+    host?.requestRender();
+  }
 
-      function choose(row = rows()[selected]): void {
-        if (!row) return;
-        if (row.kind === "action") {
-          complete(row.item.action);
-          return;
-        }
-        changeControl(row, 1);
-        tui.requestRender();
-      }
-
-      return {
-        render(width: number): string[] {
-          const safeWidth = Math.max(1, width);
-          lastWidth = safeWidth;
-          const selectionRows = rows();
-          selected = Math.min(selected, selectionRows.length - 1);
-          const selectedRow = selectionRows[selected] ?? selectionRows[0]!;
-          if (safeWidth < 24) {
-            return [
-              truncateToWidth(`Plan confirm · ${selected + 1}/${selectionRows.length} ${rowLabel(selectedRow, actions, options, backend, workflowTarget, contextMode, selectedSource)}`, safeWidth, "…"),
-              truncateToWidth(actionFooter(safeWidth, ["Esc exit", "Enter choose", "↑↓ navigate"]), safeWidth, "…"),
-            ];
-          }
-
-          const innerWidth = Math.max(1, safeWidth - 2);
-          const terminalRows = process.stdout?.rows ?? 30;
-          // A transient status line renders under the key hints; shrink the preview
-          // by one row so the overlay stays within maxHeight.
-          const hasStatusLine = Boolean(status);
-          const previewHeight = Math.max(4, Math.min(14, terminalRows - 13) - Math.max(0, selectionRows.length - 6) - (hasStatusLine ? 1 : 0));
-          const renderedPlan = markdown.render(Math.max(1, innerWidth - 2));
-          const maxOffset = Math.max(0, renderedPlan.length - previewHeight);
-          previewMaxOffset = maxOffset;
-          previewOffset = Math.min(previewOffset, maxOffset);
-          const preview = renderedPlan.slice(previewOffset, previewOffset + previewHeight);
-          const range = renderedPlan.length > previewHeight
-            ? `${previewOffset + 1}-${Math.min(renderedPlan.length, previewOffset + previewHeight)}/${renderedPlan.length}`
-            : `${renderedPlan.length}`;
-          // Key hints are always visible; a transient status line is rendered below
-          // them instead of replacing them, so report/plan navigation stays discoverable.
-          const footer = actionFooter(innerWidth, [
-            "Esc close",
-            "Enter choose",
-            "←→ change mode",
-            "↑↓ navigate",
-            "Ctrl+Enter execute",
-            "PgUp/PgDn scroll",
-          ]);
-          const modelTransition = formatModelTransition(options.modelTransition);
-          const rendered = [
-            `${theme.bold("Plan confirmation")}  ${theme.fg("dim", `${options.pathLabel ?? "current.md"}${modelTransition ? ` · ${modelTransition}` : ""}`)}`,
-            theme.fg("dim", "─".repeat(innerWidth)),
-            ...preview.map((line) => ` ${line}`),
-          ];
-          while (rendered.length < previewHeight + 2) rendered.push("");
-          rendered.push(theme.fg("dim", `Plan ${range}`));
-          rendered.push(theme.fg("dim", "─".repeat(innerWidth)));
-          for (let index = 0; index < selectionRows.length; index++) {
-            const row = selectionRows[index]!;
-            const marker = index === selected ? "›" : " ";
-            const label = rowLabel(row, actions, options, backend, workflowTarget, contextMode, selectedSource);
-            const description = innerWidth >= 76 ? `  ${theme.fg("dim", `— ${rowDescription(row, options)}`)}` : "";
-            const line = `${marker} ${label}${description}`;
-            rendered.push(index === selected
-              ? theme.fg("accent", theme.bold(line))
-              : theme.fg("text", line));
-          }
-          rendered.push(theme.fg("dim", footer));
-          if (status) rendered.push(theme.fg("warning", status));
-          return renderFrame(rendered, safeWidth, theme);
-        },
-
-        handleInput(data: string): void {
-          if (lastWidth < 20) {
-            if (matchesKey(data, Key.escape)) complete("close");
-            return;
-          }
-          const selectionRows = rows();
-          if (matchesKey(data, Key.up)) {
-            if (previewOffset >= previewMaxOffset) {
-              if (selected > 0) selected -= 1;
-              else previewOffset = Math.max(0, previewOffset - 1);
-            } else previewOffset = Math.max(0, previewOffset - 1);
-          } else if (matchesKey(data, Key.down)) {
-            if (previewOffset >= previewMaxOffset) selected = Math.min(selectionRows.length - 1, selected + 1);
-            else previewOffset = Math.min(previewMaxOffset, previewOffset + 1);
-          } else if (matchesKey(data, Key.left)) {
-            const row = selectionRows[selected];
-            if (row && row.kind !== "action") changeControl(row, -1);
-          } else if (matchesKey(data, Key.right)) {
-            const row = selectionRows[selected];
-            if (row && row.kind !== "action") changeControl(row, 1);
-          } else if (matchesKey(data, Key.pageUp)) {
-            previewOffset = Math.max(0, previewOffset - 5);
-          } else if (matchesKey(data, Key.pageDown)) {
-            previewOffset = Math.min(previewMaxOffset, previewOffset + 5);
-          } else if (/^[1-9]$/.test(data)) {
-            const index = Number(data) - 1;
-            if (index < actions.length) {
-              complete(actions[index]!.action);
-              return;
-            }
-          } else if (matchesKey(data, Key.enter)) {
-            choose();
-            return;
-          } else if (matchesKey(data, Key.ctrl("enter")) || CTRL_ENTER_SEQUENCES.has(data)) {
-            complete("execute");
-            return;
-          } else if (matchesKey(data, Key.escape)) {
-            complete("close");
-            return;
-          }
-          tui.requestRender();
-        },
-
-        invalidate(): void {
-          markdown.invalidate();
-        },
-
-        dispose(): void {
-          options.signal?.removeEventListener("abort", onAbort);
-          complete("close");
-        },
-      };
+  const controller: OverlayController<PlanConfirmationDecision> = {
+    attach(h) {
+      host = h;
     },
+    dispose() {
+      options.signal?.removeEventListener("abort", onAbort);
+      complete("close");
+    },
+    invalidate() {
+      markdown?.invalidate();
+    },
+    render(w, h, theme) {
+      const safeWidth = Math.max(1, w + 2); // w is inner; keep narrow-mode parity with the old outer width
+      lastWidth = safeWidth;
+      const selectionRows = rows();
+      selected = Math.min(selected, selectionRows.length - 1);
+      const selectedRow = selectionRows[selected] ?? selectionRows[0]!;
+      if (safeWidth < 24) {
+        return [
+          line(truncateToWidth(`Plan confirm · ${selected + 1}/${selectionRows.length} ${rowLabel(selectedRow, actions, options, backend, workflowTarget, contextMode, selectedSource)}`, safeWidth, "…")),
+          line(truncateToWidth(actionFooter(safeWidth, ["Esc exit", "Enter choose", "↑↓ navigate"]), safeWidth, "…"), "dim"),
+        ];
+      }
+
+      const inner = Math.max(1, w);
+      if (!markdown) markdown = new Markdown(options.markdown, 0, 0, markdownTheme(theme ?? plainTheme));
+      // Body rows: header + rule + preview + range + rule + selections + footer
+      // + optional status. Preview gets the rest, capped at 14.
+      const hasStatusLine = Boolean(status);
+      const fixed = 1 + 1 + 1 + 1 + selectionRows.length + 1 + (hasStatusLine ? 1 : 0);
+      const previewHeight = Math.max(2, Math.min(14, h - fixed));
+      const renderedPlan = markdown.render(Math.max(1, inner - 2));
+      const maxOffset = Math.max(0, renderedPlan.length - previewHeight);
+      previewMaxOffset = maxOffset;
+      previewOffset = Math.min(previewOffset, maxOffset);
+      const preview = renderedPlan.slice(previewOffset, previewOffset + previewHeight);
+      const range = renderedPlan.length > previewHeight
+        ? `${previewOffset + 1}-${Math.min(renderedPlan.length, previewOffset + previewHeight)}/${renderedPlan.length}`
+        : `${renderedPlan.length}`;
+      const footer = actionFooter(inner, [
+        "Esc close",
+        "Enter choose",
+        "←→ change mode",
+        "↑↓ navigate",
+        "Ctrl+Enter execute",
+        "PgUp/PgDn scroll",
+      ]);
+      const modelTransition = formatModelTransition(options.modelTransition);
+      const rendered: Frame = [
+        line(`${options.pathLabel ?? "current.md"}${modelTransition ? ` · ${modelTransition}` : ""}`, "dim"),
+        line("─".repeat(inner), "dim"),
+        ...preview.map((l) => ansiToSpans(` ${l}`)),
+      ];
+      while (rendered.length < previewHeight + 2) rendered.push([span("")]);
+      rendered.push(line(`Plan ${range}`, "dim"));
+      rendered.push(line("─".repeat(inner), "dim"));
+      for (let index = 0; index < selectionRows.length; index++) {
+        const row = selectionRows[index]!;
+        const marker = index === selected ? "›" : " ";
+        const label = rowLabel(row, actions, options, backend, workflowTarget, contextMode, selectedSource);
+        const description = inner >= 76 ? `  — ${rowDescription(row, options)}` : "";
+        const text = truncateToWidth(`${marker} ${label}${description}`, inner, "…");
+        rendered.push([span(text, index === selected ? "selected" : "text", index === selected)]);
+      }
+      rendered.push(line(footer, "dim"));
+      if (status) rendered.push(line(status, "warning"));
+      return rendered;
+    },
+    handleKey(data, keys) {
+      if (lastWidth < 20) {
+        if (keys.cancel(data)) complete("close");
+        return true;
+      }
+      const selectionRows = rows();
+      if (keys.up(data)) {
+        if (previewOffset >= previewMaxOffset) {
+          if (selected > 0) selected -= 1;
+          else previewOffset = Math.max(0, previewOffset - 1);
+        } else previewOffset = Math.max(0, previewOffset - 1);
+      } else if (keys.down(data)) {
+        if (previewOffset >= previewMaxOffset) selected = Math.min(selectionRows.length - 1, selected + 1);
+        else previewOffset = Math.min(previewMaxOffset, previewOffset + 1);
+      } else if (matchesKey(data, Key.left)) {
+        const row = selectionRows[selected];
+        if (row && row.kind !== "action") changeControl(row, -1);
+      } else if (matchesKey(data, Key.right)) {
+        const row = selectionRows[selected];
+        if (row && row.kind !== "action") changeControl(row, 1);
+      } else if (keys.pageUp(data)) {
+        previewOffset = Math.max(0, previewOffset - 5);
+      } else if (keys.pageDown(data)) {
+        previewOffset = Math.min(previewMaxOffset, previewOffset + 5);
+      } else if (/^[1-9]$/.test(data)) {
+        const index = Number(data) - 1;
+        if (index < actions.length) {
+          complete(actions[index]!.action);
+          return true;
+        }
+      } else if (keys.confirm(data)) {
+        choose();
+        return true;
+      } else if (matchesKey(data, Key.ctrl("enter")) || CTRL_ENTER_SEQUENCES.has(data)) {
+        complete("execute");
+        return true;
+      } else if (keys.cancel(data)) {
+        complete("close");
+        return true;
+      } else {
+        return false;
+      }
+      return true;
+    },
+  };
+
+  const result = await openOverlay<PlanConfirmationDecision>(
+    ctx,
     {
-      overlay: true,
-      overlayOptions: {
-        width: "92%",
-        minWidth: 24,
-        maxHeight: 28,
-        anchor: "center" as const,
+      kind: "card",
+      title: "Plan confirmation",
+      width: "92%",
+      minWidth: 24,
+      maxHeight: 28,
+      anchor: "center",
+      hints: [
+        { key: "Enter", verb: "choose" },
+        { key: "←→", verb: "change" },
+        { key: "Ctrl+Enter", verb: "execute" },
+        { key: "Esc", verb: "close" },
+      ],
+    },
+    controller,
+    {
+      utils: {
+        measure: visibleWidth,
+        clip: (text, width, ellipsis) => truncateToWidth(text, width, ellipsis),
       },
+      glyphs: resolveGlyphs("nerd"),
+      matchesKey: (data, keyId) => matchesKey(data, keyId as never),
     },
   );
 
   return isPlanConfirmationDecision(result) ? result : { action: "close" };
 }
+
+const plainTheme: OverlayTheme = { fg: (_n, t) => t };
 
 function isPlanConfirmationDecision(value: unknown): value is PlanConfirmationDecision {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
@@ -435,23 +455,10 @@ function formatModelTransition(transition: PlanConfirmationModelTransition | und
     : `Main model ${transition.current}`;
 }
 
-function renderFrame(
-  rows: string[],
-  width: number,
-  theme: { fg(name: string, text: string): string },
-): string[] {
-  return makeBorderFrame(rows, width, FRAME_GLYPHS, FRAME_UTILS, {
-    theme,
-    borderColor: "dim",
-  });
-}
-
-function markdownTheme(theme: {
-  fg(name: string, text: string): string;
-  bold(text: string): string;
-}): MarkdownTheme {
+function markdownTheme(theme: OverlayTheme): MarkdownTheme {
+  const bold = (text: string) => theme.bold ? theme.bold(text) : text;
   return {
-    heading: (text) => theme.fg("accent", theme.bold(text)),
+    heading: (text) => theme.fg("accent", bold(text)),
     link: (text) => theme.fg("accent", text),
     linkUrl: (text) => theme.fg("dim", text),
     code: (text) => theme.fg("warning", text),
@@ -461,7 +468,7 @@ function markdownTheme(theme: {
     quoteBorder: (text) => theme.fg("dim", text),
     hr: (text) => theme.fg("dim", text),
     listBullet: (text) => theme.fg("accent", text),
-    bold: (text) => theme.bold(text),
+    bold,
     italic: (text) => text,
     strikethrough: (text) => theme.fg("dim", text),
     underline: (text) => text,

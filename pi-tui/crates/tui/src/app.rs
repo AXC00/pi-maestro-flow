@@ -10,9 +10,10 @@
 //! }
 //! ```
 //!
-//! Resize is implicit (size re-read every frame; the `Renderer` forces a
-//! full redraw on size change). Frames are wrapped in synchronized-output
-//! markers `?2026h`/`?2026l`; alt-screen `?1049h`/`?1049l` brackets the run.
+//! Resize is implicit (size cached from crossterm Resize events; the
+//! `Renderer` forces a full redraw on size change). Frames are wrapped in
+//! synchronized-output markers `?2026h`/`?2026l`; alt-screen `?1049h`/`?1049l`
+//! brackets the run.
 
 use std::io::{self, Write};
 use std::sync::Arc;
@@ -438,6 +439,7 @@ impl App {
             }
             TermEvent::Mouse(m) => self.handle_mouse(m),
             TermEvent::Resize(w, h) => {
+                self.term_size = (w, h);
                 // Plugin-driven overlays re-render at the new budget.
                 if let Some(DialogState::Plugin {
                     id,
@@ -1581,12 +1583,17 @@ impl App {
     fn render_frame(&mut self) -> io::Result<()> {
         let surface = self.paint_frame();
 
-        // 7. Diff → ANSI, wrapped in synchronized output.
+        // 7. Diff → ANSI, wrapped in synchronized output. The
+        //    renderer hands back the replaced frame's surface for
+        //    reuse as the next paint buffer.
         let frame = Frame::new(surface);
         let mut out = String::new();
         ansi::begin_sync(&mut out);
         out.push_str(&self.renderer.draw(frame));
         ansi::end_sync(&mut out);
+        if self.surface_spare.is_none() {
+            self.surface_spare = self.renderer.spare_surface.take();
+        }
         // `setTitle` → OSC window-title escape (outside the sync block).
         if let Some(title) = self.state.term_title.take() {
             out.push_str(&format!("\x1b]2;{title}\x07"));

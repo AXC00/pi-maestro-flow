@@ -32,6 +32,42 @@ pub fn build(m: &mut DocumentMutator<'_>, parent: NodeId) -> NodeId {
     area
 }
 
+/// Hash of everything `sync` renders — the app skips the rebuild
+/// (and its `drop_children` restyle damage) while this is unchanged.
+pub fn signature(state: &AppState) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut s = std::collections::hash_map::DefaultHasher::new();
+    state.tray.open.hash(&mut s);
+    match &state.dialog {
+        Some(DialogState::Select { sel, .. })
+        | Some(DialogState::Local { sel, .. }) => {
+            sel.title.hash(&mut s);
+            sel.cursor.hash(&mut s);
+            sel.scroll.hash(&mut s);
+            sel.filter.hash(&mut s);
+            sel.footer.hash(&mut s);
+            sel.extra_class.hash(&mut s);
+            for o in &sel.options {
+                o.label.hash(&mut s);
+                o.description.hash(&mut s);
+                o.badge.hash(&mut s);
+            }
+        }
+        Some(_) => 1u8.hash(&mut s),
+        None => {
+            if let Some(comp) = &state.completion {
+                comp.cursor.hash(&mut s);
+                std::mem::discriminant(&comp.kind).hash(&mut s);
+                for item in &comp.items {
+                    item.display.hash(&mut s);
+                    item.desc.hash(&mut s);
+                }
+            }
+        }
+    }
+    s.finish()
+}
+
 /// Sync the completion list (rebuilt each frame while open).
 pub fn sync(
     m: &mut DocumentMutator<'_>,

@@ -31,11 +31,13 @@ export interface SshConnectionSource {
   getHosts(): SshHost[];
   checkoutKey(id: string): SshKey;
   getEffectiveHostDigest(id: string): string;
+  knownHostKeys?(hostname: string, port: number): readonly string[] | Promise<readonly string[]>;
+  rememberHostKey?(id: string, fingerprint: string): void | Promise<void>;
 }
 export type SshClientFactory = () => Client;
 export interface SshCommandChannel { readonly channel: ClientChannel; readonly effectiveDigest?: string; close(): void; }
 
-type ResolvedHop = { host: SshHost; privateKey?: Buffer; passphrase?: string };
+type ResolvedHop = { host: SshHost; privateKey?: Buffer; passphrase?: string; acceptedHostKeys?: readonly string[]; observedFingerprint?: string };
 type ResolvedConnection = { hops: ResolvedHop[]; target: SshHost; effectiveDigest?: string };
 
 class ConnectedChain {
@@ -188,7 +190,7 @@ export class SshExecutor {
     try {
       chain = await this.connect(resolved, normalized.timeout, options);
       const active = chain;
-      return await new Promise<SshCommandChannel>((resolve, reject) => {
+      const handle = await new Promise<SshCommandChannel>((resolve, reject) => {
         let settled = false;
         const timer = setTimeout(() => fail(new Error("SSH command timed out")), normalized.timeout * 1000);
         const cleanupStartup = (): void => { clearTimeout(timer); options.signal?.removeEventListener("abort", onAbort); };
@@ -214,6 +216,8 @@ export class SshExecutor {
           resolve({ channel, ...(active.effectiveDigest ? { effectiveDigest: active.effectiveDigest } : {}), close });
         });
       });
+      await this.persistObservedPins(resolved);
+      return handle;
     } catch (error) {
       chain?.cleanup();
       throw error;
@@ -231,7 +235,7 @@ export class SshExecutor {
     try {
       chain = await this.connect(resolved, normalized.timeout, options);
       const active = chain;
-      return await new Promise<SshExecutionResult>((resolve, reject) => {
+      const result = await new Promise<SshExecutionResult>((resolve, reject) => {
         let settled = false;
         let stream: ClientChannel | undefined;
         let stdout: Buffer[] = [], stderr: Buffer[] = [];
@@ -275,6 +279,8 @@ export class SshExecutor {
           channel.once("close", finishResolve);
         });
       });
+      await this.persistObservedPins(resolved);
+      return result;
     } catch (error) {
       chain?.cleanup();
       throw error;
@@ -317,32 +323,52 @@ export class SshExecutor {
       if (!current) throw new Error("SSH host references a missing jump host");
     }
     const ordered = leafFirst.reverse();
+    const acceptedById = new Map<string, readonly string[]>();
     for (let index = 0; index < ordered.length; index++) {
-      if (ordered[index]!.hostKey === null && !(allowFinalTofu && index === ordered.length - 1)) {
+      const host = ordered[index]!;
+      const accepted = host.hostKey === null && this.connectionSource?.knownHostKeys
+        ? uniqueStrings([
+          ...await Promise.resolve(this.connectionSource.knownHostKeys(host.host, host.port)),
+          ...(host.label !== host.host ? await Promise.resolve(this.connectionSource.knownHostKeys(host.label, host.port)) : []),
+        ])
+        : [];
+      acceptedById.set(host.id, accepted);
+      const canTofu = allowFinalTofu && index === ordered.length - 1;
+      if (host.hostKey === null && accepted.length === 0 && !canTofu) {
         throw new Error("SSH host requires a pinned SHA256 host key");
       }
     }
     const hops: ResolvedHop[] = [];
     try {
       for (const host of ordered) {
+        const acceptedHostKeys = acceptedById.get(host.id);
         if (host.auth.kind === "key") {
           if (!this.connectionSource) throw new Error("SSH connection source is required for managed keys");
           const key = this.connectionSource.checkoutKey(host.auth.keyId);
           try {
-            hops.push({ host, privateKey: Buffer.from(key.privateKey, "utf8"), ...(key.passphrase ? { passphrase: key.passphrase } : {}) });
+            hops.push({ host, privateKey: Buffer.from(key.privateKey, "utf8"), ...(key.passphrase ? { passphrase: key.passphrase } : {}), ...(acceptedHostKeys?.length ? { acceptedHostKeys } : {}) });
           } finally {
             key.privateKey = "";
             key.passphrase = undefined;
           }
         } else {
           const privateKey = await readAuthentication(host, agentPath);
-          hops.push({ host, ...(privateKey ? { privateKey } : {}) });
+          hops.push({ host, ...(privateKey ? { privateKey } : {}), ...(acceptedHostKeys?.length ? { acceptedHostKeys } : {}) });
         }
       }
       return { hops, target, ...(effectiveDigest ? { effectiveDigest } : {}) };
     } catch (error) {
       for (const hop of hops) hop.privateKey?.fill(0);
       throw error;
+    }
+  }
+
+  private async persistObservedPins(resolved: ResolvedConnection): Promise<void> {
+    if (!this.connectionSource?.rememberHostKey) return;
+    for (const hop of resolved.hops) {
+      if (hop.host.hostKey !== null || !hop.observedFingerprint) continue;
+      try { await this.connectionSource.rememberHostKey(hop.host.id, hop.observedFingerprint); }
+      catch { /* command already succeeded; pin is opportunistic */ }
     }
   }
 
@@ -365,7 +391,11 @@ export class SshExecutor {
           sockets.push(socket);
         }
         const client = this.clientFactory(); clients.push(client);
-        await connectClient(client, buildConnectConfig(hop, options.agentPath, timeout, socket, tofuCapture && index === resolved.hops.length - 1 ? tofuCapture : undefined), timeout, options.signal, chain);
+        const allowTofu = Boolean(tofuCapture) && index === resolved.hops.length - 1 && hop.host.hostKey === null && (hop.acceptedHostKeys?.length ?? 0) === 0;
+        await connectClient(client, buildConnectConfig(hop, options.agentPath, timeout, socket, allowTofu, (fingerprint) => {
+          hop.observedFingerprint = fingerprint;
+          if (allowTofu) tofuCapture?.(fingerprint);
+        }), timeout, options.signal, chain);
         hop.privateKey?.fill(0);
       }
       return chain;
@@ -453,19 +483,22 @@ async function readAuthentication(host: SshHost, _agentPath?: string): Promise<B
   } catch { privateKey?.fill(0); throw new Error("SSH identity file is missing, empty, unreadable, symlinked, or too large"); }
   finally { await handle?.close().catch(() => undefined); }
 }
-function buildConnectConfig(hop: ResolvedHop, agentPath: string | undefined, timeout: number, sock?: Duplex, tofuCapture?: (fingerprint: string) => void): ConnectConfig {
+function buildConnectConfig(hop: ResolvedHop, agentPath: string | undefined, timeout: number, sock: Duplex | undefined, allowTofu: boolean, observe: (fingerprint: string) => void): ConnectConfig {
   const { host } = hop;
   const common: ConnectConfig = { host: host.host, port: host.port, ...(sock ? { sock } : {}), username: host.user, readyTimeout: timeout * 1000, keepaliveInterval: 10_000, keepaliveCountMax: 2,
     hostVerifier: (key: Buffer) => {
       const fingerprint = sha256HostKeyFingerprint(key);
-      tofuCapture?.(fingerprint);
-      return host.hostKey !== null ? matchesPinnedHostKey(key, host.hostKey) : tofuCapture !== undefined;
+      observe(fingerprint);
+      if (host.hostKey !== null) return matchesPinnedHostKey(key, host.hostKey);
+      if (hop.acceptedHostKeys?.some((pin) => matchesPinnedHostKey(key, pin))) return true;
+      return allowTofu;
     } };
   if (host.auth.kind === "agent") { const agent = agentPath ?? process.env.SSH_AUTH_SOCK; if (!agent) throw new Error("SSH agent authentication requested but no agent socket is available"); return { ...common, agent }; }
   if (host.auth.kind === "identity") { if (!hop.privateKey) throw new Error("SSH identity could not be loaded"); return { ...common, privateKey: hop.privateKey, ...(host.auth.passphrase ? { passphrase: host.auth.passphrase } : {}) }; }
   if (host.auth.kind === "key") { if (!hop.privateKey) throw new Error("SSH managed key could not be loaded"); return { ...common, privateKey: hop.privateKey, ...(hop.passphrase ? { passphrase: hop.passphrase } : {}) }; }
   return { ...common, password: host.auth.password };
 }
+function uniqueStrings(values: readonly string[]): string[] { return [...new Set(values)]; }
 function zeroResolvedKeys(resolved: ResolvedConnection): void { for (const hop of resolved.hops) hop.privateKey?.fill(0); }
 function quoteBash(value: string): string { return `'${value.replaceAll("'", `'\\''`)}'`; }
 function quotePowerShell(value: string): string { return `'${value.replaceAll("'", "''")}'`; }

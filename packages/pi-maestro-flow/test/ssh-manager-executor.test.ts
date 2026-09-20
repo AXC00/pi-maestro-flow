@@ -215,6 +215,37 @@ test("SSH executor TOFU seam captures only the authenticated final target finger
   assert.equal(creates, 0, "TOFU never applies to a jump host");
 });
 
+test("SSH executor auto-pins an unpinned host from matching known_hosts fingerprints", async () => {
+  const target = { ...host(), hostKey: null, tags: [], jumpHostId: null, monitorEnabled: false };
+  const other = "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+  const remembered: Array<{ id: string; fingerprint: string }> = [];
+  const source: SshConnectionSource = {
+    getHosts: () => [target],
+    checkoutKey: () => { throw new Error("unused"); },
+    getEffectiveHostDigest: () => "digest",
+    knownHostKeys: () => [other, PIN],
+    rememberHostKey: (id, fingerprint) => { remembered.push({ id, fingerprint }); target.hostKey = fingerprint; },
+  };
+  const result = await new SshExecutor(() => new FakeClient() as unknown as Client, source).execute("server-1", { command: "id" });
+  assert.equal(result.exitCode, 7);
+  assert.deepEqual(remembered, [{ id: "server-1", fingerprint: PIN }]);
+  assert.equal(target.hostKey, PIN);
+});
+
+test("SSH executor still rejects an unpinned host when known_hosts fingerprints do not match", async () => {
+  const target = { ...host(), hostKey: null, tags: [], jumpHostId: null, monitorEnabled: false };
+  const source: SshConnectionSource = {
+    getHosts: () => [target],
+    checkoutKey: () => { throw new Error("unused"); },
+    getEffectiveHostDigest: () => "digest",
+    knownHostKeys: () => ["SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"],
+  };
+  await assert.rejects(
+    new SshExecutor(() => new FakeClient() as unknown as Client, source).execute("server-1", { command: "id" }),
+    /connection or authentication failed/,
+  );
+});
+
 test("SSH executor rejects invalid jump graphs and key references before creating clients", async () => {
   const base = { ...host(), tags: [], monitorEnabled: false };
   const cases: Array<{ hosts: SshHost[]; target: string; message: RegExp }> = [

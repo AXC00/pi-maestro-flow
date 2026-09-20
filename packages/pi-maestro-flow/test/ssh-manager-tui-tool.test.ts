@@ -5,6 +5,7 @@ import { Value } from "typebox/value";
 import {
   createBoundSshToolContext,
   MaskedSecretInput,
+  parseSshToolInput,
   SshExecutor,
   SshHostManagerOverlay,
   SshHostPickerOverlay,
@@ -191,14 +192,14 @@ test("SSH manager Keys view renders metadata only and exposes managed-key CRUD",
 });
 
 test("LLM SSH tool schema keeps legacy commands and Gateway actions hostless", async () => {
-  assert.equal(Value.Check(SshToolParams, { command: "id", cwd: "/srv", timeout: 5 }), true);
-  assert.equal(Value.Check(SshToolParams, { action: "describe", tool: "host" }), true);
-  assert.equal(Value.Check(SshToolParams, { command: "id", action: "status" }), false);
+  assert.doesNotThrow(() => parseSshToolInput({ command: "id", cwd: "/srv", timeout: 5 }));
+  assert.doesNotThrow(() => parseSshToolInput({ action: "describe", tool: "host" }));
+  assert.throws(() => parseSshToolInput({ command: "id", action: "status" }));
   assert.equal(Value.Check(SshToolParams, { action: "status", host: "alpha.example.test" }), false);
   assert.equal(Value.Check(SshToolParams, { action: "call", tool: "host", auth: {}, password: "secret" }), false);
   assert.equal(Value.Check(SshToolParams, { action: "job_start", targetId: "alpha-1", command: "sleep 10" }), true);
   assert.equal(Value.Check(SshToolParams, { action: "job_exec", sessionId: "ssh-session-1", command: "echo next" }), true);
-  assert.equal(Value.Check(SshToolParams, { action: "job_exec", targetId: "alpha-1", sessionId: "ssh-session-1", command: "echo next" }), false);
+  assert.throws(() => parseSshToolInput({ action: "job_exec", targetId: "alpha-1", sessionId: "ssh-session-1", command: "echo next" }));
 
   const provider = { current: [...hosts], getHosts() { return this.current; } };
   const context = createBoundSshToolContext(provider, new SshExecutor(), "alpha-1");

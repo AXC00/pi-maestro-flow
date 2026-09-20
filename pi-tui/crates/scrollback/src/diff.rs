@@ -144,15 +144,14 @@ pub fn emit_ansi(out: &mut String, prev: Option<&Surface>, cur: &Surface, level:
             }
 
             // Hyperlink transitions (OSC 8).
-            let cell_link = cell.link.clone();
-            if cell_link.as_deref() != open_link.as_deref() {
-                match &cell_link {
+            if cell.link.as_deref() != open_link.as_deref() {
+                match &cell.link {
                     Some(uri) => {
                         let _ = write!(out, "\x1b]8;;{}\x1b\\", uri);
                     }
                     None => out.push_str("\x1b]8;;\x1b\\"),
                 }
-                open_link = cell_link;
+                open_link = cell.link.clone();
             }
 
             // Symbol.

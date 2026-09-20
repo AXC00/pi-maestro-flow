@@ -36,6 +36,91 @@ pub fn build(m: &mut DocumentMutator<'_>, parent: NodeId) -> (NodeId, NodeId) {
     (area, widgets)
 }
 
+/// Hash of everything `sync` renders — the app skips the rebuild
+/// (and its `drop_children` restyle damage) while this is unchanged.
+pub fn signature(state: &AppState) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut s = std::collections::hash_map::DefaultHasher::new();
+    for toast in &state.toasts {
+        toast.text.hash(&mut s);
+    }
+    match &state.dialog {
+        None => 0u8.hash(&mut s),
+        Some(DialogState::Select { .. }) | Some(DialogState::Local { .. }) => {
+            // Rendered by `completion::sync` — covered by its signature.
+            1u8.hash(&mut s);
+        }
+        Some(DialogState::Confirm { title, message, .. }) => {
+            2u8.hash(&mut s);
+            title.hash(&mut s);
+            message.hash(&mut s);
+        }
+        Some(DialogState::Input {
+            title,
+            placeholder,
+            input,
+            ..
+        }) => {
+            3u8.hash(&mut s);
+            title.hash(&mut s);
+            placeholder.hash(&mut s);
+            input.text.hash(&mut s);
+            input.cursor.hash(&mut s);
+        }
+        Some(DialogState::Editor { title, input, .. }) => {
+            4u8.hash(&mut s);
+            title.hash(&mut s);
+            input.text.hash(&mut s);
+            input.cursor.hash(&mut s);
+        }
+        Some(DialogState::Plugin {
+            spec, frame, cursor, ..
+        }) => {
+            5u8.hash(&mut s);
+            spec.title.hash(&mut s);
+            for row in frame {
+                for sp in row {
+                    sp.text.hash(&mut s);
+                    std::mem::discriminant(&sp.role).hash(&mut s);
+                    sp.bold.hash(&mut s);
+                }
+            }
+            cursor.hash(&mut s);
+        }
+    }
+    for q in &state.queued {
+        q.hash(&mut s);
+    }
+    if state.tray.open {
+        true.hash(&mut s);
+        std::mem::discriminant(&state.tray.tab).hash(&mut s);
+        state.tray.cursor.hash(&mut s);
+        // Elapsed seconds in the preview refresh ~1/s.
+        (state.tick / 30).hash(&mut s);
+        for e in &state.tray.entries {
+            e.title.hash(&mut s);
+            e.tool.hash(&mut s);
+            e.model.hash(&mut s);
+            std::mem::discriminant(&e.status).hash(&mut s);
+            e.tools.hash(&mut s);
+            e.recent_tools.hash(&mut s);
+            e.end_tick.is_some().hash(&mut s);
+            e.foregrounded.hash(&mut s);
+            // Preview shows the tool output tail — length is enough
+            // (output is append-only).
+            state
+                .messages
+                .get(e.msg_idx)
+                .map(|m| m.tool_output.as_ref().map_or(0, String::len))
+                .hash(&mut s);
+        }
+    }
+    for (_key, lines) in &state.widgets {
+        lines.hash(&mut s);
+    }
+    s.finish()
+}
+
 /// Sync the dialog + widget areas from state. Rebuilds children each
 /// call (dialogs are small; rebuild-on-dirty keeps it simple).
 pub fn sync(

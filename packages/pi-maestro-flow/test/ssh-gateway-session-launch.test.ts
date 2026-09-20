@@ -1,12 +1,11 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { Value } from "typebox/value";
 import {
   buildLocalPiTodoDelegationPrompt,
   GatewaySessionLauncher,
   selectLocalPiTodoSnapshots,
 } from "../src/ssh-manager/gateway-session-launch.ts";
-import { SshToolParams } from "../src/ssh-manager/llm-tool.ts";
+import { parseSshToolInput } from "../src/ssh-manager/llm-tool.ts";
 import type { TodoTask } from "../src/tools/todo.ts";
 
 function task(overrides: Partial<TodoTask> = {}): TodoTask {
@@ -33,16 +32,25 @@ function deferred(): { promise: Promise<void>; resolve: () => void } {
   return { promise, resolve };
 }
 
+function sshInputOk(value: unknown): boolean {
+  try {
+    parseSshToolInput(value);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 test("start_pi is a strict model schema and rejects host-owned orchestration fields", () => {
   const valid = { action: "start_pi", todoIds: ["28"], objective: "Perform it", agent: "general", timeout: 20, requestId: "launch-1" };
-  assert.equal(Value.Check(SshToolParams, valid), true);
-  assert.equal(Value.Check(SshToolParams, { ...valid, todoIds: ["28", "28"] }), false);
-  assert.equal(Value.Check(SshToolParams, { ...valid, requestId: undefined }), false);
+  assert.equal(sshInputOk(valid), true);
+  assert.equal(sshInputOk({ ...valid, todoIds: ["28", "28"] }), false);
+  assert.equal(sshInputOk({ ...valid, requestId: undefined }), false);
   for (const forbidden of ["snapshot", "sessionId", "host", "user", "port", "auth", "command", "cwd", "callback"]) {
-    assert.equal(Value.Check(SshToolParams, { ...valid, [forbidden]: "attacker" }), false, forbidden);
+    assert.equal(sshInputOk({ ...valid, [forbidden]: "attacker" }), false, forbidden);
   }
-  assert.equal(Value.Check(SshToolParams, { action: "call", tool: "todo", args: { action: "list", sessionId: "remote" } }), true, "general Gateway Todo calls remain compatible");
-  assert.equal(Value.Check(SshToolParams, { command: "id", cwd: "/srv", timeout: 5 }), true, "legacy command action remains compatible");
+  assert.equal(sshInputOk({ action: "call", tool: "todo", args: { action: "list", sessionId: "remote" } }), true, "general Gateway Todo calls remain compatible");
+  assert.equal(sshInputOk({ command: "id", cwd: "/srv", timeout: 5 }), true, "legacy command action remains compatible");
 });
 
 test("host-side selection snapshots only existing local tasks and emits bounded human-readable instructions", () => {

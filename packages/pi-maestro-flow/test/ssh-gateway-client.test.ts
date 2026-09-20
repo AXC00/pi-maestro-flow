@@ -2,13 +2,12 @@ import assert from "node:assert/strict";
 import { Duplex, PassThrough } from "node:stream";
 import test from "node:test";
 import type { ClientChannel } from "ssh2";
-import { Value } from "typebox/value";
 import {
   SshGatewayCapabilityError,
   SshGatewayClientPool,
 } from "../src/ssh-manager/gateway-client.ts";
 import { SSH_GATEWAY_COMMAND } from "../src/ssh-manager/guide.ts";
-import { SshToolParams } from "../src/ssh-manager/llm-tool.ts";
+import { SshToolParams, parseSshToolInput } from "../src/ssh-manager/llm-tool.ts";
 import type {
   SshCommandChannel,
   SshExecuteOptions,
@@ -176,21 +175,44 @@ function deferred(): { promise: Promise<void>; resolve: () => void } {
   return { promise, resolve };
 }
 
-test("ssh tool schema is a strict legacy-or-Gateway union with an object root", () => {
-  assert.equal(SshToolParams.type, "object");
-  assert.equal(Value.Check(SshToolParams, { command: "uname -a", cwd: "/srv", timeout: 5 }), true);
-  assert.equal(Value.Check(SshToolParams, { action: "guide" }), true);
-  assert.equal(Value.Check(SshToolParams, { action: "ensure_gateway", timeout: 30 }), true);
-  assert.equal(Value.Check(SshToolParams, { action: "ensure_gateway", timeout: 0 }), false);
-  assert.equal(Value.Check(SshToolParams, { action: "ensure_gateway", command: "evil" }), false);
-  assert.equal(Value.Check(SshToolParams, { action: "status" }), true);
-  assert.equal(Value.Check(SshToolParams, { action: "list" }), true);
-  assert.equal(Value.Check(SshToolParams, { action: "describe", tool: "host" }), true);
-  assert.equal(Value.Check(SshToolParams, { action: "call", tool: "host", args: { action: "status" }, timeout: 5 }), true);
-  assert.equal(Value.Check(SshToolParams, { command: "id", action: "status" }), false);
-  assert.equal(Value.Check(SshToolParams, { action: "call", tool: "host", command: "evil" }), false);
-  assert.equal(Value.Check(SshToolParams, { action: "status", host: "attacker.test" }), false);
-  assert.equal(Value.Check(SshToolParams, { action: "call", tool: "host", args: [], timeout: 5 }), false);
+function sshInputOk(value: unknown): boolean {
+  try {
+    parseSshToolInput(value);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+test("ssh tool schema is a published object with top-level properties and no root anyOf", () => {
+  const schema = SshToolParams as {
+    type?: string;
+    anyOf?: unknown;
+    additionalProperties?: boolean;
+    properties?: Record<string, unknown>;
+  };
+  assert.equal(schema.type, "object");
+  assert.equal(schema.anyOf, undefined);
+  assert.equal(schema.additionalProperties, false);
+  assert.ok(schema.properties?.action);
+  assert.ok(schema.properties?.command);
+  assert.ok(schema.properties?.targetId);
+  assert.ok(schema.properties?.cwd);
+  assert.ok(schema.properties?.timeout);
+  assert.equal(sshInputOk({ command: "uname -a", cwd: "/srv", timeout: 5 }), true);
+  assert.equal(sshInputOk({ action: "guide" }), true);
+  assert.equal(sshInputOk({ action: "ensure_gateway", timeout: 30 }), true);
+  assert.equal(sshInputOk({ action: "ensure_gateway", timeout: 0 }), false);
+  assert.equal(sshInputOk({ action: "ensure_gateway", command: "evil" }), false);
+  assert.equal(sshInputOk({ action: "status" }), true);
+  assert.equal(sshInputOk({ action: "list" }), true);
+  assert.equal(sshInputOk({ action: "describe", tool: "host" }), true);
+  assert.equal(sshInputOk({ action: "call", tool: "host", args: { action: "status" }, timeout: 5 }), true);
+  assert.equal(sshInputOk({ command: "id", action: "status" }), false);
+  assert.equal(sshInputOk({ action: "call", tool: "host", command: "evil" }), false);
+  assert.equal(sshInputOk({ action: "status", host: "attacker.test" }), false);
+  assert.equal(sshInputOk({ action: "call", tool: "host", args: [], timeout: 5 }), false);
+  assert.equal(sshInputOk({}), false);
 });
 
 test("Gateway MCP uses the fixed command, frames list/describe/call, and reuses one client", async () => {

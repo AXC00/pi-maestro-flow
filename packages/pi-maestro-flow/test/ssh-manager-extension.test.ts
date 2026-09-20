@@ -386,13 +386,13 @@ test("independent SSH extension binds #ssh selection to a hostless tool without 
     assert.equal(Value.Check(tool.parameters, { command: "id", targetId: "server-1" }), true);
     assert.equal(Value.Check(tool.parameters, { action: "targets" }), true);
     assert.equal(Value.Check(tool.parameters, { action: "ensure_gateway", targetId: "server-1", timeout: 30 }), true);
-    assert.equal(Value.Check(tool.parameters, { action: "ensure_gateway", targetId: "server-1", command: "evil" }), false);
+    assert.throws(() => parseSshToolInput({ action: "ensure_gateway", targetId: "server-1", command: "evil" }));
     assert.equal(Value.Check(tool.parameters, { action: "ensure_gateway", timeout: 0 }), false);
     assert.equal(Value.Check(tool.parameters, { action: "status" }), true);
     assert.equal(Value.Check(tool.parameters, { action: "status", targetId: "server-1" }), true);
     assert.equal(Value.Check(tool.parameters, { action: "sync_pi_config", targetId: "server-1", categories: ["models", "auth"] }), true);
     assert.equal(Value.Check(tool.parameters, { action: "sync_pi_config", targetId: "server-1", categories: ["models"], path: "secret" }), false);
-    assert.equal(Value.Check(tool.parameters, { command: "id", action: "status" }), false);
+    assert.throws(() => parseSshToolInput({ command: "id", action: "status" }));
     assert.equal(Value.Check(tool.parameters, { action: "status", targetId: "../server-1" }), false);
     assert.equal(Value.Check(tool.parameters, { action: "status", host: "other.example.test" }), false);
 
