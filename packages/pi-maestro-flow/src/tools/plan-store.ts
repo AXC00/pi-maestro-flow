@@ -23,6 +23,8 @@ export interface PlanExecutionChoice {
   backend: PlanExecutionBackend;
   context: PlanExecutionContextMode;
   workflowTarget?: PlanWorkflowTarget;
+  /** Decision document bound at confirmation, as a workspace-relative POSIX path. */
+  sourceDocument?: string;
 }
 
 export interface PlanWorkflowBinding {
@@ -59,6 +61,8 @@ export interface PlanManifest {
   handoffKey?: string;
   execution?: PlanExecutionChoice;
   workflowBinding?: PlanWorkflowBinding;
+  /** Decision documents bound to this Plan (workspace-relative POSIX paths). */
+  sourceDocuments?: string[];
   approvals: string[];
 }
 
@@ -580,6 +584,9 @@ export class PlanStore {
           approvedChecksum: checksum,
           handoffKey,
           ...(options.execution ? { execution: normalizeExecutionChoice(options.execution) } : {}),
+          ...(options.execution?.sourceDocument
+            ? { sourceDocuments: [options.execution.sourceDocument] }
+            : {}),
           ...(options.execution?.backend === "workflow"
             ? {
                 workflowBinding: {
@@ -1209,13 +1216,24 @@ function validateExecutionChoice(raw: unknown): PlanExecutionChoice | null {
   if (!isRecord(raw)
     || (raw.backend !== "standalone" && raw.backend !== "workflow")
     || (raw.context !== "current" && raw.context !== "compact")) return null;
+  const sourceDocument = raw.sourceDocument === undefined
+    ? undefined
+    : typeof raw.sourceDocument === "string" && raw.sourceDocument.trim()
+      ? raw.sourceDocument.trim()
+      : null;
+  if (sourceDocument === null) return null;
   if (raw.backend === "standalone") {
     return raw.workflowTarget === undefined
-      ? { backend: "standalone", context: raw.context }
+      ? { backend: "standalone", context: raw.context, ...(sourceDocument ? { sourceDocument } : {}) }
       : null;
   }
   if (raw.workflowTarget !== "current" && raw.workflowTarget !== "new") return null;
-  return { backend: "workflow", context: raw.context, workflowTarget: raw.workflowTarget };
+  return {
+    backend: "workflow",
+    context: raw.context,
+    workflowTarget: raw.workflowTarget,
+    ...(sourceDocument ? { sourceDocument } : {}),
+  };
 }
 
 function normalizeWorkflowBinding(
@@ -1347,6 +1365,13 @@ function validateManifest(
     ? undefined
     : validateWorkflowBinding(raw.workflowBinding, raw.handoffKey as string | undefined, raw.approvedChecksum as string | undefined);
   if (raw.workflowBinding !== undefined && !workflowBinding) invalidManifest();
+  const sourceDocuments = raw.sourceDocuments === undefined
+    ? undefined
+    : Array.isArray(raw.sourceDocuments)
+      && raw.sourceDocuments.every((entry) => typeof entry === "string" && entry.trim())
+      ? (raw.sourceDocuments as string[]).map((entry) => entry.trim())
+      : null;
+  if (sourceDocuments === null) invalidManifest();
 
   if (raw.status === "approved") {
     if (!isIsoDate(raw.approvedAt)
@@ -1368,6 +1393,7 @@ function validateManifest(
     || raw.handoffKey !== undefined
     || raw.execution !== undefined
     || raw.workflowBinding !== undefined
+    || raw.sourceDocuments !== undefined
   ) {
     invalidManifest();
   }
@@ -1391,6 +1417,7 @@ function validateManifest(
           ...(typeof raw.handoffKey === "string" ? { handoffKey: raw.handoffKey } : {}),
           ...(execution ? { execution } : {}),
           ...(workflowBinding ? { workflowBinding } : {}),
+          ...(sourceDocuments ? { sourceDocuments } : {}),
         }
       : {}),
     approvals,

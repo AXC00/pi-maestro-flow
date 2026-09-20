@@ -1,0 +1,18 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/pi-rpc",
+    "crates/scrollback",
+    "crates/tui",
+]
+
+# Standalone spike crates with their own lockfiles live outside the
+# workspace (they pin a different blitz-dom line that cannot coexist
+# in one dependency graph — see SPIKE-NOTES.md).
+exclude = [
+    "spikes/dioxus-blitz",
+]
+
+[workspace.package]
+edition = "2021"
+license = "MIT"

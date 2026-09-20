@@ -1,6 +1,7 @@
 /** Dedicated, operator-driven Gateway tunnel page. */
 import { readFileSync } from "node:fs";
-import { Key, type Component, type Focusable, matchesKey, truncateToWidth } from "@earendil-works/pi-tui";
+import { Key, type Component, type Focusable, matchesKey, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import { makeBorderFrame, resolveGlyphs, type OverlayTheme } from "pi-maestro-settings-core/ui";
 import { GatewayConfigConflictError, loadGatewayConfigSync, normalizeGatewayConfig, restoreGatewayConfigIfCurrent, writeGatewayConfigPatchIfCurrent, type GatewayConfigPatch, type GatewayTunnelProfileConfig } from "../gateway/config.ts";
 import { gatewayConfigPath } from "../gateway/state-paths.ts";
 import type { GatewayTunnelDoctorReport } from "../gateway/tunnel/provider.ts";
@@ -19,6 +20,10 @@ export interface GatewayTunnelPanelParams {
   input?: (title: string, placeholder?: string) => Promise<string | undefined>;
   /** Canonical daemon listener path (for example /api/mcp). */
   httpPath?: string;
+  /** Footer hint for the Esc key — "Esc 关闭" when the page is the overlay's initial view. */
+  escLabel?: string;
+  /** Theme for role colors; when absent the panel renders unstyled. */
+  theme?: OverlayTheme;
 }
 
 export interface GatewayTunnelReadiness {
@@ -81,8 +86,10 @@ export class GatewayTunnelPanel implements Component, Focusable {
   private busy = false;
   private disposed = false;
   private readonly httpPath: string;
+  private readonly escLabel: string;
 
   constructor(private readonly params: GatewayTunnelPanelParams) {
+    this.escLabel = params.escLabel ?? "Esc 返回";
     this.configPath = params.configPath ?? gatewayConfigPath();
     this.profiles = [...(params.initialProfiles ?? (() => {
       try { return loadGatewayConfigSync(this.configPath).tunnels.profiles; } catch { return []; }
@@ -264,20 +271,31 @@ export class GatewayTunnelPanel implements Component, Focusable {
 
   render(width: number): string[] {
     const safeWidth = Math.max(1, Math.min(width, 120));
-    const lines = ["Pi Maestro Gateway · Tunnel（专用人工操作面）", "↑↓ 选择 · Enter 详情/编辑（空配置添加） · s 保存 · d doctor · e 启用 · x 停用 · Esc 返回", ""];
-    if (this.profiles.length === 0) lines.push("尚无 tunnel profile；请先在 /gateway config 建立 profile。", "默认 enabled: false");
+    if (safeWidth < 20) {
+      return [truncateToWidth(`Gateway Tunnel · ${this.profiles.length} profiles · ${this.escLabel}`, safeWidth, "…")];
+    }
+    const inner = safeWidth - 2;
+    const rows = [fitLine(`Pi Maestro Gateway · ${this.fg("36", "Tunnel")}（专用人工操作面）`, inner), rule(inner)];
+    if (this.profiles.length === 0) {
+      rows.push(fitLine("  ○ 尚无 tunnel profile；请先在 /gateway config 建立 profile", inner));
+      rows.push(fitLine(this.fg("2", "  默认 enabled: false · Enter 可添加 JSON metadata"), inner));
+    }
     for (const [index, profile] of this.profiles.entries()) {
       const descriptor = projectGatewayTunnelMcpConnectionDescriptor(profile, { httpPath: this.httpPath, state: this.stateFor(profile.id) });
       const readiness = gatewayTunnelReadiness(profile, descriptor, this.providerReady(profile.id));
-      const marker = index === this.selected ? ">" : " ";
+      const marker = index === this.selected ? this.fg("36", "▶") : " ";
+      const enabled = profile.enabled ? this.fg("32", "enabled") : this.fg("2", "disabled");
       const endpoint = descriptor.ephemeral ? "MCP URL: ephemeral（运行后不固定）" : `MCP URL: ${descriptor.mcpUrl ?? "未配置"}`;
-      lines.push(`${marker} ${profile.id} · ${profile.provider}/${profile.mode} · ${profile.lifecycle === "persistent" ? "fixed" : "ephemeral"} · ${profile.enabled ? "enabled" : "disabled"}`);
-      lines.push(`  ${endpoint} · auth: ${descriptor.authKind}`);
-      lines.push(`  OpenAI experimental: ${profile.provider === "openai" ? "yes" : "no"} · provider: ${statusLabel(readiness.provider)} · MCP: ${statusLabel(readiness.mcp)} · remote authorization E2E: ${statusLabel(readiness.remoteAuthorizationE2E)}`);
-      if (index === this.selected && profile.mcpAccess) lines.push(`  mcp_access: ${profile.mcpAccess.enabled ? "enabled" : "disabled"} · actions: ${profile.mcpAccess.actions.length}`);
+      rows.push(fitLine(`${marker} ${profile.id} · ${profile.provider}/${profile.mode} · ${profile.lifecycle === "persistent" ? "fixed" : "ephemeral"} · ${enabled}`, inner));
+      rows.push(fitLine(`  ${endpoint} · auth: ${descriptor.authKind}`, inner));
+      rows.push(fitLine(`  OpenAI experimental: ${profile.provider === "openai" ? "yes" : "no"} · ${this.statusSegment("provider", readiness.provider)} · ${this.statusSegment("MCP", readiness.mcp)} · ${this.statusSegment("remote authorization E2E", readiness.remoteAuthorizationE2E)}`, inner));
+      if (index === this.selected && profile.mcpAccess) {
+        rows.push(fitLine(`  mcp_access: ${profile.mcpAccess.enabled ? "enabled" : "disabled"} · actions: ${profile.mcpAccess.actions.length}`, inner));
+      }
     }
-    if (this.status) lines.push("", this.status);
-    return lines.map((line) => truncateToWidth(sanitizeTerminalText(line), safeWidth, "…", true));
+    if (this.status) rows.push(rule(inner), fitLine(this.status, inner));
+    rows.push(...fitSegments(inner, ["↑↓ 选择", "Enter 详情/编辑", "s 保存", "d doctor", "e 启用", "x 停用", this.escLabel]));
+    return frame(rows, safeWidth, this.params.theme);
   }
 
   handleInput(data: string): void {
@@ -310,7 +328,7 @@ export class GatewayTunnelPanel implements Component, Focusable {
       const aliases: Record<string, string> = {
         public_url: "publicUrl", mcp_access: "mcpAccess", local_port: "localPort", binary_path: "binaryPath",
         tunnel_id: "tunnelId", credentials_file: "credentialsFile", token_file: "tokenFile", identity_file: "identityFile", tunnel_id_env: "tunnelIdEnv",
-        runtime_key_env: "runtimeKeyEnv", credential_ttl_ms: "credentialTtlMs", remote_bind_host: "remoteBindHost",
+        runtime_key_env: "runtimeKeyEnv", credential_ttl_ms: "credentialTtlMs", auto_install: "autoInstall", remote_bind_host: "remoteBindHost",
         remote_port: "remotePort", local_host: "localHost", config_file: "configFile", known_hosts_file: "knownHostsFile",
         connect_timeout_seconds: "connectTimeoutSeconds", server_alive_interval_seconds: "serverAliveIntervalSeconds",
         server_alive_count_max: "serverAliveCountMax",
@@ -350,6 +368,71 @@ export class GatewayTunnelPanel implements Component, Focusable {
   private providerReady(profileId: string): boolean | undefined {
     return this.doctor?.profiles.find((profile) => profile.profile === profileId)?.readiness;
   }
+
+  private statusSegment(label: string, value: string): string {
+    const color = value === "ready" ? "32" : value === "not-ready" ? "31" : "33";
+    return this.fg(color, `${label}: ${statusLabel(value)}`);
+  }
+
+  /** Legacy numeric code → semantic role → theme slot. */
+  private fg(code: string, text: string): string {
+    const theme = this.params.theme;
+    if (!theme || !code) return text;
+    const role = CODE_ROLE[code];
+    if (role === "bold") return theme.bold ? theme.bold(text) : theme.fg("text", text);
+    return theme.fg(role ?? "text", text);
+  }
+}
+
+const FRAME_GLYPHS = resolveGlyphs("nerd");
+const FRAME_UTILS = {
+  measure: visibleWidth,
+  clip: (text: string, width: number, ellipsis: string) => truncateToWidth(text, width, ellipsis),
+};
+
+function fitLine(value: string, width: number): string {
+  return truncateToWidth(sanitizeTerminalText(value), width, "…", true);
+}
+
+function rule(width: number): string {
+  return "─".repeat(Math.max(0, width));
+}
+
+function frame(rows: readonly string[], width: number, theme?: OverlayTheme): string[] {
+  return makeBorderFrame(rows, width, FRAME_GLYPHS, FRAME_UTILS, {
+    corners: "square",
+    clip: false,
+    pad: false,
+    theme,
+    borderColor: "borderMuted",
+  });
+}
+
+const CODE_ROLE: Record<string, string> = {
+  "1": "bold",
+  "2": "dim",
+  "31": "error",
+  "32": "success",
+  "33": "warning",
+  "34": "muted",
+  "35": "accent",
+  "36": "accent",
+};
+
+function fitSegments(width: number, segments: readonly string[]): string[] {
+  const lines: string[] = [];
+  let current = "";
+  for (const segment of segments) {
+    const candidate = current ? `${current} · ${segment}` : segment;
+    if (current && visibleWidth(candidate) > width) {
+      lines.push(fitLine(current, width));
+      current = segment;
+    } else {
+      current = candidate;
+    }
+  }
+  if (current) lines.push(fitLine(current, width));
+  return lines;
 }
 
 function sanitizeTerminalText(value: string): string {

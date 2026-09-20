@@ -124,6 +124,8 @@ export interface McpPanelOptions {
   noticeLines?: string[];
   authOnly?: boolean;
   keybindings?: PanelKeybindings;
+  /** Terminal rows from the host; absent keeps the legacy fixed cap. */
+  getTerminalRows?: () => number | undefined;
   /** Explicit UI language; otherwise follows the shared runtime TUI locale. */
   locale?: SupportedSettingsLocale;
 }
@@ -267,9 +269,10 @@ class McpPanel {
   private t = DEFAULT_THEME;
   private authOnly: boolean;
   private readonly locale: SupportedSettingsLocale;
+  private readonly getTerminalRows: (() => number | undefined) | undefined;
   private keys: PanelKeys;
 
-  private static readonly MAX_VISIBLE = 12;
+  private static readonly FALLBACK_MAX_VISIBLE = 12;
   private static readonly INACTIVITY_MS = 60_000;
 
   constructor(
@@ -285,6 +288,7 @@ class McpPanel {
     this.tui = tui;
     this.noticeLines = options.noticeLines ?? [];
     this.authOnly = options.authOnly === true;
+    this.getTerminalRows = options.getTerminalRows;
     this.keys = createPanelKeys(options.keybindings);
     this.prefix = config.settings?.toolPrefix ?? "server";
 
@@ -796,10 +800,11 @@ class McpPanel {
       lines.push(row(fg(t.hint, italic(this.authOnly ? this.text("empty.oauth") : this.text("empty.servers")))));
       lines.push(emptyRow());
     } else {
-      const maxVis = McpPanel.MAX_VISIBLE;
+      const maxVis = this.visibleItemBudget(innerW);
       const total = this.visibleItems.length;
-      const startIdx = Math.max(0, Math.min(this.cursorIndex - Math.floor(maxVis / 2), total - maxVis));
-      const endIdx = Math.min(startIdx + maxVis, total);
+      const visibleLimit = total > maxVis ? Math.max(1, maxVis - 2) : maxVis;
+      const startIdx = Math.max(0, Math.min(this.cursorIndex - Math.floor(visibleLimit / 2), total - visibleLimit));
+      const endIdx = Math.min(startIdx + visibleLimit, total);
 
       lines.push(emptyRow());
 
@@ -817,7 +822,7 @@ class McpPanel {
 
       lines.push(emptyRow());
 
-      if (total > maxVis) {
+      if (total > visibleLimit) {
         const prog = Math.round(((this.cursorIndex + 1) / total) * 10);
         lines.push(row(`${rainbowProgress(prog, 10)}  ${fg(t.hint, `${this.cursorIndex + 1}/${total}`)}`));
         lines.push(emptyRow());
@@ -902,6 +907,31 @@ class McpPanel {
     lines.push(fg(t.border, "╰" + "─".repeat(innerW) + "╯"));
 
     return lines;
+  }
+
+  private visibleItemBudget(innerW: number): number {
+    const terminalRows = this.getTerminalRows?.();
+    if (!terminalRows || terminalRows <= 0) return McpPanel.FALLBACK_MAX_VISIBLE;
+    const overlayRows = Math.max(3, Math.floor(terminalRows * 0.92));
+    const noticeRows = this.noticeLines.length > 0 ? this.noticeLines.length + 1 : 0;
+    const transientRows = (this.importNotice ? 2 : 0) + (this.authNotice ? 2 : 0);
+    const hintRows = this.authOnly ? 1 : Math.max(1, Math.ceil(visibleWidth("↑↓ navigate  space toggle  ⏎ expand/auth  ctrl+a auth  ctrl+r reconnect  ? desc search  ctrl+s save  esc clear/close  ctrl+c quit") / Math.max(1, innerW - 2)));
+    const fixedRows = 1 // top border
+      + 1 // top spacer
+      + 1 // search
+      + 1 // search spacer
+      + noticeRows
+      + 1 // divider before list
+      + 1 // spacer before list
+      + 1 // spacer after list
+      + transientRows
+      + 1 // footer divider
+      + 1 // footer spacer
+      + 1 // stats/auth row
+      + 1 // hint spacer
+      + hintRows
+      + 1; // bottom border
+    return Math.max(3, overlayRows - fixedRows);
   }
 
   private renderServerRow(server: ServerState, isCursor: boolean): string {

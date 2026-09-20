@@ -14,7 +14,7 @@ import {
   pad,
   rule,
   type FrameTheme,
-} from "pi-cockpit/src/settings/ui-primitives.ts";
+} from "../tui/ui-primitives.ts";
 import { getTuiLocale } from "../tui/locale.ts";
 import type { McpManagedServer } from "./mcp-manager-store.ts";
 

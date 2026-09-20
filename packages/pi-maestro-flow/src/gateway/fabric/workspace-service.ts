@@ -54,6 +54,8 @@ export class GatewayFabricWorkspaceService {
           if (authorized.fabric.generation !== request.expectedWorkspaceGeneration) {
             throw new FabricContractError("stale_generation", "Fabric workspace generation is stale", "expectedWorkspaceGeneration");
           }
+          // Liveness is fenced here; the lease expiry is not a TTL ceiling —
+          // heartbeats renew it while dependent leases keep their requested TTL.
           const connection = runtime.connections.requireReadyForDevice(
             request.connectionId!,
             request.expectedConnectionGeneration!,
@@ -68,7 +70,7 @@ export class GatewayFabricWorkspaceService {
             workspaceGeneration: authorized.fabric.generation,
             policyDigest: authorized.fabric.policyDigest,
             issuedAt: this.support.now(runtime),
-            expiresAt: this.support.boundedExpiry(request, connection.expiresAt),
+            expiresAt: this.support.boundedExpiry(request),
             revision: 0,
           };
           const authorization = runtime.resolveLocalWorkspaceAuthorization === undefined ? undefined : {
@@ -81,8 +83,10 @@ export class GatewayFabricWorkspaceService {
           const binding = await runtime.admissions.getBindingDurable(request.workspaceBindingId!);
           if (binding === undefined) throw new FabricContractError("not_found", "Workspace Binding is not known", "workspaceBindingId");
           await this.support.authorizeWorkspaceBindingLifecycle(principal, binding.bindingId, binding.workspaceId);
-          const connection = runtime.connections.requireReadyForDevice(binding.connectionId, binding.connectionGeneration, binding.deviceId);
-          const expiresAt = this.support.boundedExpiry(request, connection.expiresAt);
+          // Liveness is fenced here; the lease expiry is not a TTL ceiling —
+          // heartbeats renew it while dependent leases keep their requested TTL.
+          runtime.connections.requireReadyForDevice(binding.connectionId, binding.connectionGeneration, binding.deviceId);
+          const expiresAt = this.support.boundedExpiry(request);
           return { binding: await runtime.admissions.renewBinding(binding.bindingId, expectedRevision(request), expiresAt) };
         }
         case "workspace.unbind": {

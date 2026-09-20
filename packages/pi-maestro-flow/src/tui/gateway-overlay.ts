@@ -3,14 +3,14 @@
  * daemon/HTTP status, registered workspaces, Gateway tasks, discoverable Pi
  * windows, and cross-window message history.
  *
- * Keys: 1 home · 2/c config · ↑↓/jk select · Enter details/edit · r refresh · R restart · e register/unregister cwd · s start · x stop · w workspaces · p password · Esc back/close
+ * Keys: 1 home · 2/c config · u tunnel · ↑↓/jk select · Enter details/edit · r refresh · R restart · e register/unregister cwd · s start · x stop · w workspaces · p password · Esc back/close
  */
 import { createHash, randomUUID } from "node:crypto";
 import { accessSync, constants, opendirSync, readdirSync, readFileSync, existsSync, statSync, type Dirent } from "node:fs";
 import { homedir } from "node:os";
 import { basename, delimiter, dirname, join } from "node:path";
 import { Key, type Component, type Focusable, matchesKey, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
-import { makeBorderFrame, resolveGlyphs } from "pi-maestro-settings-core/ui";
+import { makeBorderFrame, resolveGlyphs, type OverlayTheme } from "pi-maestro-settings-core/ui";
 
 const FRAME_GLYPHS = resolveGlyphs("nerd");
 const FRAME_UTILS = {
@@ -155,6 +155,8 @@ export interface GatewayOverlayParams {
   initialRefresh?: boolean;
   /** Runtime height for bounded window/event views. */
   getTerminalRows?: () => number;
+  /** Theme for role colors; when absent the overlay renders unstyled. */
+  theme?: OverlayTheme;
   /** Endpoint readiness wait for startGateway (ms); tests shorten this. */
   endpointWaitMs?: number;
   /** Host-native prompt used by the tunnel structured editor. */
@@ -548,6 +550,7 @@ export class GatewayOverlay implements Component, Focusable {
   private configListKey: "commandsAllow" | "commandsConfirm" | "commandsDeny" | "filesAllow" | "filesConfirm" | "filesDeny" | undefined;
   private configListSelected = 0;
   private readonly tunnelPanel: GatewayTunnelPanel;
+  private readonly initialPage: "home" | "config" | "tunnel";
   private tunnelProvider: "cloudflare" | "openai" = "cloudflare";
   private snapshot: GatewaySnapshot = {
     refreshing: true, endpoint: "unknown", workspaces: [], cwdRegistered: false, windows: [], thread: [], mcpServers: [],
@@ -591,6 +594,7 @@ export class GatewayOverlay implements Component, Focusable {
   }
 
   constructor(private readonly params: GatewayOverlayParams) {
+    this.initialPage = params.initialPage ?? "home";
     const tunnelConfigView = readGatewayConfigView();
     if (params.initialPage === "config") {
       this.mode = "config";
@@ -600,7 +604,21 @@ export class GatewayOverlay implements Component, Focusable {
     }
     this.tunnelPanel = new GatewayTunnelPanel({
       requestRender: () => this.safeRequestRender(),
-      close: () => { if (this.closed) return; this.mode = "list"; this.safeRequestRender(); },
+      // ui-conventions-003: top-level Esc closes. When the tunnel page is the
+      // overlay's initial view, Esc must close the overlay — bouncing to the
+      // home page made Esc appear to *open* the gateway TUI.
+      close: () => {
+        if (this.closed) return;
+        if (this.initialPage === "tunnel") {
+          this.markClosed();
+          this.params.close();
+          return;
+        }
+        this.mode = "list";
+        this.safeRequestRender();
+      },
+      escLabel: this.initialPage === "tunnel" ? "Esc 关闭" : "Esc 返回",
+      theme: params.theme,
       createControlClient: (configPath) => new GatewayControlClient({ cwd: params.cwd, configPath }),
       initialProfiles: tunnelConfigView?.tunnels.profiles,
       httpPath: tunnelConfigView?.transport.httpPath,
@@ -767,6 +785,7 @@ export class GatewayOverlay implements Component, Focusable {
         if (!openai?.enabled) throw new Error("请先启用 OpenAI Tunnel，保存配置并按 R 重启 Gateway");
         const pending = [
           this.configChanges.openAiTunnelEnabled,
+          this.configChanges.openAiAutoInstall,
           this.configChanges.openAiTunnelBinaryPath,
           this.configChanges.openAiTunnelIdEnv,
           this.configChanges.openAiRuntimeKeyEnv,
@@ -778,6 +797,7 @@ export class GatewayOverlay implements Component, Focusable {
         const state = await startOpenAiTunnel({
           localPort: this.listenPort(),
           ...(openai.binaryPath ? { binaryPath: openai.binaryPath } : {}),
+          autoInstall: openai.autoInstall,
           tunnelIdEnv: openai.tunnelIdEnv,
           runtimeKeyEnv: openai.runtimeKeyEnv,
         });
@@ -1188,6 +1208,10 @@ export class GatewayOverlay implements Component, Focusable {
         } else if (this.configListKey) {
           this.configListKey = undefined;
           this.configListSelected = 0;
+        } else if (this.initialPage === "config") {
+          // Top-level Esc closes: /gateway config opens directly on this page.
+          this.markClosed();
+          this.params.close();
         } else {
           this.mode = "list";
         }
@@ -1389,6 +1413,11 @@ export class GatewayOverlay implements Component, Focusable {
       void this.refreshTunnelAndGateway();
       return;
     }
+    if (data === "u" || data === "U") {
+      this.mode = "tunnel";
+      this.params.requestRender();
+      return;
+    }
     if (data === "w" || data === "W") {
       this.wsSelected = 0;
       this.mode = "workspace";
@@ -1480,6 +1509,7 @@ export class GatewayOverlay implements Component, Focusable {
       ] : [
         { column: 1 as const, group: "tunnel", key: "tunnel.openai.status", label: "OpenAI 状态", kind: "readonly" as const, value: openAiState?.alive ? `${openAiState.phase}${openAiState.opaqueId ? ` · ${openAiState.opaqueId}` : ""}` : "未运行" },
         { column: 1 as const, group: "tunnel", key: "tunnel.openai.enabled", label: "enabled (experimental)", kind: "bool" as const, value: String(openai?.enabled ?? false) },
+        { column: 1 as const, group: "tunnel", key: "tunnel.openai.autoInstall", label: "auto_install (pinned download)", kind: "bool" as const, value: String(openai?.autoInstall ?? false) },
         { column: 1 as const, group: "tunnel", key: "tunnel.openai.binaryPath", label: "binary_path", kind: "text" as const, value: openai?.binaryPath ?? "PATH: tunnel-client" },
         { column: 1 as const, group: "tunnel", key: "tunnel.openai.tunnelIdEnv", label: "tunnel_id_env", kind: "text" as const, value: openai?.tunnelIdEnv ?? "CONTROL_PLANE_TUNNEL_ID" },
         { column: 1 as const, group: "tunnel", key: "tunnel.openai.runtimeKeyEnv", label: "runtime_key_env", kind: "text" as const, value: openai?.runtimeKeyEnv ?? "CONTROL_PLANE_API_KEY" },
@@ -1689,6 +1719,7 @@ export class GatewayOverlay implements Component, Focusable {
       case "files.max_patch_files": if (Number.isInteger(num) && num > 0) { this.configChanges.filesMaxPatchFiles = num; if (this.configView) this.configView.files.maxPatchFiles = num; } break;
       case "tunnel.provider": this.tunnelProvider = value === "openai" ? "openai" : "cloudflare"; break;
       case "tunnel.openai.enabled": this.configChanges.openAiTunnelEnabled = value === "true"; if (this.configView) this.configView.tunnels.openai.enabled = value === "true"; break;
+      case "tunnel.openai.autoInstall": this.configChanges.openAiAutoInstall = value === "true"; if (this.configView) this.configView.tunnels.openai.autoInstall = value === "true"; break;
       case "tunnel.openai.binaryPath": this.configChanges.openAiTunnelBinaryPath = value === "PATH: tunnel-client" ? "" : value; if (this.configView) this.configView.tunnels.openai.binaryPath = value === "PATH: tunnel-client" ? "" : value; break;
       case "tunnel.openai.tunnelIdEnv": this.configChanges.openAiTunnelIdEnv = value; if (this.configView) this.configView.tunnels.openai.tunnelIdEnv = value; break;
       case "tunnel.openai.runtimeKeyEnv": this.configChanges.openAiRuntimeKeyEnv = value; if (this.configView) this.configView.tunnels.openai.runtimeKeyEnv = value; break;
@@ -1744,18 +1775,20 @@ export class GatewayOverlay implements Component, Focusable {
 
   private renderConfig(width: number): string[] {
     const inner = width - 2;
-    const rows = [fitLine(`Pi Maestro Gateway · 1 主页 · ${fg("36", "[2 配置]")}`, inner), rule(inner)];
+    const rows = [fitLine(`Pi Maestro Gateway · 1 主页 · ${this.fg("36", "[2 配置]")}`, inner), rule(inner)];
     if (!this.configView) {
-      rows.push(fitLine(fg("31", "配置读取失败；请检查 config.yaml 格式后按 Esc 返回主页"), inner));
-      rows.push(...fitSegments(inner, ["1 主页", "Esc 返回"]));
-      return frame(rows, width);
+      const escHint = this.initialPage === "config" ? "Esc 关闭" : "Esc 返回";
+      rows.push(fitLine(this.fg("31", `配置读取失败；请检查 config.yaml 格式后按 ${escHint === "Esc 关闭" ? "Esc 关闭" : "Esc 返回主页"}`), inner));
+      rows.push(...fitSegments(inner, ["1 主页", escHint]));
+      return frame(rows, width, this.params.theme);
     }
     if (this.configListKey) {
       rows.push(...this.renderConfigList(inner));
       rows.push(...fitSegments(inner, ["a 添加", "d 删除", "Enter 确认输入", "Esc 返回"]));
       if (this.status) rows.push(fitLine(this.status, inner));
-      return frame(rows, width);
+      return frame(rows, width, this.params.theme);
     }
+    const escHint = this.initialPage === "config" ? "Esc 关闭" : "Esc 返回";
     const entries = this.configEntries();
     if (inner >= 76) {
       const gap = 3;
@@ -1763,7 +1796,7 @@ export class GatewayOverlay implements Component, Focusable {
       const rightWidth = inner - gap - leftWidth;
       const left = this.renderConfigColumn(entries, 0, leftWidth);
       const right = this.renderConfigColumn(entries, 1, rightWidth);
-      rows.push(fitLine(fg("36", "Gateway 基础与命令安全"), leftWidth) + " │ " + fitLine(fg("36", "公网隧道与文件安全"), rightWidth));
+      rows.push(fitLine(this.fg("36", "Gateway 基础与命令安全"), leftWidth) + " │ " + fitLine(this.fg("36", "公网隧道与文件安全"), rightWidth));
       for (let index = 0; index < Math.max(left.length, right.length); index++) {
         rows.push((left[index] ?? " ".repeat(leftWidth)) + " │ " + (right[index] ?? " ".repeat(rightWidth)));
       }
@@ -1772,10 +1805,10 @@ export class GatewayOverlay implements Component, Focusable {
       rows.push(...this.renderConfigColumn(entries, 1, inner));
     }
     rows.push(rule(inner));
-    rows.push(fitLine(fg("2", "OpenAI 只保存 tunnel-client 路径与 env 名，不保存密钥；切换 provider 会先停止另一侧"), inner));
+    rows.push(fitLine(this.fg("2", "OpenAI 只保存 tunnel-client 路径与 env 名，不保存密钥；切换 provider 会先停止另一侧"), inner));
     if (this.status) rows.push(fitLine(this.status, inner));
-    rows.push(...fitSegments(inner, ["←→ 切栏", "↑↓ 选择", "Enter 编辑/执行", "space 切换", "1 主页", "Esc 返回"]));
-    return frame(rows, width);
+    rows.push(...fitSegments(inner, ["←→ 切栏", "↑↓ 选择", "Enter 编辑/执行", "space 切换", "1 主页", escHint]));
+    return frame(rows, width, this.params.theme);
   }
 
   private renderConfigColumn(entries: ConfigEntry[], column: 0 | 1, width: number): string[] {
@@ -1785,23 +1818,23 @@ export class GatewayOverlay implements Component, Focusable {
       if (entry.column !== column) return;
       if (entry.group !== currentGroup) {
         currentGroup = entry.group;
-        rows.push(fitLine(fg("36", `「${groupLabel(currentGroup)}」`), width));
+        rows.push(fitLine(this.fg("36", `「${groupLabel(currentGroup)}」`), width));
       }
       const selected = index === this.configSelected && !this.configEditing;
       const marker = selected ? "›" : " ";
       let valueText: string;
       if (entry.key === "tunnel.provider") {
-        const cloudflare = this.tunnelProvider === "cloudflare" ? fg("32", "[Cloudflare]") : " Cloudflare ";
-        const openai = this.tunnelProvider === "openai" ? fg("32", "[OpenAI experimental]") : " OpenAI experimental ";
+        const cloudflare = this.tunnelProvider === "cloudflare" ? this.fg("32", "[Cloudflare]") : " Cloudflare ";
+        const openai = this.tunnelProvider === "openai" ? this.fg("32", "[OpenAI experimental]") : " OpenAI experimental ";
         valueText = `${cloudflare} ↔ ${openai}`;
       } else if (entry.kind === "list" || entry.kind === "action" || entry.kind === "readonly" && !entry.value) {
         valueText = entry.label;
       } else if (this.configEditing && index === this.configSelected) {
         valueText = `${entry.label} (${entry.value ?? ""}): ${this.configDraft}▌`;
       } else if (entry.kind === "bool") {
-        valueText = `${entry.label}: ${entry.value === "true" ? fg("32", "true") : fg("31", "false")}`;
+        valueText = `${entry.label}: ${entry.value === "true" ? this.fg("32", "true") : this.fg("31", "false")}`;
       } else if (entry.kind === "cycle") {
-        valueText = `${entry.label}: ${fg("33", entry.value ?? "")}`;
+        valueText = `${entry.label}: ${this.fg("33", entry.value ?? "")}`;
       } else {
         valueText = `${entry.label}: ${entry.value ?? ""}`;
       }
@@ -1818,12 +1851,12 @@ export class GatewayOverlay implements Component, Focusable {
       rows.push(fitLine("  ○ 空列表（按 a 添加正则/规则）", inner));
     } else {
       for (let i = 0; i < list.length; i++) {
-        const marker = i === this.configListSelected ? fg("36", "▶") : " ";
+        const marker = i === this.configListSelected ? this.fg("36", "▶") : " ";
         rows.push(fitLine(`${marker} ${list[i]}`, inner));
       }
     }
     if (this.configEditing) {
-      rows.push(fitLine(fg("33", `  + 新增: ${this.configDraft}▌`), inner));
+      rows.push(fitLine(this.fg("33", `  + 新增: ${this.configDraft}▌`), inner));
     }
     return rows;
   }
@@ -1837,12 +1870,12 @@ export class GatewayOverlay implements Component, Focusable {
 
   private renderList(width: number): string[] {
     const inner = width - 2;
-    const rows = [fitLine(`Pi Maestro Gateway · ${fg("36", "[1 主页]")} · 2 配置`, inner), rule(inner)];
-    rows.push(fitLine(fg("36", "服务概览"), inner));
+    const rows = [fitLine(`Pi Maestro Gateway · ${this.fg("36", "[1 主页]")} · 2 配置`, inner), rule(inner)];
+    rows.push(fitLine(this.fg("36", "服务概览"), inner));
     rows.push(...this.renderForkRows(inner));
     rows.push(this.renderConnectionRow(inner));
     const brokenMcp = this.snapshot.mcpServers.filter((server) => !server.executable).length;
-    rows.push(fitLine(`上游 MCP ${this.snapshot.mcpServers.length} · 客户端 ${this.snapshot.connections?.length ?? "—"} · 工作区 ${this.snapshot.workspaces.length}${brokenMcp ? ` · ${fg("31", `${brokenMcp} 个命令不可用`)}` : ""}`, inner));
+    rows.push(fitLine(`上游 MCP ${this.snapshot.mcpServers.length} · 客户端 ${this.snapshot.connections?.length ?? "—"} · 工作区 ${this.snapshot.workspaces.length}${brokenMcp ? ` · ${this.fg("31", `${brokenMcp} 个命令不可用`)}` : ""}`, inner));
     rows.push(...this.renderFabricRows(inner));
     rows.push(rule(inner));
     rows.push(...this.renderTunnelRows(inner));
@@ -1865,9 +1898,9 @@ export class GatewayOverlay implements Component, Focusable {
       }
     }
     if (this.status) rows.push(fitLine(this.status, inner));
-    if (this.snapshot.error) rows.push(fitLine(fg("31", `! ${this.snapshot.error}`), inner));
-    rows.push(...fitSegments(inner, ["1 主页", "2/c 配置", "Enter 消息", "G 协作", "V 窗口", "W 工作区", "r 刷新", this.snapshot.endpoint === "online" ? "x 停止" : "s 启动", "R 重启", "T 重建 Cloudflare", "e 注册(租约)", "E 注册(永久)", "P 口令", "Esc 关闭"]));
-    return frame(rows, width);
+    if (this.snapshot.error) rows.push(fitLine(this.fg("31", `! ${this.snapshot.error}`), inner));
+    rows.push(...fitSegments(inner, ["1 主页", "2/c 配置", "U 隧道", "Enter 消息", "G 协作", "V 窗口", "W 工作区", "r 刷新", this.snapshot.endpoint === "online" ? "x 停止" : "s 启动", "R 重启", "T 重建 Cloudflare", "e 注册(租约)", "E 注册(永久)", "P 口令", "Esc 关闭"]));
+    return frame(rows, width, this.params.theme);
   }
 
   private renderFabricRows(width: number): string[] {
@@ -1897,25 +1930,25 @@ export class GatewayOverlay implements Component, Focusable {
 
   private renderForkRows(width: number): string[] {
     if (this.snapshot.forkInstalled) {
-      return [fitLine(fg("32", `Pi Maestro Gateway 已安装${this.snapshot.forkVersion ? ` · v${this.snapshot.forkVersion}` : ""}`), width)];
+      return [fitLine(this.fg("32", `Pi Maestro Gateway 已安装${this.snapshot.forkVersion ? ` · v${this.snapshot.forkVersion}` : ""}`), width)];
     }
-    return [fitLine(fg("31", "未找到 Pi Maestro Gateway — 设置 PI_MAESTRO_GATEWAY_BIN 或重新安装 pi-maestro-flow"), width)];
+    return [fitLine(this.fg("31", "未找到 Pi Maestro Gateway — 设置 PI_MAESTRO_GATEWAY_BIN 或重新安装 pi-maestro-flow"), width)];
   }
 
   private renderConnectionRow(width: number): string {
     const binary = this.snapshot.binary ?? "未找到 Pi Maestro Gateway";
     const version = this.snapshot.version ? ` · ${this.snapshot.version}` : "";
     const endpoint = this.snapshot.endpoint === "online"
-      ? fg("32", `● ${this.snapshot.endpointVersion ?? "online"}`)
+      ? this.fg("32", `● ${this.snapshot.endpointVersion ?? "online"}`)
       : this.snapshot.endpoint === "offline"
-        ? fg("31", "● offline")
-        : fg("33", "● …");
+        ? this.fg("31", "● offline")
+        : this.fg("33", "● …");
     // "已注册" is green only when the lease is live; a stale-but-unswept entry
     // is yellow so the user knows gateway will reclaim it (config.yaml still lists
     // it until the next ~5min sweep).
     const registered = this.snapshot.cwdRegistered
-      ? (this.snapshot.cwdLeaseStale ? fg("33", "租约过期·待清理") : fg("32", "已注册"))
-      : fg("33", "未注册");
+      ? (this.snapshot.cwdLeaseStale ? this.fg("33", "租约过期·待清理") : this.fg("32", "已注册"))
+      : this.fg("33", "未注册");
     // gateway's registry is rebuilt only at startup and every ~5min (lease sweep);
     // a freshly-registered window is recognized by the runtime after that delay.
     const sweepHint = this.snapshot.cwdRegistered && !this.snapshot.cwdLeaseStale ? " · Gateway workspace 已生效" : "";
@@ -1926,15 +1959,15 @@ export class GatewayOverlay implements Component, Focusable {
     const cloudflare = this.snapshot.tunnel;
     const openai = this.snapshot.openAiTunnel;
     const stateLabel = (state: TunnelState | undefined) => state?.alive
-      ? fg("32", `${state.phase}${state.pid ? ` · pid ${state.pid}` : ""}`)
-      : state?.health === "dead" ? fg("31", "异常") : fg("2", "未运行");
-    const rows = [fitLine(`${fg("36", "公网接入")} · 两种模式在配置页并列切换（2/c）`, width)];
+      ? this.fg("32", `${state.phase}${state.pid ? ` · pid ${state.pid}` : ""}`)
+      : state?.health === "dead" ? this.fg("31", "异常") : this.fg("2", "未运行");
+    const rows = [fitLine(`${this.fg("36", "公网接入")} · 配置页切换 provider（2/c）· U 打开 Tunnel 操作页`, width)];
     rows.push(fitLine(`  Cloudflare Quick Tunnel      ${stateLabel(cloudflare)}${cloudflare?.url ? ` · ${cloudflare.url}/mcp` : ""}`, width));
     rows.push(fitLine(`  OpenAI Secure MCP Tunnel    ${stateLabel(openai)}${openai?.opaqueId ? ` · ${openai.opaqueId}` : ""} · experimental`, width));
     const failureDetail = cloudflare?.health === "dead" && cloudflare.detail
       ? cloudflare.detail
       : openai?.health === "dead" ? openai.detail : undefined;
-    if (failureDetail) rows.push(fitLine(fg("31", `  ! ${failureDetail}`), width));
+    if (failureDetail) rows.push(fitLine(this.fg("31", `  ! ${failureDetail}`), width));
     return rows;
   }
 
@@ -1947,7 +1980,7 @@ export class GatewayOverlay implements Component, Focusable {
     // Full reveal is also available directly from the native Gateway config.
     const pw = this.snapshot.opsPassword;
     if (!pw) {
-      return [fitLine(fg("33", "运维口令：未在 config 持久化（OAuth 授权需要配置 oauth.password）"), width)];
+      return [fitLine(this.fg("33", "运维口令：未在 config 持久化（OAuth 授权需要配置 oauth.password）"), width)];
     }
     const shown = this.revealOpsPassword
       ? pw
@@ -1955,8 +1988,8 @@ export class GatewayOverlay implements Component, Focusable {
         ? `●●●●${pw.slice(-4)}`
         : "●●●●";
     return [
-      fitLine(`运维口令（OAuth 授权页填写）: ${fg("36", shown)}`, width),
-      fitLine(fg("2", `  按 P 显明/隐藏口令（完整值见 the native Gateway config）`), width),
+      fitLine(`运维口令（OAuth 授权页填写）: ${this.fg("36", shown)}`, width),
+      fitLine(this.fg("2", `  按 P 显明/隐藏口令（完整值见 the native Gateway config）`), width),
     ];
   }
 
@@ -1975,11 +2008,11 @@ export class GatewayOverlay implements Component, Focusable {
     for (const task of tasks.slice(0, 6)) {
       const color = statusColor[task.status] ?? "33";
       const tid = task.id.slice(0, 8);
-      rows.push(fitLine(`  ${fg(color, task.status)} · ${tid} · Gateway · ${task.cwd || "?"}`, width));
+      rows.push(fitLine(`  ${this.fg(color, task.status)} · ${tid} · Gateway · ${task.cwd || "?"}`, width));
       if (task.status === "completed" && task.publicationId) {
-        rows.push(fitLine(fg("2", `      结果: agent://${task.publicationId}`), width));
+        rows.push(fitLine(this.fg("2", `      结果: agent://${task.publicationId}`), width));
       } else if ((task.status === "failed" || task.status === "lost") && task.error) {
-        rows.push(fitLine(fg("31", `      错误: ${task.error.slice(0, 60)}`), width));
+        rows.push(fitLine(this.fg("31", `      错误: ${task.error.slice(0, 60)}`), width));
       }
     }
     return rows;
@@ -1990,8 +2023,8 @@ export class GatewayOverlay implements Component, Focusable {
     const todos = sessions.reduce((count, state) => count + state.todos.length, 0);
     const monitors = Object.values(this.snapshot.collaborationMonitors ?? {}).reduce((count, values) => count + values.length, 0);
     const rows = [fitLine(`Gateway 协作（${sessions.length} Session） · Gateway Todo ${todos} · Monitor ${monitors} · G 管理`, width)];
-    rows.push(fitLine(fg("33", "  Gateway Todo is independent and is not synchronized with Pi Todo."), width));
-    if (this.snapshot.collaborationError) rows.push(fitLine(fg("31", `  collaboration: ${this.snapshot.collaborationError}`), width));
+    rows.push(fitLine(this.fg("33", "  Gateway Todo is independent and is not synchronized with Pi Todo."), width));
+    if (this.snapshot.collaborationError) rows.push(fitLine(this.fg("31", `  collaboration: ${this.snapshot.collaborationError}`), width));
     return rows;
   }
 
@@ -1999,21 +2032,21 @@ export class GatewayOverlay implements Component, Focusable {
     const inner = width - 2;
     const sessions = this.snapshot.collaborativeSessions ?? [];
     const rows = [fitLine("Gateway Collaboration · CollaborativeSession ↑↓ · Enter details", inner), rule(inner)];
-    rows.push(fitLine(fg("33", "Gateway Todo is independent and is not synchronized with Pi Todo."), inner));
+    rows.push(fitLine(this.fg("33", "Gateway Todo is independent and is not synchronized with Pi Todo."), inner));
     if (sessions.length === 0) {
       rows.push(fitLine("  ○ No workspace-local CollaborativeSession state", inner));
     } else {
       const start = Math.max(0, Math.min(this.collaborationSelected - 3, sessions.length - 7));
       for (let index = start; index < Math.min(sessions.length, start + 7); index++) {
         const state = sessions[index]!;
-        const marker = index === this.collaborationSelected ? fg("36", "▶") : " ";
+        const marker = index === this.collaborationSelected ? this.fg("36", "▶") : " ";
         const monitorCount = this.snapshot.collaborationMonitors?.[state.session.id]?.length ?? 0;
         rows.push(fitLine(`${marker} ${state.session.id} · ${state.session.status} · revision ${state.session.revision} · members ${state.members.length} · Gateway Todo ${state.todos.length} · Monitor ${monitorCount}`, inner));
       }
     }
     if (this.status) rows.push(fitLine(this.status, inner));
     rows.push(...fitSegments(inner, ["Enter details", "r refresh", "Esc back"]));
-    return frame(rows, width);
+    return frame(rows, width, this.params.theme);
   }
 
   private renderCollaborationDetail(width: number): string[] {
@@ -2029,7 +2062,7 @@ export class GatewayOverlay implements Component, Focusable {
       rows.push(fitLine(`Members (${state.members.length}) · lease generation / expiry`, inner));
       for (const member of state.members.slice(0, 8)) {
         const remaining = member.leaseExpiresAt - Date.now();
-        const lease = remaining <= 0 ? fg("31", "expired") : `${Math.ceil(remaining / 1000)}s`;
+        const lease = remaining <= 0 ? this.fg("31", "expired") : `${Math.ceil(remaining / 1000)}s`;
         rows.push(fitLine(`  ${member.id} · ${member.role}/${member.status} · gen ${member.generation} · lease ${lease}`, inner));
       }
       rows.push(rule(inner));
@@ -2039,7 +2072,7 @@ export class GatewayOverlay implements Component, Focusable {
       if (state.todos.length === 0) rows.push(fitLine("  ○ No Gateway Todo items", inner));
       for (let index = todoStart; index < Math.min(state.todos.length, todoStart + 8); index++) {
         const todo = state.todos[index]!;
-        const marker = index === this.collaborationItemSelected ? fg("36", "▶") : " ";
+        const marker = index === this.collaborationItemSelected ? this.fg("36", "▶") : " ";
         const assignee = todo.assigneeId ? ` · @${todo.assigneeId}` : "";
         rows.push(fitLine(`${marker} ${todo.status} · ${todo.id}${assignee} · ${todo.subject}`, inner));
       }
@@ -2051,14 +2084,14 @@ export class GatewayOverlay implements Component, Focusable {
       const monitorStart = Math.max(0, Math.min(selectedMonitor - 3, monitors.length - 8));
       for (let index = monitorStart; index < Math.min(monitors.length, monitorStart + 8); index++) {
         const monitor = monitors[index]!;
-        const marker = state.todos.length + index === this.collaborationItemSelected ? fg("36", "▶") : " ";
-        const status = monitor.task.status === "lost" ? fg("31", "lost") : monitor.task.status;
+        const marker = state.todos.length + index === this.collaborationItemSelected ? this.fg("36", "▶") : " ";
+        const status = monitor.task.status === "lost" ? this.fg("31", "lost") : monitor.task.status;
         rows.push(fitLine(`${marker} ${status} · ${monitor.handle} · cursor ${monitor.task.eventCursor} · results ${monitor.task.resultCount}`, inner));
       }
     }
     if (this.status) rows.push(fitLine(this.status, inner));
     rows.push(...fitSegments(inner, ["↑↓ select", "Enter observe Monitor", "u renew my lease", "a claim/release Todo", "b block/unblock Todo", "d complete Todo", "r refresh", "Esc back"]));
-    return frame(rows, width);
+    return frame(rows, width, this.params.theme);
   }
 
   private renderMonitorDetail(width: number): string[] {
@@ -2068,9 +2101,9 @@ export class GatewayOverlay implements Component, Focusable {
     if (!observation) {
       rows.push(fitLine(this.collaborationBusy ? "  observing…" : "  ○ No observation available", inner));
     } else {
-      const status = observation.task.status === "lost" ? fg("31", "lost") : observation.task.status;
+      const status = observation.task.status === "lost" ? this.fg("31", "lost") : observation.task.status;
       rows.push(fitLine(`${observation.handle} · ${status} · next cursor ${observation.nextCursor} · oldest ${observation.oldestCursor}${observation.hasMore ? " · more" : ""}`, inner));
-      rows.push(fitLine(observation.gap ? fg("31", "! cursor gap: older Monitor events were lost") : fg("32", "cursor continuity retained"), inner));
+      rows.push(fitLine(observation.gap ? this.fg("31", "! cursor gap: older Monitor events were lost") : this.fg("32", "cursor continuity retained"), inner));
       rows.push(rule(inner));
       if (observation.events.length === 0) rows.push(fitLine("  ○ No retained events after this cursor", inner));
       for (const event of observation.events.slice(-this.rowBudget(8, 12))) {
@@ -2079,7 +2112,7 @@ export class GatewayOverlay implements Component, Focusable {
     }
     if (this.status) rows.push(fitLine(this.status, inner));
     rows.push(...fitSegments(inner, ["r next", "R replay retained", "x cancel", "Esc back"]));
-    return frame(rows, width);
+    return frame(rows, width, this.params.theme);
   }
 
   private renderThreadRow(entry: GatewayThreadEntry, selected: boolean, width: number): string {
@@ -2117,7 +2150,7 @@ export class GatewayOverlay implements Component, Focusable {
       }
     }
     rows.push(...fitSegments(inner, ["Esc back"]));
-    return frame(rows, width);
+    return frame(rows, width, this.params.theme);
   }
 
   private renderWindowList(width: number): string[] {
@@ -2128,7 +2161,7 @@ export class GatewayOverlay implements Component, Focusable {
     const rows = [fitLine("Pi 窗口 · Remote Session ←→ · ↑↓ 选择", inner), rule(inner)];
     if (this.snapshot.runtimeWindows === undefined) {
       const reason = this.snapshot.runtimeWindowFallback === "auth" ? "鉴权阻止 Runtime 调用" : "Runtime 缺少统一 pi_window actions";
-      rows.push(fitLine(fg("33", `${reason} · 使用 local registry fallback`), inner));
+      rows.push(fitLine(this.fg("33", `${reason} · 使用 local registry fallback`), inner));
       const fallbackBudget = this.rowBudget(6, 10);
       const visibleFallback = this.snapshot.windows.length > fallbackBudget
         ? this.snapshot.windows.slice(0, Math.max(1, fallbackBudget - 1))
@@ -2141,7 +2174,7 @@ export class GatewayOverlay implements Component, Focusable {
       }
       if (this.snapshot.windows.length === 0) rows.push(fitLine("  ○ 无本地 fresh owner", inner));
       rows.push(...fitSegments(inner, ["r refresh", "Esc back"]));
-      return frame(rows, width);
+      return frame(rows, width, this.params.theme);
     }
     if (!session || sessions.length === 0) {
       rows.push(fitLine("○ 无可用 Remote Session", inner));
@@ -2160,7 +2193,7 @@ export class GatewayOverlay implements Component, Focusable {
         const end = Math.min(windows.length, start + entryBudget);
         for (let index = start; index < end; index++) {
           const window = windows[index];
-          const marker = index === this.windowSelected ? fg("36", "▶") : " ";
+          const marker = index === this.windowSelected ? this.fg("36", "▶") : " ";
           const cursor = window.cursor ? ` · cursor ${window.cursor}` : "";
           rows.push(fitLine(`${marker} ${window.kind} · ${window.displayName} · ${window.status}${cursor}`, inner));
         }
@@ -2171,7 +2204,7 @@ export class GatewayOverlay implements Component, Focusable {
     }
     if (this.status) rows.push(fitLine(this.status, inner));
     rows.push(...fitSegments(inner, ["Enter observe", "m send", "n new", "r refresh", "Esc back"]));
-    return frame(rows, width);
+    return frame(rows, width, this.params.theme);
   }
 
   private renderWindowDetail(width: number): string[] {
@@ -2201,7 +2234,7 @@ export class GatewayOverlay implements Component, Focusable {
     }
     if (this.status) rows.push(fitLine(this.status, inner));
     rows.push(...fitSegments(inner, ["m send", "n new", "r observe", "Esc back"]));
-    return frame(rows, width);
+    return frame(rows, width, this.params.theme);
   }
 
   /** W 子模式：列出并更新 built-in Gateway workspace registry。 */
@@ -2214,17 +2247,26 @@ export class GatewayOverlay implements Component, Focusable {
     } else {
       for (let i = 0; i < ws.length; i++) {
         const w = ws[i];
-        const marker = i === this.wsSelected ? fg("36", "▶") : " ";
+        const marker = i === this.wsSelected ? this.fg("36", "▶") : " ";
         const lease = w.expiresAt
-          ? w.expiresAt <= Date.now() ? fg("31", "租约·已过期") : fg("33", "租约")
-          : fg("32", "永久");
+          ? w.expiresAt <= Date.now() ? this.fg("31", "租约·已过期") : this.fg("33", "租约")
+          : this.fg("32", "永久");
         rows.push(fitLine(`${marker} ${w.name} · ${w.path} · ${lease}`, inner));
       }
       rows.push(rule(inner));
-      rows.push(fitLine(fg("31", "  d 删除选中 workspace（立即从 Gateway registry 清理）"), inner));
+      rows.push(fitLine(this.fg("31", "  d 删除选中 workspace（立即从 Gateway registry 清理）"), inner));
     }
     rows.push(...fitSegments(inner, ["d delete", "e 注册(租约)", "E 注册(永久)", "Esc back"]));
-    return frame(rows, width);
+    return frame(rows, width, this.params.theme);
+  }
+
+  /** Legacy numeric code → semantic role → theme slot. */
+  private fg(code: string, text: string): string {
+    const theme = this.params.theme;
+    if (!theme || !code) return text;
+    const role = CODE_ROLE[code];
+    if (role === "bold") return theme.bold ? theme.bold(text) : theme.fg("text", text);
+    return theme.fg(role ?? "text", text);
   }
 
   private async removeSelectedWorkspace(): Promise<void> {
@@ -2249,7 +2291,7 @@ export class GatewayOverlay implements Component, Focusable {
 function sanitizeTerminalText(value: string): string {
   return value
     .replace(/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g, "") // OSC 序列(标题等)
-    // 非颜色 CSI 序列清掉;SGR 颜色码(以 m 结尾)必须保留以维持 fg()/主题着色
+    // 非颜色 CSI 序列清掉;SGR 颜色码(以 m 结尾)必须保留以维持 this.fg()/主题着色
     .replace(/\x1b\[(?![0-9;]*m)[0-9;?]*[ -/]*[@-~]/g, "")
     // C0/C1 控制:保留 ESC(0x1b,SGR 序列的一部分)与 \t\n;只剥除其余控制符
     .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001a\u001c-\u001f\u007f-\u009f]/g, "")
@@ -2294,15 +2336,28 @@ function rule(width: number): string {
   return "─".repeat(Math.max(0, width));
 }
 
-function frame(rows: readonly string[], width: number): string[] {
+function frame(rows: readonly string[], width: number, theme?: OverlayTheme): string[] {
   // width is the OUTER width; content rows are │+inner+│, so the horizontal
   // rules must span inner = width-2 to keep all rows the same width.
   return makeBorderFrame(rows, width, FRAME_GLYPHS, FRAME_UTILS, {
     corners: "square",
     clip: false,
     pad: false,
+    theme,
+    borderColor: "borderMuted",
   });
 }
+
+const CODE_ROLE: Record<string, string> = {
+  "1": "bold",
+  "2": "dim",
+  "31": "error",
+  "32": "success",
+  "33": "warning",
+  "34": "muted",
+  "35": "accent",
+  "36": "accent",
+};
 
 function fitSegments(width: number, segments: readonly string[]): string[] {
   // Greedy-wrap the hint segments so no shortcut is hidden by truncation on
@@ -2320,10 +2375,6 @@ function fitSegments(width: number, segments: readonly string[]): string[] {
   }
   if (current) lines.push(fitLine(current, width));
   return lines;
-}
-
-function fg(code: string, text: string): string {
-  return `\x1b[${code}m${text}\x1b[0m`;
 }
 
 function isEnter(data: string): boolean {

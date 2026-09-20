@@ -11,6 +11,8 @@ import {
   type BrowserManagerLike,
   type BrowserManagerStatus,
   type BrowserOpenOptions,
+  type BrowserPickCaptureCallback,
+  type BrowserPickResult,
   type BrowserRunOutput,
   type BrowserTabInfo,
 } from "../tools/browser/manager.ts";
@@ -44,6 +46,15 @@ class ScopedTeammateBrowserManager implements BrowserManagerLike {
     timeoutMs: number,
   ): Promise<BrowserRunOutput> {
     return this.manager.run(this.#physicalName(name), code, cwd, signal, timeoutMs);
+  }
+
+  pick(
+    name: string,
+    onCapture: BrowserPickCaptureCallback | undefined,
+    signal: AbortSignal | undefined,
+    timeoutMs: number,
+  ): Promise<BrowserPickResult> {
+    return this.manager.pick(this.#physicalName(name), onCapture, signal, timeoutMs);
   }
 
   async status(signal?: AbortSignal): Promise<BrowserManagerStatus> {

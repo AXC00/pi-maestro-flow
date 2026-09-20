@@ -247,9 +247,11 @@ export class GatewayDaemon {
         new CloudflareQuickTunnelProvider({ defaultLocalPort: localTunnelPort, probePath: config.transport.http.path }),
         // Registered after Cloudflare and kept experimental/disabled unless the
         // administrator explicitly configures the supported external CLI and
-        // credential references. This provider never downloads or provisions.
+        // credential references. The managed download stays opt-in via
+        // auto_install; the provider never provisions tunnels.
         new OpenAiTunnelProvider({
           enabled: openAiConfig.enabled,
+          autoInstall: openAiConfig.autoInstall,
           binaryPath: openAiConfig.binaryPath,
           minimumVersion: openAiConfig.minimumVersion,
           tunnelIdEnv: openAiConfig.tunnelIdEnv,

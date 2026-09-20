@@ -8,20 +8,23 @@
 
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import {
-  Key,
   Markdown,
+  type KeyId,
   type MarkdownTheme,
   matchesKey,
   truncateToWidth,
   visibleWidth,
 } from "@earendil-works/pi-tui";
-import { makeBorderFrame, resolveGlyphs } from "pi-maestro-settings-core/ui";
-
-const FRAME_GLYPHS = resolveGlyphs("nerd");
-const FRAME_UTILS = {
-  measure: visibleWidth,
-  clip: (text: string, width: number, ellipsis: string) => truncateToWidth(text, width, ellipsis),
-};
+import {
+  ansiToSpans,
+  line,
+  openOverlay,
+  resolveGlyphs,
+  span,
+  type Frame,
+  type OverlayController,
+  type OverlayTheme,
+} from "pi-maestro-settings-core/ui";
 import type { PlanDraftArchiveEntry } from "../tools/plan-store.ts";
 
 export interface RenderRollbackOverlayOptions {
@@ -37,8 +40,6 @@ export interface RenderRollbackOverlayResult {
 
 type RollbackContext = Pick<ExtensionContext, "hasUI" | "ui">;
 
-const MAX_VISIBLE = 10;
-const PREVIEW_VISIBLE = 12;
 const WIDE_THRESHOLD = 76;
 
 export async function renderRollbackOverlay(
@@ -48,180 +49,182 @@ export async function renderRollbackOverlay(
   if (!ctx.hasUI || options.signal?.aborted) return { action: "cancel" };
   const drafts = options.drafts;
 
-  const result = await ctx.ui.custom<RenderRollbackOverlayResult>(
-    (tui, theme, _keybindings, done) => {
-      let selected = 0;
-      let preview = "";
-      let loadingPreview = false;
-      let lastWidth = 80;
-      let settled = false;
+  let selected = 0;
+  let preview = "";
+  let loadingPreview = false;
+  let settled = false;
+  let pendingResult: RenderRollbackOverlayResult | undefined;
+  let host: { requestRender(): void; close(result?: RenderRollbackOverlayResult): void } | undefined;
 
-      const finish = (value: RenderRollbackOverlayResult): void => {
-        if (settled) return;
-        settled = true;
-        options.signal?.removeEventListener("abort", onAbort);
-        done(value);
-      };
-      const onAbort = (): void => finish({ action: "cancel" });
-      options.signal?.addEventListener("abort", onAbort, { once: true });
-      if (options.signal?.aborted) onAbort();
+  const finish = (value: RenderRollbackOverlayResult): void => {
+    if (settled) return;
+    settled = true;
+    options.signal?.removeEventListener("abort", onAbort);
+    if (host) host.close(value);
+    else pendingResult = value;
+  };
+  const onAbort = (): void => finish({ action: "cancel" });
+  options.signal?.addEventListener("abort", onAbort, { once: true });
+  if (options.signal?.aborted) onAbort();
 
-      const markdownTheme: MarkdownTheme = {
-        heading: (text) => theme.fg("accent", theme.bold(text)),
-        link: (text) => theme.fg("accent", text),
-        linkUrl: (text) => theme.fg("dim", text),
-        code: (text) => theme.fg("warning", text),
-        codeBlock: (text) => text,
-        codeBlockBorder: (text) => theme.fg("dim", text),
-        quote: (text) => text,
-        quoteBorder: (text) => theme.fg("dim", text),
-        hr: (text) => theme.fg("dim", text),
-        listBullet: (text) => theme.fg("accent", text),
-        bold: (text) => theme.bold(text),
-        italic: (text) => text,
-        strikethrough: (text) => theme.fg("dim", text),
-        underline: (text) => text,
-      };
+  async function refreshPreview(): Promise<void> {
+    const entry = drafts[selected];
+    if (!entry) { preview = ""; return; }
+    loadingPreview = true;
+    try {
+      preview = await options.readDraft(entry.path);
+    } catch {
+      preview = "Unable to read this draft archive.";
+    } finally {
+      loadingPreview = false;
+      if (!settled) host?.requestRender();
+    }
+  }
+  if (!settled) void refreshPreview();
 
-      async function refreshPreview(): Promise<void> {
-        const entry = drafts[selected];
-        if (!entry) { preview = ""; return; }
-        loadingPreview = true;
-        try {
-          preview = await options.readDraft(entry.path);
-        } catch {
-          preview = "Unable to read this draft archive.";
-        } finally {
-          loadingPreview = false;
-          if (!settled) tui.requestRender();
-        }
-      }
-      if (!settled) void refreshPreview();
-
-      function visibleStart(): number {
-        if (drafts.length <= MAX_VISIBLE) return 0;
-        return Math.min(Math.max(0, selected - MAX_VISIBLE + 1), drafts.length - MAX_VISIBLE);
-      }
-
-      return {
-        render(width: number): string[] {
-          const safeWidth = Math.max(1, Math.min(width, 140));
-          lastWidth = safeWidth;
-          const inner = Math.max(1, safeWidth - 2);
-          const wide = safeWidth >= WIDE_THRESHOLD;
-          const terminalRows = process.stdout?.rows ?? 30;
-          const overlayMax = Math.max(8, Math.floor(terminalRows * 0.9));
-          const listWidth = wide ? Math.min(38, Math.floor(inner * 0.4)) : inner;
-          const previewWidth = wide ? Math.max(1, inner - listWidth - 1) : inner;
-
-          const rows: string[] = [
-            truncateToWidth(`${theme.bold("Rollback to draft version")} · ${drafts.length} archived`, inner, "…"),
-            "─".repeat(inner),
-          ];
-
-          if (drafts.length === 0) {
-            rows.push(theme.fg("warning", "No archived drafts available for rollback."));
-            rows.push("─".repeat(inner));
-            rows.push(truncateToWidth("Esc close", inner, "…"));
-            return frameBox(rows, safeWidth, theme);
-          }
-
-          const start = visibleStart();
-          const visibleCount = Math.min(MAX_VISIBLE, overlayMax - 6);
-          const listRows = drafts.slice(start, start + visibleCount).map((entry, offset) => {
-            const isSelected = start + offset === selected;
-            const marker = isSelected ? "›" : " ";
-            const label = `r${entry.revision} · ${entry.archivedAt.slice(0, 15)} · ${entry.checksum.slice(0, 8)}`;
-            return isSelected
-              ? theme.bold(`${marker} ${label}`)
-              : `${marker} ${label}`;
-          });
-
-          if (wide) {
-            const md = new Markdown(preview, 0, 0, markdownTheme);
-            const rendered = md.render(previewWidth).slice(0, overlayMax - 6);
-            const count = Math.max(listRows.length, rendered.length);
-            for (let index = 0; index < count; index++) {
-              const left = padToWidth(truncateToWidth(listRows[index] ?? "", listWidth, "…"), listWidth);
-              const right = rendered[index] ?? "";
-              rows.push(right ? `${left} ${right}` : left);
-            }
-          } else {
-            rows.push(...listRows);
-            if (drafts.length > visibleCount) {
-              rows.push(theme.fg("dim", truncateToWidth(`↑↓ scroll · ${start + 1}-${Math.min(drafts.length, start + visibleCount)}/${drafts.length}`, inner, "…")));
-            }
-            rows.push("─".repeat(inner));
-            const md = new Markdown(preview, 0, 0, markdownTheme);
-            const rendered = md.render(previewWidth).slice(0, Math.max(1, overlayMax - listRows.length - 6));
-            rows.push(...rendered);
-          }
-
-          rows.push("─".repeat(inner));
-          rows.push(theme.fg("dim", truncateToWidth(
-            wide ? "↑↓ select · Enter restore · Esc cancel" : "↑↓ select · Enter restore · Esc cancel",
-            inner, "…",
-          )));
-          if (loadingPreview) rows.push(theme.fg("dim", "loading preview…"));
-          return frameBox(rows, safeWidth, theme);
-        },
-
-        handleInput(data: string): void {
-          if (matchesKey(data, Key.up)) {
-            selected = Math.max(0, selected - 1);
-            void refreshPreview();
-            tui.requestRender();
-            return;
-          }
-          if (matchesKey(data, Key.down)) {
-            selected = Math.min(drafts.length - 1, selected + 1);
-            void refreshPreview();
-            tui.requestRender();
-            return;
-          }
-          if (matchesKey(data, Key.enter)) {
-            finish({ action: "restore", selected: drafts[selected] });
-            return;
-          }
-          if (matchesKey(data, Key.escape)) {
-            finish({ action: "cancel" });
-            return;
-          }
-          tui.requestRender();
-        },
-
-        invalidate(): void {},
-        dispose(): void {
-          finish({ action: "cancel" });
-        },
-      };
+  const controller: OverlayController<RenderRollbackOverlayResult> = {
+    attach(h) {
+      host = h;
+      if (pendingResult) h.close(pendingResult);
     },
+    dispose() {
+      finish({ action: "cancel" });
+    },
+    render(w, h, theme) {
+      const inner = Math.max(1, w);
+      const wide = inner >= WIDE_THRESHOLD;
+      const listWidth = wide ? Math.min(38, Math.floor(inner * 0.4)) : inner;
+      const previewWidth = wide ? Math.max(1, inner - listWidth - 1) : inner;
+      const rows: Frame = [];
+
+      if (drafts.length === 0) {
+        rows.push(line("No archived drafts available for rollback.", "warning"));
+        return rows;
+      }
+
+      const markdownTheme = theme ? buildMarkdownTheme(theme) : undefined;
+      const renderPreview = (width: number, budget: number): Frame => {
+        if (!markdownTheme || budget <= 0) return [];
+        const md = new Markdown(preview, 0, 0, markdownTheme);
+        return md.render(width).slice(0, budget).map(ansiToSpans);
+      };
+
+      // Body rows: list (+scroll info) + separator + preview + loading marker.
+      const listBudget = Math.max(1, h - 2);
+      const start = visibleStart(selected, drafts.length, listBudget);
+      const visibleCount = Math.min(drafts.length - start, listBudget);
+      const listRows: Frame = drafts.slice(start, start + visibleCount).map((entry, offset) => {
+        const isSelected = start + offset === selected;
+        const label = `${isSelected ? "›" : " "} r${entry.revision} · ${entry.archivedAt.slice(0, 15)} · ${entry.checksum.slice(0, 8)}`;
+        return [span(label, isSelected ? "selected" : "text", isSelected)];
+      });
+
+      if (wide) {
+        const rendered = renderPreview(previewWidth, h);
+        const count = Math.max(listRows.length, rendered.length);
+        for (let index = 0; index < count; index++) {
+          const left = listRows[index] ?? [span("")];
+          const right = rendered[index];
+          if (right) {
+            rows.push([...left, span(" ".repeat(Math.max(1, listWidth - rowTextWidth(left) + 1))), ...right]);
+          } else {
+            rows.push(left);
+          }
+        }
+      } else {
+        rows.push(...listRows);
+        if (drafts.length > visibleCount) {
+          rows.push(line(
+            `↑↓ scroll · ${start + 1}-${Math.min(drafts.length, start + visibleCount)}/${drafts.length}`,
+            "dim",
+          ));
+        }
+        rows.push(line("─".repeat(inner), "dim"));
+        const previewBudget = Math.max(0, h - rows.length - (loadingPreview ? 1 : 0));
+        rows.push(...renderPreview(previewWidth, previewBudget));
+      }
+
+      if (loadingPreview) rows.push(line("loading preview…", "dim"));
+      return rows;
+    },
+    handleKey(data, keys) {
+      if (keys.up(data)) {
+        selected = Math.max(0, selected - 1);
+        void refreshPreview();
+        return true;
+      }
+      if (keys.down(data)) {
+        selected = Math.min(drafts.length - 1, selected + 1);
+        void refreshPreview();
+        return true;
+      }
+      if (keys.confirm(data)) {
+        finish({ action: "restore", selected: drafts[selected] });
+        return true;
+      }
+      if (keys.cancel(data)) {
+        finish({ action: "cancel" });
+        return true;
+      }
+      return false;
+    },
+  };
+
+  const result = await openOverlay<RenderRollbackOverlayResult>(
+    ctx,
     {
-      overlay: true,
-      overlayOptions: {
-        width: "92%",
-        minWidth: 40,
-        maxHeight: "90%" as const,
-        anchor: "center" as const,
+      kind: "card",
+      title: `Rollback to draft version · ${drafts.length} archived`,
+      width: "92%",
+      minWidth: 40,
+      maxHeight: "90%",
+      anchor: "center",
+      hints: [
+        { key: "↑↓", verb: "select" },
+        { key: "Enter", verb: "restore" },
+        { key: "Esc", verb: "cancel" },
+      ],
+    },
+    controller,
+    {
+      utils: {
+        measure: visibleWidth,
+        clip: (text, width, ellipsis) => truncateToWidth(text, width, ellipsis),
       },
+      glyphs: resolveGlyphs("nerd"),
+      matchesKey: (data, keyId) => matchesKey(data, keyId as KeyId),
     },
   );
 
   return result ?? { action: "cancel" };
 }
 
-function padToWidth(value: string, width: number): string {
-  const current = visibleWidth(value);
-  return current >= width ? value : `${value}${" ".repeat(width - current)}`;
+function visibleStart(selected: number, length: number, maxVisible: number): number {
+  if (length <= maxVisible) return 0;
+  return Math.min(Math.max(0, selected - maxVisible + 1), length - maxVisible);
 }
 
-function frameBox(
-  rows: string[],
-  width: number,
-  theme: { fg(name: string, text: string): string },
-): string[] {
-  return makeBorderFrame(rows, width, FRAME_GLYPHS, FRAME_UTILS, {
-    theme,
-    borderColor: "dim",
-  });
+function rowTextWidth(row: readonly { text: string }[]): number {
+  let w = 0;
+  for (const s of row) w += visibleWidth(s.text);
+  return w;
+}
+
+function buildMarkdownTheme(theme: OverlayTheme): MarkdownTheme {
+  return {
+    heading: (text) => theme.fg("accent", theme.bold ? theme.bold(text) : text),
+    link: (text) => theme.fg("accent", text),
+    linkUrl: (text) => theme.fg("dim", text),
+    code: (text) => theme.fg("warning", text),
+    codeBlock: (text) => text,
+    codeBlockBorder: (text) => theme.fg("dim", text),
+    quote: (text) => text,
+    quoteBorder: (text) => theme.fg("dim", text),
+    hr: (text) => theme.fg("dim", text),
+    listBullet: (text) => theme.fg("accent", text),
+    bold: (text) => theme.bold ? theme.bold(text) : theme.fg("text", text),
+    italic: (text) => text,
+    strikethrough: (text) => theme.fg("dim", text),
+    underline: (text) => text,
+  };
 }

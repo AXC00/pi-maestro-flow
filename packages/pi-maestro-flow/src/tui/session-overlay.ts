@@ -1,5 +1,5 @@
 import { Key, type Component, type Focusable, matchesKey, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
-import { makeBorderFrame, resolveGlyphs } from "pi-maestro-settings-core/ui";
+import { makeBorderFrame, resolveGlyphs, type OverlayTheme } from "pi-maestro-settings-core/ui";
 import {
   type WorkflowRunView,
   type WorkflowViewModel,
@@ -19,6 +19,10 @@ export interface SessionOverlayParams {
   requestRender: () => void;
   close: () => void;
   onAction: (action: SessionOverlayAction, runId?: string) => void | Promise<void>;
+  /** Theme for role colors; when absent the overlay renders unstyled. */
+  theme?: OverlayTheme;
+  /** Terminal row budget for list/detail bodies (ui-conventions-006). */
+  getTerminalRows?: () => number | undefined;
 }
 
 type OverlayMode = "list" | "detail" | "confirm";
@@ -117,14 +121,21 @@ export class SessionOverlay implements Component, Focusable {
     if (this.view.runs.length === 0) {
       rows.push(fitLine("○ pending · no runs", inner));
     } else {
-      const start = Math.max(0, Math.min(this.selected - 3, this.view.runs.length - 7));
-      for (let index = start; index < Math.min(this.view.runs.length, start + 7); index++) {
+      // ui-conventions-006: the window follows the terminal-height budget
+      // (90% maxHeight minus chrome), not a fixed row count.
+      const budget = this.bodyBudget();
+      const total = this.view.runs.length;
+      const window = Math.min(total, budget);
+      const start = Math.max(0, Math.min(this.selected - Math.floor(window / 2), total - window));
+      for (let index = start; index < start + window; index++) {
         rows.push(this.renderRunRow(this.view.runs[index], index === this.selected, inner));
       }
+      const hidden = total - window;
+      if (hidden > 0) rows.push(fitLine(this.paint("dim", `${hidden} more`), inner));
     }
     if (this.status) rows.push(fitLine(this.status, inner));
     rows.push(fitSegments(inner, this.controlSegments("Esc close")));
-    return frame(rows, width);
+    return frame(rows, width, this.params.theme);
   }
 
   private renderDetail(width: number): string[] {
@@ -144,7 +155,7 @@ export class SessionOverlay implements Component, Focusable {
     const knowledge = this.view.knowledge;
     if (knowledge) {
       rows.push(rule(inner));
-      const review = knowledge.reviewRequired > 0 ? ` · ${fg("33", `${knowledge.reviewRequired} review`)}` : "";
+      const review = knowledge.reviewRequired > 0 ? ` · ${this.paint("warning", `${knowledge.reviewRequired} review`)}` : "";
       rows.push(fitLine(
         `Knowledge: consumed ${knowledge.consumed} · cited ${knowledge.cited} · `
         + `validated ${knowledge.validated} · contradicted ${knowledge.contradicted}`,
@@ -166,7 +177,7 @@ export class SessionOverlay implements Component, Focusable {
         .join(" · ");
       if (sourceLine) rows.push(fitLine(`Attribution: ${sourceLine}`, inner));
       if (knowledge.inputs.length > 0) {
-        rows.push(fitLine(fg("2", "Recent attribution (newest first):"), inner));
+        rows.push(fitLine(this.paint("dim", "Recent attribution (newest first):"), inner));
         for (const input of knowledge.inputs.slice(0, 5)) {
           const shortRun = input.runId.length > 18 ? `${input.runId.slice(0, 15)}…` : input.runId;
           rows.push(fitLine(
@@ -178,7 +189,17 @@ export class SessionOverlay implements Component, Focusable {
     }
     if (this.status) rows.push(fitLine(this.status, inner));
     rows.push(fitSegments(inner, this.controlSegments("Esc back")));
-    return frame(rows, width);
+    return frame(rows, width, this.params.theme);
+  }
+
+  private paint(role: string, text: string): string {
+    return this.params.theme ? this.params.theme.fg(role, text) : text;
+  }
+
+  /** Row budget for the run list inside the 90%-height overlay chrome. */
+  private bodyBudget(): number {
+    const rows = this.params.getTerminalRows?.() ?? process.stdout?.rows ?? 24;
+    return Math.max(3, Math.floor(rows * 0.9) - 6);
   }
 
   private renderConfirm(width: number): string[] {
@@ -188,7 +209,7 @@ export class SessionOverlay implements Component, Focusable {
       fitLine(`✓ Complete ${run?.id ?? "session"}?`, inner),
       fitLine("Enter confirm · Esc back", inner),
     ];
-    return frame(rows, width);
+    return frame(rows, width, this.params.theme);
   }
 
   private renderRunRow(run: WorkflowRunView, selected: boolean, width: number): string {
@@ -278,14 +299,12 @@ function rule(width: number): string {
   return "─".repeat(Math.max(1, width));
 }
 
-function fg(code: string, text: string): string {
-  if (!code) return text;
-  return `\x1b[${code}m${text}\x1b[0m`;
-}
-
-function frame(rows: readonly string[], width: number): string[] {
+function frame(rows: readonly string[], width: number, theme?: OverlayTheme): string[] {
   if (width < 3) return rows.map((row) => fitLine(row, width));
-  return makeBorderFrame(rows, width, FRAME_GLYPHS, FRAME_UTILS);
+  return makeBorderFrame(rows, width, FRAME_GLYPHS, FRAME_UTILS, {
+    theme,
+    borderColor: "borderMuted",
+  });
 }
 
 function errorMessage(error: unknown): string {

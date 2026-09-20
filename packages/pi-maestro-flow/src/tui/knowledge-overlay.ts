@@ -7,7 +7,7 @@ import {
   truncateToWidth,
   visibleWidth,
 } from "@earendil-works/pi-tui";
-import { makeBorderFrame, resolveGlyphs } from "pi-maestro-settings-core/ui";
+import { makeBorderFrame, resolveGlyphs, type OverlayTheme } from "pi-maestro-settings-core/ui";
 import {
   BracketedPasteDecoder,
   removeLastGrapheme,
@@ -45,6 +45,8 @@ export interface KnowledgeOverlayParams {
   requestRender: () => void;
   close: () => void;
   onAction: (action: KnowledgeOverlayAction) => void | Promise<void>;
+  /** Theme for role colors; when absent the overlay renders unstyled. */
+  theme?: OverlayTheme;
 }
 
 type OverlayMode =
@@ -132,13 +134,13 @@ export class KnowledgeOverlay implements Component, Focusable {
       case "resolve-choice":
         return this.renderChoice(safeWidth, `Resolve ${this.selectedSummary()?.candidate.candidate_id ?? "candidate"}`, this.resolveChoices, this.resolveChoiceIndex);
       case "resolve-reason":
-        return this.renderReason(safeWidth, `Resolve as ${fg("36", this.resolveAs ?? "?")}`, this.resolveTargetLabel());
+        return this.renderReason(safeWidth, `Resolve as ${this.fg("36", this.resolveAs ?? "?")}`, this.resolveTargetLabel());
       case "batch-scope":
         return this.renderBatchScope(safeWidth);
       case "batch-as":
         return this.renderChoice(safeWidth, `Batch resolve ${this.batchIds.length} candidate(s)`, BATCH_AS_CHOICES, this.batchAsIndex);
       case "batch-reason":
-        return this.renderReason(safeWidth, `Batch resolve as ${fg("36", this.batchAs ?? "?")}`, `${this.batchIds.length} candidate(s)`);
+        return this.renderReason(safeWidth, `Batch resolve as ${this.fg("36", this.batchAs ?? "?")}`, `${this.batchIds.length} candidate(s)`);
       case "confirm":
         return this.renderConfirm(safeWidth);
       default:
@@ -462,7 +464,7 @@ export class KnowledgeOverlay implements Component, Focusable {
     const inner = width - 2;
     const { counts } = this.view;
     const header = this.view.sessionId ? `Knowledge · ${this.view.sessionId}` : "Knowledge center";
-    const orderTag = this.triage ? fg("36", "triage") : fg("2", "severity");
+    const orderTag = this.triage ? this.fg("36", "triage") : this.fg("2", "severity");
     const rows = [
       fitLine(`${header} · order: ${orderTag}`, inner),
       fitLine(
@@ -474,7 +476,7 @@ export class KnowledgeOverlay implements Component, Focusable {
     ];
     const list = this.activeCandidates();
     if (this.view.error) {
-      rows.push(fitLine(fg("31", `Error: ${this.view.error}`), inner));
+      rows.push(fitLine(this.fg("31", `Error: ${this.view.error}`), inner));
     } else if (list.length === 0) {
       rows.push(fitLine("○ no pending candidates", inner));
     } else {
@@ -486,17 +488,17 @@ export class KnowledgeOverlay implements Component, Focusable {
     rows.push(this.renderHealthStrip(inner));
     if (this.status) rows.push(fitLine(this.status, inner));
     rows.push(fitSegments(inner, ["Enter detail", "t order", "B batch", "P promote-all", "a health", "r refresh", "Esc close"]));
-    return frame(rows, width);
+    return frame(rows, width, this.params.theme);
   }
 
   private renderCandidateRow(summary: CandidateSummary, selected: boolean, width: number): string {
     const marker = selected ? "›" : " ";
-    const glyph = fg(SEVERITY_COLOR[summary.severity], SEVERITY_GLYPH[summary.severity]);
-    const disposition = fg(SEVERITY_COLOR[summary.severity], dispositionLabel(summary.disposition).padEnd(9, " "));
-    const freshness = freshnessTag(summary.freshness);
-    const stage = summary.candidate.stage === "corroborated" ? fg("36", "◆") : fg("2", "◇");
-    const stale = summary.staleObserved ? fg("33", "⏰") : "";
-    const age = summary.ageDays >= 1 ? fg("2", `${Math.floor(summary.ageDays)}d`) : "";
+    const glyph = this.fg(SEVERITY_COLOR[summary.severity], SEVERITY_GLYPH[summary.severity]);
+    const disposition = this.fg(SEVERITY_COLOR[summary.severity], dispositionLabel(summary.disposition).padEnd(9, " "));
+    const freshness = this.freshnessTag(summary.freshness);
+    const stage = summary.candidate.stage === "corroborated" ? this.fg("36", "◆") : this.fg("2", "◇");
+    const stale = summary.staleObserved ? this.fg("33", "⏰") : "";
+    const age = summary.ageDays >= 1 ? this.fg("2", `${Math.floor(summary.ageDays)}d`) : "";
     const title = `${stage}${stale} ${summary.candidate.title}`;
     const prefix = `${marker} ${glyph} ${disposition} ${freshness} ${age} `.replace("  ", " ");
     const budget = Math.max(1, width - visibleWidth(prefix));
@@ -505,16 +507,16 @@ export class KnowledgeOverlay implements Component, Focusable {
 
   private renderHealthStrip(width: number): string {
     const health = this.view.health;
-    if (!health) return fitLine(fg("2", "health: unavailable (a)"), width);
+    if (!health) return fitLine(this.fg("2", "health: unavailable (a)"), width);
     const spec = health.spec;
     const parts = [
       `spec ${spec.active}/${spec.total}`,
       spec.deprecated > 0 ? `dep ${spec.deprecated}` : "",
-      spec.contested > 0 ? fg("31", `contested ${spec.contested}`) : "",
-      spec.stale > 0 ? fg("33", `stale ${spec.stale}`) : "",
+      spec.contested > 0 ? this.fg("31", `contested ${spec.contested}`) : "",
+      spec.stale > 0 ? this.fg("33", `stale ${spec.stale}`) : "",
       `knowhow ${health.knowhow.active}/${health.knowhow.total}`,
     ].filter(Boolean);
-    return fitLine(fg("2", "▪ ") + parts.join(" · "), width);
+    return fitLine(this.fg("2", "▪ ") + parts.join(" · "), width);
   }
 
   private renderDetail(width: number): string[] {
@@ -524,35 +526,35 @@ export class KnowledgeOverlay implements Component, Focusable {
     if (!summary) {
       rows.push(fitLine("○ no candidate selected", inner));
       rows.push(fitSegments(inner, ["Esc back"]));
-      return frame(rows, width);
+      return frame(rows, width, this.params.theme);
     }
     const candidate = summary.candidate;
-    rows.push(fitLine(fg("1", candidate.title), inner));
+    rows.push(fitLine(this.fg("1", candidate.title), inner));
     rows.push(fitLine(
       `${actionLabel(candidate)} · ${candidate.status} · ${candidate.stage} · ×${candidate.occurrences} · ${Math.floor(summary.ageDays)}d old`,
       inner,
     ));
     rows.push(fitLine(
-      `disposition: ${fg(SEVERITY_COLOR[summary.severity], dispositionLabel(summary.disposition))} · `
-      + `eligibility: ${eligibilityLabel(summary.eligibility)} · freshness: ${freshnessTag(summary.freshness)}`,
+      `disposition: ${this.fg(SEVERITY_COLOR[summary.severity], dispositionLabel(summary.disposition))} · `
+      + `eligibility: ${eligibilityLabel(summary.eligibility)} · freshness: ${this.freshnessTag(summary.freshness)}`,
       inner,
     ));
     if (summary.candidate.review.blocked_reason) {
-      rows.push(fitLine(fg("35", `blocked: ${summary.candidate.review.blocked_reason}`), inner));
+      rows.push(fitLine(this.fg("35", `blocked: ${summary.candidate.review.blocked_reason}`), inner));
     }
-    if (summary.staleObserved) rows.push(fitLine(fg("33", "⏰ stale observed-only candidate"), inner));
+    if (summary.staleObserved) rows.push(fitLine(this.fg("33", "⏰ stale observed-only candidate"), inner));
     if (summary.canonicalId) rows.push(fitLine(`canonical: ${summary.canonicalId}`, inner));
     rows.push(rule(inner));
 
     const matches = candidate.reconciliation?.matches.slice(0, MAX_MATCHES) ?? [];
     if (matches.length === 0) {
-      rows.push(fitLine(fg("2", "no reconciliation matches"), inner));
+      rows.push(fitLine(this.fg("2", "no reconciliation matches"), inner));
     } else {
       for (const match of matches) rows.push(...this.renderMatch(match, inner));
     }
 
     const block = promoteBlockReason(summary);
-    if (block) rows.push(fitLine(fg("33", `promote: ${block}`), inner));
+    if (block) rows.push(fitLine(this.fg("33", `promote: ${block}`), inner));
 
     if (this.status) rows.push(fitLine(this.status, inner));
     const controls = ["Esc back", "r refresh"];
@@ -560,27 +562,27 @@ export class KnowledgeOverlay implements Component, Focusable {
     if (canPromote(summary)) controls.splice(controls.length - 1, 0, "p promote");
     controls.splice(controls.length - 1, 0, "P promote-all");
     rows.push(fitSegments(inner, controls));
-    return frame(rows, width);
+    return frame(rows, width, this.params.theme);
   }
 
   private renderMatch(match: KnowledgeReconciliationMatch, width: number): string[] {
     const score = match.scores.composite.toFixed(2);
-    const head = `${fg("33", match.relation)} → ${match.knowledge_id} (${score})`;
-    const rows = [fitLine(head, width), fitLine(fg("2", `   ${match.title}`), width)];
+    const head = `${this.fg("33", match.relation)} → ${match.knowledge_id} (${score})`;
+    const rows = [fitLine(head, width), fitLine(this.fg("2", `   ${match.title}`), width)];
     const evidence = match.evidence[0];
-    if (evidence) rows.push(fitLine(fg("2", `   ${evidence}`), width));
+    if (evidence) rows.push(fitLine(this.fg("2", `   ${evidence}`), width));
     return rows;
   }
 
   private renderChoice(width: number, title: string, choices: readonly string[], selectedIndex: number): string[] {
     const inner = width - 2;
-    const rows = [fitLine(title, inner), fitLine(fg("2", "choose:"), inner), rule(inner)];
+    const rows = [fitLine(title, inner), fitLine(this.fg("2", "choose:"), inner), rule(inner)];
     choices.forEach((choice, index) => {
       const marker = index === selectedIndex ? "›" : " ";
-      rows.push(fitLine(`${marker} ${fg("36", String(index + 1))} ${choice}`, inner));
+      rows.push(fitLine(`${marker} ${this.fg("36", String(index + 1))} ${choice}`, inner));
     });
     rows.push(fitSegments(inner, ["Enter select", "Esc back"]));
-    return frame(rows, width);
+    return frame(rows, width, this.params.theme);
   }
 
   private renderReason(width: number, title: string, targetLabel: string): string[] {
@@ -589,12 +591,12 @@ export class KnowledgeOverlay implements Component, Focusable {
       fitLine(title, inner),
       fitLine(`target: ${targetLabel}`, inner),
       rule(inner),
-      fitLine(fg("2", "reason (evidence-backed):"), inner),
+      fitLine(this.fg("2", "reason (evidence-backed):"), inner),
       fitLine(`${this.reasonText}▏`, inner),
     ];
-    if (this.status) rows.push(fitLine(fg("33", this.status), inner));
+    if (this.status) rows.push(fitLine(this.fg("33", this.status), inner));
     rows.push(fitSegments(inner, ["Enter confirm", "Esc back"]));
-    return frame(rows, width);
+    return frame(rows, width, this.params.theme);
   }
 
   private renderBatchScope(width: number): string[] {
@@ -602,24 +604,24 @@ export class KnowledgeOverlay implements Component, Focusable {
     const rows = [fitLine("Batch resolve — choose scope", inner), rule(inner)];
     this.batchScopeChoices.forEach((choice, index) => {
       const marker = index === this.batchScopeIndex ? "›" : " ";
-      rows.push(fitLine(`${marker} ${fg("36", String(index + 1))} ${choice.label}`, inner));
+      rows.push(fitLine(`${marker} ${this.fg("36", String(index + 1))} ${choice.label}`, inner));
     });
-    if (this.status) rows.push(fitLine(fg("33", this.status), inner));
+    if (this.status) rows.push(fitLine(this.fg("33", this.status), inner));
     rows.push(fitSegments(inner, ["Enter select", "Esc back"]));
-    return frame(rows, width);
+    return frame(rows, width, this.params.theme);
   }
 
   private renderConfirm(width: number): string[] {
     const inner = width - 2;
-    const rows = [fitLine(fg("33", `✓ ${this.confirmLabel}`), inner)];
+    const rows = [fitLine(this.fg("33", `✓ ${this.confirmLabel}`), inner)];
     for (const line of this.confirmPreview.slice(0, MAX_CONFIRM_PREVIEW)) {
-      rows.push(fitLine(fg("2", `  ${line}`), inner));
+      rows.push(fitLine(this.fg("2", `  ${line}`), inner));
     }
     if (this.confirmPreview.length > MAX_CONFIRM_PREVIEW) {
-      rows.push(fitLine(fg("2", `  …+${this.confirmPreview.length - MAX_CONFIRM_PREVIEW} more`), inner));
+      rows.push(fitLine(this.fg("2", `  …+${this.confirmPreview.length - MAX_CONFIRM_PREVIEW} more`), inner));
     }
     rows.push(fitLine("Enter confirm · Esc back", inner));
-    return frame(rows, width);
+    return frame(rows, width, this.params.theme);
   }
 
   private renderHealth(width: number): string[] {
@@ -627,10 +629,10 @@ export class KnowledgeOverlay implements Component, Focusable {
     const rows = [fitLine("Knowledge health", inner), rule(inner)];
     const health = this.view.health;
     if (!health) {
-      rows.push(fitLine(fg("2", "health unavailable — run: maestro knowledge audit --scope all"), inner));
+      rows.push(fitLine(this.fg("2", "health unavailable — run: maestro knowledge audit --scope all"), inner));
     } else {
       const spec = health.spec;
-      rows.push(fitLine(fg("1", "Spec"), inner));
+      rows.push(fitLine(this.fg("1", "Spec"), inner));
       rows.push(fitLine(
         `  active ${spec.active}/${spec.total} · deprecated ${spec.deprecated} · contested ${spec.contested} · stale ${spec.stale}`,
         inner,
@@ -640,7 +642,7 @@ export class KnowledgeOverlay implements Component, Focusable {
         inner,
       ));
       const knowhow = health.knowhow;
-      rows.push(fitLine(fg("1", "Knowhow"), inner));
+      rows.push(fitLine(this.fg("1", "Knowhow"), inner));
       rows.push(fitLine(
         `  active ${knowhow.active}/${knowhow.total} · deprecated ${knowhow.deprecated} · invalid ${knowhow.invalid}`,
         inner,
@@ -652,32 +654,32 @@ export class KnowledgeOverlay implements Component, Focusable {
       ));
       if (health.bySource.length > 0) {
         rows.push(rule(inner));
-        rows.push(fitLine(fg("1", "Exposure by source (impressions)"), inner));
+        rows.push(fitLine(this.fg("1", "Exposure by source (impressions)"), inner));
         const max = Math.max(...health.bySource.map((entry) => entry.impressions), 1);
         const barWidth = Math.max(6, Math.min(24, inner - 22));
         for (const entry of health.bySource) {
           const filled = Math.round((entry.impressions / max) * barWidth);
-          const bar = fg("36", "█".repeat(filled)) + fg("2", "░".repeat(Math.max(0, barWidth - filled)));
+          const bar = this.fg("36", "█".repeat(filled)) + this.fg("2", "░".repeat(Math.max(0, barWidth - filled)));
           rows.push(fitLine(`${entry.sourceType.padEnd(9, " ")} ${bar} ${entry.impressions}`, inner));
         }
       }
       if (health.findings.length > 0) {
         rows.push(rule(inner));
         for (const finding of health.findings.slice(0, 4)) {
-          rows.push(fitLine(`${fg("33", finding.severity)} ${finding.message}`, inner));
+          rows.push(fitLine(`${this.fg("33", finding.severity)} ${finding.message}`, inner));
         }
       }
       if (this.view.upstreamAdvisories.length > 0) {
         rows.push(rule(inner));
-        rows.push(fitLine(fg("1", "Maestro2 upstream advisories"), inner));
+        rows.push(fitLine(this.fg("1", "Maestro2 upstream advisories"), inner));
         for (const advisory of this.view.upstreamAdvisories) {
-          rows.push(fitLine(`${fg("33", advisory.id)} ${advisory.message}`, inner));
+          rows.push(fitLine(`${this.fg("33", advisory.id)} ${advisory.message}`, inner));
         }
       }
     }
     if (this.status) rows.push(fitLine(this.status, inner));
     rows.push(fitSegments(inner, ["a back", "r refresh", "Esc close"]));
-    return frame(rows, width);
+    return frame(rows, width, this.params.theme);
   }
 
   private activeCandidates(): CandidateSummary[] {
@@ -716,19 +718,34 @@ export class KnowledgeOverlay implements Component, Focusable {
       this.params.requestRender();
     }
   }
+
+  private freshnessTag(freshness: "fresh" | "stale" | "missing" | "blocked"): string {
+    if (freshness === "blocked") return this.fg("35", "blocked");
+    if (freshness === "missing") return this.fg("31", "missing");
+    if (freshness === "stale") return this.fg("33", "stale");
+    return this.fg("32", "fresh");
+  }
+
+  /** Legacy numeric code → semantic role → theme slot. */
+  private fg(code: string, text: string): string {
+    const theme = this.params.theme;
+    if (!theme || !code) return text;
+    const role = CODE_ROLE[code];
+    if (role === "bold") return theme.bold ? theme.bold(text) : theme.fg("text", text);
+    return theme.fg(role ?? "text", text);
+  }
 }
 
-function freshnessTag(freshness: "fresh" | "stale" | "missing" | "blocked"): string {
-  if (freshness === "blocked") return fg("35", "blocked");
-  if (freshness === "missing") return fg("31", "missing");
-  if (freshness === "stale") return fg("33", "stale");
-  return fg("32", "fresh");
-}
-
-function fg(code: string, text: string): string {
-  if (!code) return text;
-  return `\x1b[${code}m${text}\x1b[0m`;
-}
+const CODE_ROLE: Record<string, string> = {
+  "1": "bold",
+  "2": "dim",
+  "31": "error",
+  "32": "success",
+  "33": "warning",
+  "34": "muted",
+  "35": "accent",
+  "36": "accent",
+};
 
 function isEnter(data: string): boolean {
   return matchesKey(data, Key.enter);
@@ -762,9 +779,12 @@ function rule(width: number): string {
   return "─".repeat(Math.max(1, width));
 }
 
-function frame(rows: readonly string[], width: number): string[] {
+function frame(rows: readonly string[], width: number, theme?: OverlayTheme): string[] {
   if (width < 3) return rows.map((row) => fitLine(row, width));
-  return makeBorderFrame(rows, width, FRAME_GLYPHS, FRAME_UTILS);
+  return makeBorderFrame(rows, width, FRAME_GLYPHS, FRAME_UTILS, {
+    theme,
+    borderColor: "borderMuted",
+  });
 }
 
 function errorMessage(error: unknown): string {

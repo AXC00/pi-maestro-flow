@@ -483,7 +483,7 @@ test("independent SSH extension binds #ssh selection to a hostless tool without 
       result: typeof result,
       options: { expanded: boolean; isPartial: boolean },
       theme: typeof renderTheme,
-      context: { args: { command: string } },
+      context: { args: { command: string }; isError?: boolean },
     ) => { render(width: number): string[] };
     assert.deepEqual(renderResult(
       result,
@@ -492,6 +492,21 @@ test("independent SSH extension binds #ssh selection to a hostless tool without 
       { args: { command: "uname -a" } },
     ).render(240), [
       "  ✓ ssh Production · deploy@192.0.2.10:22 · bash · uname -a · exit 0 · 1ms",
+    ]);
+
+    // A rejected tool call (e.g. schema validation failure) carries no details;
+    // context.isError must still render it as a failure, not "exit unknown".
+    const rejectedResult = {
+      content: [{ type: "text" as const, text: "Validation failed for tool \"ssh\"" }],
+      details: {},
+    };
+    assert.deepEqual(renderResult(
+      rejectedResult as unknown as typeof result,
+      { expanded: false, isPartial: false },
+      renderTheme,
+      { args: {} as unknown as { command: string }, isError: true },
+    ).render(240), [
+      "  ✕ ssh Production · deploy@192.0.2.10:22 · bash · failed",
     ]);
 
     const start = handlers.get("session_start")![0]!;

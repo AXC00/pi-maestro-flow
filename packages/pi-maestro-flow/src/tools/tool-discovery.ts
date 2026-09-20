@@ -38,18 +38,39 @@ export interface ToolSearchResult {
 }
 
 export function toDiscoverableTool(tool: ToolInfo): DiscoverableTool {
-  const parameters = tool.parameters as { properties?: unknown } | undefined;
-  const properties = parameters?.properties;
-  const schemaKeys = properties && typeof properties === "object" && !Array.isArray(properties)
-    ? Object.keys(properties as Record<string, unknown>).sort()
-    : [];
   return {
     name: tool.name,
     label: titleFromName(tool.name),
     summary: summarize(tool.description),
     description: tool.description,
-    schemaKeys,
+    schemaKeys: collectSchemaKeys(tool.parameters),
   };
+}
+
+/**
+ * Collects top-level parameter names from a tool schema. Union schemas
+ * (anyOf/oneOf/allOf) have no top-level properties, so variant properties are
+ * merged recursively; nested value schemas (items, property subschemas) are
+ * intentionally not traversed.
+ */
+function collectSchemaKeys(schema: unknown): string[] {
+  const keys = new Set<string>();
+  const visit = (node: unknown): void => {
+    if (typeof node !== "object" || node === null || Array.isArray(node)) return;
+    const record = node as Record<string, unknown>;
+    const properties = record.properties;
+    if (properties && typeof properties === "object" && !Array.isArray(properties)) {
+      for (const key of Object.keys(properties)) keys.add(key);
+    }
+    for (const keyword of ["anyOf", "oneOf", "allOf"] as const) {
+      const variants = record[keyword];
+      if (Array.isArray(variants)) {
+        for (const variant of variants) visit(variant);
+      }
+    }
+  };
+  visit(schema);
+  return [...keys].sort();
 }
 
 export function buildToolSearchIndex(tools: Iterable<DiscoverableTool>): ToolSearchIndex {

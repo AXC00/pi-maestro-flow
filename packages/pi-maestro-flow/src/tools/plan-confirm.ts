@@ -60,6 +60,8 @@ export interface PlanConfirmationOptions {
   defaultExecution?: PlanExecutionChoice;
   workflow?: PlanWorkflowConfirmationOptions;
   modelTransition?: PlanConfirmationModelTransition;
+  /** Candidate decision documents detected for this Plan (workspace-relative paths). */
+  decisionDocuments?: string[];
   signal?: AbortSignal;
   /** Archived draft revisions available for rollback. */
   drafts?: { revision: number; archivedAt: string; checksum: string }[];
@@ -75,6 +77,7 @@ type SelectionRow =
   | { kind: "backend" }
   | { kind: "target" }
   | { kind: "context" }
+  | { kind: "source" }
   | { kind: "action"; item: ActionItem };
 
 const CTRL_ENTER_SEQUENCES = new Set([
@@ -101,6 +104,11 @@ export async function openPlanConfirmation(
         && options.canCompactContext !== false
         ? "compact"
         : "current";
+      const decisionDocs = options.decisionDocuments ?? [];
+      let selectedSource: string | undefined = options.defaultExecution?.sourceDocument
+        && decisionDocs.includes(options.defaultExecution.sourceDocument)
+        ? options.defaultExecution.sourceDocument
+        : decisionDocs[0];
       const actions: ActionItem[] = [
         { action: "execute", label: "Execute", description: "Approve with the selected execution settings" },
         { action: "modify", label: "View / modify Plan", description: "Open the full-screen Markdown editor" },
@@ -122,6 +130,7 @@ export async function openPlanConfirmation(
         { kind: "backend" },
         ...(backend === "workflow" ? [{ kind: "target" } as const] : []),
         { kind: "context" },
+        ...(decisionDocs.length > 0 ? [{ kind: "source" } as const] : []),
         ...actions.map((item): SelectionRow => ({ kind: "action", item })),
       ];
 
@@ -135,9 +144,10 @@ export async function openPlanConfirmation(
       }
 
       function executionChoice(): PlanExecutionChoice {
-        return backend === "workflow"
+        const base = backend === "workflow"
           ? { backend, context: contextMode, workflowTarget }
           : { backend, context: contextMode };
+        return selectedSource ? { ...base, sourceDocument: selectedSource } : base;
       }
 
       let settled = false;
@@ -183,6 +193,12 @@ export async function openPlanConfirmation(
           contextMode = contextMode === "current" ? "compact" : "current";
           return;
         }
+        if (row.kind === "source") {
+          const choices: (string | undefined)[] = [undefined, ...decisionDocs];
+          const index = choices.indexOf(selectedSource);
+          selectedSource = choices[(index + direction + choices.length) % choices.length];
+          return;
+        }
       }
 
       function choose(row = rows()[selected]): void {
@@ -204,7 +220,7 @@ export async function openPlanConfirmation(
           const selectedRow = selectionRows[selected] ?? selectionRows[0]!;
           if (safeWidth < 24) {
             return [
-              truncateToWidth(`Plan confirm · ${selected + 1}/${selectionRows.length} ${rowLabel(selectedRow, actions, options, backend, workflowTarget, contextMode)}`, safeWidth, "…"),
+              truncateToWidth(`Plan confirm · ${selected + 1}/${selectionRows.length} ${rowLabel(selectedRow, actions, options, backend, workflowTarget, contextMode, selectedSource)}`, safeWidth, "…"),
               truncateToWidth(actionFooter(safeWidth, ["Esc exit", "Enter choose", "↑↓ navigate"]), safeWidth, "…"),
             ];
           }
@@ -245,7 +261,7 @@ export async function openPlanConfirmation(
           for (let index = 0; index < selectionRows.length; index++) {
             const row = selectionRows[index]!;
             const marker = index === selected ? "›" : " ";
-            const label = rowLabel(row, actions, options, backend, workflowTarget, contextMode);
+            const label = rowLabel(row, actions, options, backend, workflowTarget, contextMode, selectedSource);
             const description = innerWidth >= 76 ? `  ${theme.fg("dim", `— ${rowDescription(row, options)}`)}` : "";
             const line = `${marker} ${label}${description}`;
             rendered.push(index === selected
@@ -343,6 +359,7 @@ function isPlanConfirmationDecision(value: unknown): value is PlanConfirmationDe
   if (!execution || typeof execution !== "object" || Array.isArray(execution)) return false;
   const choice = execution as Record<string, unknown>;
   if (choice.context !== "current" && choice.context !== "compact") return false;
+  if (choice.sourceDocument !== undefined && typeof choice.sourceDocument !== "string") return false;
   if (choice.backend === "standalone") return true;
   return choice.backend === "workflow"
     && (choice.workflowTarget === "current" || choice.workflowTarget === "new");
@@ -377,6 +394,7 @@ function rowLabel(
   backend: PlanExecutionBackend,
   target: PlanWorkflowTarget,
   context: PlanExecutionContextMode,
+  source: string | undefined,
 ): string {
   if (row.kind === "backend") return `Execution  [${backend === "standalone" ? "Standalone" : "Workflow"}]`;
   if (row.kind === "target") {
@@ -385,6 +403,7 @@ function rowLabel(
     return `Workflow target  [Current: ${id}]`;
   }
   if (row.kind === "context") return `Context  [${context === "compact" ? "New Context" : "Current"}]`;
+  if (row.kind === "source") return `Decision doc  [${source ?? "none"}]`;
   const number = actions.findIndex((item) => item.action === row.item.action);
   const prefix = number >= 0 ? `${number + 1}. ` : "";
   return `${prefix}${row.item.label}`;
@@ -398,6 +417,7 @@ function rowDescription(row: SelectionRow, options: PlanConfirmationOptions): st
       : "Select the canonical Workflow Session target";
   }
   if (row.kind === "context") return "Save the Plan conversation as a checkpoint, then reset the same-session context deterministically";
+  if (row.kind === "source") return "Bind the decision document whose locked decisions this Plan implements";
   const actModel = options.modelTransition?.act;
   if (actModel && row.item.action === "execute") {
     return `Approve and restore the main model to ${actModel} before implementation`;

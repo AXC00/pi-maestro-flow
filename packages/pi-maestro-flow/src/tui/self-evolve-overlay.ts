@@ -21,7 +21,7 @@
 
 import { Key, matchesKey, type Component, type Focusable } from "@earendil-works/pi-tui";
 import type { Theme } from "@earendil-works/pi-coding-agent";
-import { fit, frame, headerLine, pad, rule } from "pi-cockpit/src/settings/ui-primitives.ts";
+import { fit, frame, headerLine, pad, rule } from "./ui-primitives.ts";
 import {
   SELF_EVOLVE_MODES,
   formatDurationMs,

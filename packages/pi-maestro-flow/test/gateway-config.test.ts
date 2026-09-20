@@ -48,6 +48,7 @@ test("Gateway config normalizes legacy snake-case sections and rejects invalid k
   assert.throws(() => normalizeGatewayConfig({ auth: { mode: "open", allow_open_mutations: "yes" } }), /allowOpenMutations must be boolean/);
   const openAiTunnel = normalizeGatewayConfig({ tunnels: { openai: {
     enabled: true,
+    auto_install: true,
     binary_path: "/opt/openai/tunnel-client",
     tunnel_id_env: "MY_TUNNEL_ID",
     runtime_key_env: "MY_RUNTIME_KEY",
@@ -56,12 +57,14 @@ test("Gateway config normalizes legacy snake-case sections and rejects invalid k
   } } }).tunnels.openai;
   assert.deepEqual(openAiTunnel, {
     enabled: true,
+    autoInstall: true,
     binaryPath: "/opt/openai/tunnel-client",
     tunnelIdEnv: "MY_TUNNEL_ID",
     runtimeKeyEnv: "MY_RUNTIME_KEY",
     minimumVersion: "0.0.14",
     credentialTtlMs: 60_000,
   });
+  assert.equal(normalizeGatewayConfig({}).tunnels.openai.autoInstall, false);
   assert.throws(() => normalizeGatewayConfig({ tunnels: { openai: { runtime_key: "literal-secret" } } }), /not a recognized field/);
   assert.throws(() => normalizeGatewayConfig({ tunnels: { openai: { runtime_key_env: "bad-name" } } }), /environment variable name/);
   const tunnelProfiles = normalizeGatewayConfig({
@@ -77,12 +80,13 @@ test("Gateway config normalizes legacy snake-case sections and rejects invalid k
   ]);
   const openAiProfile = normalizeGatewayConfig({
     auth: { mode: "oauth", oauth: { server_url: "https://openai.example.com" } },
-    tunnels: { profiles: [{ id: "openai-prod", provider: "openai", mode: "secure", enabled: true, public_url: "https://openai.example.com" }] },
+    tunnels: { profiles: [{ id: "openai-prod", provider: "openai", mode: "secure", enabled: true, public_url: "https://openai.example.com", auto_install: true }] },
   }).tunnels.profiles[0];
   assert.deepEqual(openAiProfile, {
     id: "openai-prod", provider: "openai", mode: "secure", lifecycle: "persistent", enabled: true,
-    publicUrl: "https://openai.example.com", tunnelIdEnv: "CONTROL_PLANE_TUNNEL_ID", runtimeKeyEnv: "CONTROL_PLANE_API_KEY", credentialTtlMs: 300_000,
+    publicUrl: "https://openai.example.com", tunnelIdEnv: "CONTROL_PLANE_TUNNEL_ID", runtimeKeyEnv: "CONTROL_PLANE_API_KEY", credentialTtlMs: 300_000, autoInstall: true,
   });
+  assert.throws(() => normalizeGatewayConfig({ tunnels: { profiles: [{ id: "bad-quick", provider: "cloudflare", mode: "quick", auto_install: true }] } }), /persistent-provider fields/);
   assert.throws(() => normalizeGatewayConfig({ tunnels: { profiles: [{ id: "bad", provider: "cloudflare", mode: "named", public_url: "https://mcp.example.com", tunnel_id: "prod", token: "literal-secret" }] } }), /not a recognized field/);
   assert.throws(() => normalizeGatewayConfig({ tunnels: { profiles: [{ id: "bad", provider: "cloudflare", mode: "named", public_url: "https://mcp.example.com", tunnel_id: "prod" }] } }), /exactly one/);
   assert.throws(() => normalizeGatewayConfig({ tunnels: { profiles: [{ id: "bad-quick", provider: "cloudflare", mode: "quick", runtime_key_env: "RUNTIME_KEY" }] } }), /persistent-provider fields/);

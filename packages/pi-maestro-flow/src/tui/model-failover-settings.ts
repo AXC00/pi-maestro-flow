@@ -14,7 +14,7 @@ import {
   pad,
   rule,
   type FrameTheme,
-} from "pi-cockpit/src/settings/ui-primitives.ts";
+} from "./ui-primitives.ts";
 import { getTuiLocale } from "./locale.ts";
 import type {
   ModelCircuitBreaker,

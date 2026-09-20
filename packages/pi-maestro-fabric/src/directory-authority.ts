@@ -6,6 +6,7 @@ export const FABRIC_DIRECTORY_RECORD_PERSISTED_ADVERTISEMENT: unique symbol = Sy
 export const FABRIC_DIRECTORY_PUBLISH_ADVERTISEMENT: unique symbol = Symbol("fabric-directory-publish-advertisement");
 export const FABRIC_DIRECTORY_WITHDRAW_ADVERTISEMENT: unique symbol = Symbol("fabric-directory-withdraw-advertisement");
 export const FABRIC_DIRECTORY_REGISTRY_AUTHORITY: unique symbol = Symbol("fabric-directory-registry-authority");
+export const FABRIC_DIRECTORY_REGISTER_PRESENCE: unique symbol = Symbol("fabric-directory-register-presence");
 
 export interface DirectoryAdvertisementAuthorityContext {
   connectionId: string;

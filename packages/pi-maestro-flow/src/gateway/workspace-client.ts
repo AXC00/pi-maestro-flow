@@ -289,6 +289,7 @@ export interface OpenAiTunnelStartOptions {
   binaryPath?: string;
   tunnelIdEnv: string;
   runtimeKeyEnv: string;
+  autoInstall?: boolean;
   timeoutMs?: number;
 }
 
@@ -302,6 +303,7 @@ export async function startOpenAiTunnel(options: OpenAiTunnelStartOptions): Prom
       experimental: true,
       localPort: options.localPort,
       ...(options.binaryPath ? { binaryPath: options.binaryPath } : {}),
+      ...(options.autoInstall === undefined ? {} : { autoInstall: options.autoInstall }),
       tunnelIdEnv: options.tunnelIdEnv,
       runtimeKeyEnv: options.runtimeKeyEnv,
     },
@@ -401,6 +403,7 @@ export interface GatewayConfigView {
   tunnels: {
     openai: {
       enabled: boolean;
+      autoInstall: boolean;
       binaryPath: string;
       tunnelIdEnv: string;
       runtimeKeyEnv: string;
@@ -434,6 +437,7 @@ export function readGatewayConfigView(): GatewayConfigView | undefined {
       tunnels: {
         openai: {
           enabled: config.tunnels.openai.enabled,
+          autoInstall: config.tunnels.openai.autoInstall,
           binaryPath: config.tunnels.openai.binaryPath ?? "",
           tunnelIdEnv: config.tunnels.openai.tunnelIdEnv,
           runtimeKeyEnv: config.tunnels.openai.runtimeKeyEnv,
@@ -507,6 +511,7 @@ export async function writeGatewayConfigChanges(changes: GatewayConfigChanges, t
 
   const openai: Record<string, unknown> = {};
   if (changes.openAiTunnelEnabled !== undefined) openai.enabled = changes.openAiTunnelEnabled;
+  if (changes.openAiAutoInstall !== undefined) openai.auto_install = changes.openAiAutoInstall;
   if (changes.openAiTunnelBinaryPath !== undefined) openai.binary_path = changes.openAiTunnelBinaryPath || null;
   if (changes.openAiTunnelIdEnv !== undefined) openai.tunnel_id_env = changes.openAiTunnelIdEnv;
   if (changes.openAiRuntimeKeyEnv !== undefined) openai.runtime_key_env = changes.openAiRuntimeKeyEnv;

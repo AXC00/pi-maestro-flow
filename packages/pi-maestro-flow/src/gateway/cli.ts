@@ -65,6 +65,7 @@ interface TunnelFlags {
   localPort?: number;
   binaryPath?: string;
   experimental: boolean;
+  autoInstall: boolean;
   tunnelIdEnv?: string;
   runtimeKeyEnv?: string;
 }
@@ -124,7 +125,7 @@ function parseWorkspaceFlags(args: string[]): WorkspaceFlags {
 }
 
 function parseTunnelFlags(args: string[]): TunnelFlags {
-  const result: TunnelFlags = { json: false, experimental: false };
+  const result: TunnelFlags = { json: false, experimental: false, autoInstall: false };
   for (let index = 0; index < args.length; index += 1) {
     const arg = args[index]!;
     if (arg === "--json") result.json = true;
@@ -137,6 +138,7 @@ function parseTunnelFlags(args: string[]): TunnelFlags {
     }
     else if (arg === "--binary") result.binaryPath = requiredValue(args, ++index, arg);
     else if (arg === "--experimental") result.experimental = true;
+    else if (arg === "--auto-install") result.autoInstall = true;
     else if (arg === "--tunnel-id-env") result.tunnelIdEnv = requiredValue(args, ++index, arg);
     else if (arg === "--runtime-key-env") result.runtimeKeyEnv = requiredValue(args, ++index, arg);
     else if (arg.startsWith("--")) throw new Error(`Unknown tunnel option: ${arg}`);
@@ -473,7 +475,7 @@ export async function main(argv = process.argv.slice(2), io: GatewayCliIo = {}):
       if (action === "doctor") {
         const flags = parseTunnelFlags(args.slice(1));
         if (flags.provider !== undefined || flags.instance !== undefined || flags.expectedGeneration !== undefined
-          || flags.localPort !== undefined || flags.binaryPath !== undefined || flags.experimental
+          || flags.localPort !== undefined || flags.binaryPath !== undefined || flags.experimental || flags.autoInstall
           || flags.tunnelIdEnv !== undefined || flags.runtimeKeyEnv !== undefined) {
           throw new Error("tunnel doctor accepts only --config, --timeout-ms and --json");
         }
@@ -485,7 +487,7 @@ export async function main(argv = process.argv.slice(2), io: GatewayCliIo = {}):
         const profileAction = args[1];
         if (!profileAction || !["list", "status", "start", "stop", "restart", "enable", "disable"].includes(profileAction)) throw new Error("Usage: pi-maestro-gateway tunnel profile list|status|start|stop|restart|enable|disable [PROFILE] [--timeout-ms MS] [--generation N] [--json]");
         const flags = parseTunnelFlags(args.slice(2));
-        if (flags.instance !== undefined || flags.localPort !== undefined || flags.binaryPath !== undefined || flags.experimental || flags.tunnelIdEnv !== undefined || flags.runtimeKeyEnv !== undefined) {
+        if (flags.instance !== undefined || flags.localPort !== undefined || flags.binaryPath !== undefined || flags.experimental || flags.autoInstall || flags.tunnelIdEnv !== undefined || flags.runtimeKeyEnv !== undefined) {
           throw new Error("Tunnel profile commands use the persisted profile and do not accept provider-specific overrides");
         }
         const config = await loadGatewayConfig(flags.configPath);
@@ -558,16 +560,17 @@ export async function main(argv = process.argv.slice(2), io: GatewayCliIo = {}):
       if (!action || !["status", "start", "stop", "restart"].includes(action)) throw new Error("Usage: pi-maestro-gateway tunnel status|start|stop|restart [PROVIDER] [INSTANCE] [--timeout-ms MS] [--generation N] [--json]");
       const flags = parseTunnelFlags(args.slice(1));
       if (action !== "status" && !flags.provider) throw new Error(`tunnel ${action} requires a provider`);
-      if (action === "status" && (flags.expectedGeneration !== undefined || flags.localPort !== undefined || flags.binaryPath !== undefined || flags.experimental || flags.tunnelIdEnv !== undefined || flags.runtimeKeyEnv !== undefined)) throw new Error("tunnel status does not accept start/configuration options");
-      if (flags.provider && flags.provider !== "cloudflare" && flags.provider !== "openai" && (flags.localPort !== undefined || flags.binaryPath !== undefined || flags.experimental || flags.tunnelIdEnv !== undefined || flags.runtimeKeyEnv !== undefined)) throw new Error("Tunnel provider-specific options require cloudflare or openai");
-      if (flags.provider === "cloudflare" && (flags.experimental || flags.tunnelIdEnv !== undefined || flags.runtimeKeyEnv !== undefined)) throw new Error("--experimental and OpenAI credential references are OpenAI Tunnel options");
+      if (action === "status" && (flags.expectedGeneration !== undefined || flags.localPort !== undefined || flags.binaryPath !== undefined || flags.experimental || flags.autoInstall || flags.tunnelIdEnv !== undefined || flags.runtimeKeyEnv !== undefined)) throw new Error("tunnel status does not accept start/configuration options");
+      if (flags.provider && flags.provider !== "cloudflare" && flags.provider !== "openai" && (flags.localPort !== undefined || flags.binaryPath !== undefined || flags.experimental || flags.autoInstall || flags.tunnelIdEnv !== undefined || flags.runtimeKeyEnv !== undefined)) throw new Error("Tunnel provider-specific options require cloudflare or openai");
+      if (flags.provider === "cloudflare" && (flags.experimental || flags.autoInstall || flags.tunnelIdEnv !== undefined || flags.runtimeKeyEnv !== undefined)) throw new Error("--experimental, --auto-install and OpenAI credential references are OpenAI Tunnel options");
       const client = createControlClient(flags.configPath);
       const common = {
         ...(flags.instance === undefined ? {} : { instance: flags.instance }),
         ...(flags.timeoutMs === undefined ? {} : { timeoutMs: flags.timeoutMs }),
         ...(flags.expectedGeneration === undefined ? {} : { expectedGeneration: flags.expectedGeneration }),
-        ...(flags.localPort === undefined && flags.binaryPath === undefined && !flags.experimental && flags.tunnelIdEnv === undefined && flags.runtimeKeyEnv === undefined ? {} : { input: flags.provider === "openai" ? {
+        ...(flags.localPort === undefined && flags.binaryPath === undefined && !flags.experimental && !flags.autoInstall && flags.tunnelIdEnv === undefined && flags.runtimeKeyEnv === undefined ? {} : { input: flags.provider === "openai" ? {
           ...(flags.experimental ? { experimental: true } : {}),
+          ...(flags.autoInstall ? { autoInstall: true } : {}),
           ...(flags.localPort === undefined ? {} : { localPort: flags.localPort }),
           ...(flags.binaryPath === undefined ? {} : { binaryPath: flags.binaryPath }),
           ...(flags.tunnelIdEnv === undefined ? {} : { tunnelIdEnv: flags.tunnelIdEnv }),
@@ -716,7 +719,7 @@ export async function main(argv = process.argv.slice(2), io: GatewayCliIo = {}):
         "  tunnel doctor [--timeout-ms MS] [--config PATH] [--json] (local, read-only, bounded)",
         "  tunnel profile list|status|start|stop|restart|enable|disable [PROFILE] [--timeout-ms MS] [--generation N] [--config PATH] [--json]",
         "    persisted profiles support Cloudflare Quick/Named, OpenAI Secure, and Managed OpenSSH Reverse modes; legacy provider commands remain compatible",
-        "    openai is experimental: explicitly configure env references or pass --experimental --tunnel-id-env NAME --runtime-key-env NAME; no auto-download/provisioning",
+        "    openai is experimental: explicitly configure env references or pass --experimental --tunnel-id-env NAME --runtime-key-env NAME; --auto-install opts into the pinned verified client download; no provisioning",
         "  workspace list [--config PATH] [--json]",
         "  workspace register PATH [--ttl SECONDS | --permanent] [--generation N] [--config PATH] [--json]",
         "  workspace renew PATH_OR_ID --generation N [--ttl SECONDS] [--config PATH] [--json]",

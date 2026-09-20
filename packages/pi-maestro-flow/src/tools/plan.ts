@@ -26,6 +26,7 @@ import {
   type PlanWorkflowConfirmationOptions,
 } from "./plan-confirm.ts";
 import { openPlanEditor } from "./plan-editor.ts";
+import { detectDecisionDocuments } from "./plan-sources.ts";
 import {
   PlanApprovalError,
   PlanStore,
@@ -601,7 +602,7 @@ async function recoverWorkflowBinding(
     applyLoadedPlan(bound);
     ctx.ui.notify(`Recovered approved Plan binding to Workflow Session ${published.binding.workflowSessionId}.`, "info");
     const planPath = join(bound.plansDir, approvedPath);
-    const executionMessage = `${published.executionMessage}\n\n${buildPlanExecutionContract(planPath, handoffKey)}`;
+    const executionMessage = `${published.executionMessage}\n\n${buildPlanExecutionContract(planPath, handoffKey, undefined, undefined, bound.manifest.sourceDocuments?.[0])}`;
     if (!isCurrentPlanOperation(ctx, operation)) return;
     await deliverImplementation(
       ctx,
@@ -930,6 +931,8 @@ async function reviewPlan(
       id: `plan-confirm:${operation.sessionId}:${operation.operationId}:${++attentionIndex}`,
       kind: "plan-confirm",
     }, ctx);
+    const decisionDocuments = await detectDecisionDocuments(latestPlan ?? "", ctx.cwd).catch(() => []);
+    if (!isCurrentPlanOperation(ctx, operation)) return { approved: false, exited: false };
     const decision = await openPlanConfirmation(ctx, {
       markdown: latestPlan ?? "",
       pathLabel: store.currentPath,
@@ -938,6 +941,7 @@ async function reviewPlan(
       defaultExecution: latestExecution,
       workflow,
       modelTransition: describePlanModelTransition(ctx),
+      decisionDocuments,
       drafts,
       signal,
     });
@@ -1311,6 +1315,7 @@ async function startImplementation(
     latestHandoffKey,
     refineFeedback,
     refineLatestRoleLabel,
+    approved.manifest.sourceDocuments?.[0],
   );
   let executionMessage = executionContract;
   let workflowDelivery: { handoffKey: string; binding: PlanWorkflowBinding } | undefined;
@@ -1390,12 +1395,16 @@ function buildPlanExecutionContract(
   handoffKey?: string,
   refineFeedback?: string,
   refineRoleLabel?: string,
+  sourceDocument?: string,
 ): string {
   const base = [
     "The user selected Execute and explicitly authorized immediate implementation of the approved Plan.",
     "Begin execution now. Do not ask the user to trigger implementation again.",
     "The approved Plan is already in the current context for current-context execution; after a deterministic reset, reload it from the source path below before decomposition.",
     `Plan source: ${planPath}`,
+    ...(sourceDocument
+      ? [`Decision document: ${sourceDocument} — honor its locked decisions; do not re-litigate alternatives.`]
+      : []),
     "Before modifying the project:",
     "1. Load the knowledge/spec system (Knowledge Gate) before any project-related work:",
     "   - Make `maestro search \"<1-3 task keywords from this Plan>\" [--type spec|knowhow] --json` the first project-related call.",

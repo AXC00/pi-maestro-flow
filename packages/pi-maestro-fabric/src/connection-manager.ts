@@ -42,6 +42,7 @@ import {
   FABRIC_DIRECTORY_ADVERTISEMENT_AUTHORITY,
   FABRIC_DIRECTORY_PUBLISH_ADVERTISEMENT,
   FABRIC_DIRECTORY_RECORD_PERSISTED_ADVERTISEMENT,
+  FABRIC_DIRECTORY_REGISTER_PRESENCE,
   FABRIC_DIRECTORY_REGISTRY_AUTHORITY,
   FABRIC_DIRECTORY_STAGE_ADVERTISEMENT,
   FABRIC_DIRECTORY_WITHDRAW_ADVERTISEMENT,
@@ -476,6 +477,19 @@ export class FabricConnectionManager {
       this.#assertAdvertisementAdmission(admissionEpoch);
       checkedAt = this.#now();
       this.#assertInboundAuthority(request, connector, device, checkedAt);
+      // Register the authenticated instance nonce only after the final authority
+      // fence: writing it earlier would itself trip authorityEqual. The managed
+      // snapshot must carry the same presence or #revalidateAuthority would fence
+      // this connection on its next renewal. This stays before map population so
+      // a failure still rolls back cleanly through the uncommitted path.
+      const presence = this.directory[FABRIC_DIRECTORY_REGISTER_PRESENCE](
+        connector.connectorId,
+        request.connectorInstanceNonce,
+        checkedAt,
+      );
+      if (presence === undefined) {
+        throw new FabricContractError("not_found", "Connector is not registered", "connectorId");
+      }
       const managed: ManagedConnection = {
         state: connected,
         inboundOwner: owner,
@@ -485,7 +499,7 @@ export class FabricConnectionManager {
         durableCleanupDone: durableRevision === undefined,
         ownerCloseDone: false,
         ready: false,
-        authorityConnector: { ...connector },
+        authorityConnector: presence,
         authorityDevice: projectDeviceClone(device),
         negotiatedLimits: { ...request.limits },
         providerLease: { ...lease },

@@ -147,3 +147,7 @@ wechat_E4f4Eqpn_HPuJqPGLOzE1g/images/11.jpg
 
 # Reverse-engineering artifacts (devin.exe analysis dump)
 devin-re/
+
+# Rust build artifacts
+pi-tui/target/
+pi-tui/spikes/*/target/

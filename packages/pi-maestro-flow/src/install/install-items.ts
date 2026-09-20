@@ -108,11 +108,11 @@ export const INSTALL_ITEMS: readonly InstallItem[] = [
   {
     id: "openai-tunnel",
     title: "OpenAI Secure MCP Tunnel（实验性）",
-    description: "配置外部 tunnel-client 和仅含环境变量名的 Gateway OpenAI tunnel 引用；不会自动下载或预配 tunnel。",
+    description: "配置 tunnel-client 发现（binaryPath/PATH/managed）和仅含环境变量名的 Gateway OpenAI tunnel 引用；可选 auto_install 启用固定版本+SHA256 校验的托管下载，绝不预配 tunnel。",
     docFile: "OPENAI-TUNNEL-SETUP.md",
     category: "external",
     promptIntro:
-      "配置实验性的 OpenAI Secure MCP Tunnel。只在原生 ~/.pi/agent/gateway/config.yaml 中写环境变量名称，绝不写入或索取 secret 值；不得自动下载 tunnel-client，也不得创建或预配 tunnel。按文档验证外部 client、Gateway doctor/start/status，并保留显式 opt-in 语义。",
+      "配置实验性的 OpenAI Secure MCP Tunnel。只在原生 ~/.pi/agent/gateway/config.yaml 中写环境变量名称，绝不写入或索取 secret 值；不得创建或预配 tunnel。client 解析顺序为 binaryPath → PATH → managed install；只有用户显式确认后才可写 auto_install: true 启用固定版本+SHA256 校验的托管下载，否则不得自动下载 tunnel-client。按文档验证外部 client、Gateway doctor/start/status，并保留显式 opt-in 语义。",
   },
 ];
 

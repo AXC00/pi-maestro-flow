@@ -341,6 +341,7 @@ async function openSkillManagerOverlay(
       notice,
       initialState,
       locale,
+      getTerminalRows: () => tui.terminal?.rows,
       requestRender: () => tui.requestRender(),
       done,
     }), {

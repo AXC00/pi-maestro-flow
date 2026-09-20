@@ -9,7 +9,7 @@
 必须保留以下边界：
 
 - **experimental**：默认关闭，只有 `tunnels.openai.enabled: true` 才启用。
-- **no auto-download**：Pi 和 `/install` 绝不下载、更新或替换 `tunnel-client`。
+- **opt-in auto-install**：默认不下载。client 解析顺序为 `binary_path` → `PATH` → managed install（`~/.pi/agent/gateway/v1/tools/openai-tunnel-client/`）。只有 `tunnels.openai.auto_install: true`（或 profile 级 `auto_install`，或 CLI `--auto-install`）显式开启时，Gateway 才会从官方 `openai/tunnel-client` release 下载**固定版本**资产，并强制 archive + binary 双重 SHA-256 校验与版本验证后原子落位；校验失败绝不发布二进制。
 - **no provisioning**：Pi 绝不创建、认领或删除 OpenAI tunnel；tunnel 必须已由用户通过外部受信流程预配。
 - **reference-only secrets**：Gateway YAML 只保存环境变量名称，不保存 tunnel id、runtime API key 或其他 secret 值。
 
@@ -17,7 +17,7 @@
 
 - 原生配置路径为 `~/.pi/agent/gateway/config.yaml`；不要写入旧 MCPX 配置。
 - 用户已通过 OpenAI 支持的外部流程预配 tunnel，并能自行管理其生命周期。
-- 用户已从受信来源手工安装符合公开 CLI contract 的 `tunnel-client`，版本至少为 `0.0.14`。不要由 AI 猜测下载 URL或执行下载安装。
+- 用户已从受信来源手工安装符合公开 CLI contract 的 `tunnel-client`（版本至少为 `0.0.14`），或明确选择 `auto_install` 让 Gateway 执行固定版本+哈希校验的托管下载。除 `auto_install` 托管路径外，不要由 AI 猜测下载 URL或执行下载安装。
 - Gateway 启动环境中已有两个凭证引用。默认名称是 `CONTROL_PLANE_TUNNEL_ID` 和 `CONTROL_PLANE_API_KEY`；值由用户的 secret manager、服务管理器或当前 shell 注入。
 - `pi-maestro-gateway` 可启动，并且本地 HTTP MCP transport 可用。
 
@@ -27,7 +27,7 @@
 
 按 INTERACTIVE INPUTS 确认：
 
-- `tunnel-client` 的现有绝对路径；
+- `tunnel-client` 的现有绝对路径，或用户明确选择 `auto_install` 托管下载；
 - 两个环境变量的**名称**；
 - 用户已经预配 tunnel 且接受 experimental 语义。
 
@@ -41,7 +41,7 @@
 "<absolute-path-to-tunnel-client>" --version
 ```
 
-版本必须是受支持的 `0.0.x`，且不低于 `0.0.14`。缺失或不兼容时停止并报告；不得自动下载、升级或换用未知二进制。
+版本必须是受支持的 `0.0.x`，且不低于 `0.0.14`。缺失或不兼容时停止并报告；除非用户显式选择 `auto_install`，不得自动下载、升级或换用未知二进制。`auto_install` 只下载钉死版本与哈希的官方 release 资产，不解析 latest、不猜测 URL。
 
 ### 3. 更新原生 Gateway 配置
 
@@ -68,6 +68,7 @@ tunnels:
   openai:
     enabled: true
     binary_path: "/absolute/path/to/tunnel-client"
+    auto_install: false
     tunnel_id_env: "CONTROL_PLANE_TUNNEL_ID"
     runtime_key_env: "CONTROL_PLANE_API_KEY"
     minimum_version: "0.0.14"
@@ -94,7 +95,8 @@ tunnels:
 
 约束：
 
-- `binary_path` 指向用户已经安装的 client；不得触发下载。
+- `binary_path` 指向用户已经安装的 client；省略时依次尝试 PATH 与 managed install。
+- `auto_install` 默认 `false`；设为 `true` 才允许托管下载（固定版本 + 双 SHA-256 校验）。profile 级 `auto_install` 可单独覆盖。
 - `tunnel_id_env` 与 `runtime_key_env` 是环境变量名，不是 credential 值。
 - 不得把 tunnel id、API key、bearer token 或任何 secret literal 写入 YAML。
 - `credential_ttl_ms` 是 Gateway 发放给 client 的短期本地凭证 TTL；`profiles` 中的 OpenAI Secure profile 允许范围为 `60000..3600000`，兼容的 `tunnels.openai` provider defaults 允许 `1000..3600000`，推荐两处都保留 `300000`。
@@ -129,7 +131,8 @@ pi-maestro-gateway tunnel profile start openai-prod --config ~/.pi/agent/gateway
 必须用 `ctx.ui` 询问且只记录非敏感答案：
 
 1. `ctx.ui.confirm`：用户是否已自行预配 tunnel，并理解该 contract 为 experimental、Pi 不会 provisioning。
-2. `ctx.ui.input`：已安装 `tunnel-client` 的绝对路径。若不存在或版本低于 `0.0.14`，停止；不要下载。
+2. `ctx.ui.input`：已安装 `tunnel-client` 的绝对路径。若不存在或版本低于 `0.0.14`，停止；除非用户在下一条中显式选择 `auto_install`，否则不要下载。
+2b. `ctx.ui.confirm`：用户是否显式选择 `auto_install`（固定版本+哈希校验的托管下载）。拒绝时保持 `auto_install: false`。
 3. `ctx.ui.input`：tunnel id 的环境变量名称，默认 `CONTROL_PLANE_TUNNEL_ID`。
 4. `ctx.ui.input`：runtime key 的环境变量名称，默认 `CONTROL_PLANE_API_KEY`。
 5. `ctx.ui.confirm`：用户是否已在 Gateway 启动环境中安全注入这两个变量。只确认可用性，不要求粘贴或持久化值。
@@ -146,7 +149,7 @@ pi-maestro-gateway tunnel profile start openai-prod --config ~/.pi/agent/gateway
 成功必须同时满足：
 
 1. `tunnel-client --version` 报告受支持的 `0.0.x` 且版本 `>= 0.0.14`。
-2. `~/.pi/agent/gateway/config.yaml` 的 `tunnels.openai` 包含 `enabled`、`binary_path`、`tunnel_id_env`、`runtime_key_env`、`minimum_version`、`credential_ttl_ms`，且不含 secret literal。
+2. `~/.pi/agent/gateway/config.yaml` 的 `tunnels.openai` 包含 `enabled`、`binary_path`（或 `auto_install: true`）、`tunnel_id_env`、`runtime_key_env`、`minimum_version`、`credential_ttl_ms`，且不含 secret literal。
 3. `/install list` 对 `openai-tunnel` 显示 installed；缺失配置为 not-installed，disabled 或缺少被引用环境变量时为 partial。
 4. `pi-maestro-gateway tunnel profile start openai-prod --config ~/.pi/agent/gateway/config.yaml --json` 成功通过 provider doctor 和 readiness probe。
 5. `pi-maestro-gateway tunnel profile status openai-prod --config ~/.pi/agent/gateway/config.yaml --json` 显示 running/ready；日志和状态中没有 credential 值。
@@ -163,4 +166,4 @@ pi-maestro-gateway tunnel profile start openai-prod --config ~/.pi/agent/gateway
 2. 如仍使用兼容的 provider 级入口，再将 `~/.pi/agent/gateway/config.yaml` 中 `tunnels.openai.enabled` 改为 `false`；可保留非敏感的 client path、env 名称、minimum version 与 TTL，或删除整个 `openai` mapping。
 3. 重启 Gateway，并确认 `tunnel profile status openai-prod` 不再 running。
 4. 按用户自己的 secret manager 流程撤销或轮换 runtime key，并从 Gateway 启动环境移除引用；不要把值复制到配置或日志。
-5. 如需删除已预配的 tunnel，必须由用户在 OpenAI 的外部管理流程中完成。Pi 的 rollback 不执行 provisioning/deprovisioning，也不卸载或删除 `tunnel-client`。
+5. 如需删除已预配的 tunnel，必须由用户在 OpenAI 的外部管理流程中完成。Pi 的 rollback 不执行 provisioning/deprovisioning，也不卸载或删除 `tunnel-client`（含 managed install 目录）。

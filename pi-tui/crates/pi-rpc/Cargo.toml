@@ -1,0 +1,16 @@
+[package]
+name = "pi-rpc"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "JSON-RPC/stdio client for `pi --mode rpc` — spawns the pi CLI, sends JSONL commands, and streams responses, agent events, and extension UI requests."
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
+futures-core = "0.3"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full", "test-util"] }

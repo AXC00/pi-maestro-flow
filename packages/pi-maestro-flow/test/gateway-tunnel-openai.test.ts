@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
 import { existsSync, readFileSync, statSync } from "node:fs";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
@@ -15,6 +15,7 @@ import {
   renderOpenAiTunnelClientConfig,
 } from "../src/gateway/tunnel/providers/openai-client-contract.ts";
 import { OpenAiTunnelProvider, redactOpenAiTunnelText, type OpenAiTunnelCommandResult } from "../src/gateway/tunnel/providers/openai.ts";
+import { managedOpenAiTunnelClientPath, openAiTunnelClientAssetFor } from "../src/gateway/tunnel/providers/openai-client-managed.ts";
 
 const tunnelId = "tunnel_0123456789abcdef0123456789abcdef";
 const runtimeKey = "rk-runtime-secret-0123456789";
@@ -135,7 +136,7 @@ test("experimental, missing, and incompatible doctor states are stable and never
   context.close();
   assert.equal(blocked.calls.length, 0);
 
-  const missingClient = new OpenAiTunnelProvider({ enabled: true, binaryPath: join(blocked.root, "missing-tunnel-client"), environment: { CONTROL_PLANE_TUNNEL_ID: tunnelId, CONTROL_PLANE_API_KEY: runtimeKey } });
+  const missingClient = new OpenAiTunnelProvider({ enabled: true, binaryPath: join(blocked.root, "missing-tunnel-client"), managedRoot: join(blocked.root, "managed-empty"), environment: { CONTROL_PLANE_TUNNEL_ID: tunnelId, CONTROL_PLANE_API_KEY: runtimeKey } });
   context = deadline();
   assert.match((await missingClient.doctor(context, request)).detail ?? "", /client_not_installed/u);
   context.close();
@@ -294,6 +295,75 @@ test("doctor failures and child lifecycle redact secrets, revoke, and remove all
   assert.deepEqual(running.revoked, ["pair-openai-1"]);
   context.close();
   assert.doesNotMatch(redactOpenAiTunnelText(`token=${gatewayToken} api_key=${runtimeKey}`, [gatewayToken, runtimeKey]), /gateway-secret|runtime-secret/u);
+});
+
+test("client discovery resolves PATH, managed installs, and opt-in downloads in order", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "gateway-openai-discovery-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const executable = process.platform === "win32" ? "tunnel-client.exe" : "tunnel-client";
+  const pathDir = join(root, "path-bin");
+  const pathBinary = join(pathDir, executable);
+  const managedRoot = join(root, "managed");
+  const asset = openAiTunnelClientAssetFor(process.platform);
+  assert.ok(asset);
+  const managedBinary = managedOpenAiTunnelClientPath(managedRoot, asset);
+  const environment = { PATH: pathDir, CONTROL_PLANE_TUNNEL_ID: tunnelId, CONTROL_PLANE_API_KEY: runtimeKey };
+  const versionRun = (version: string) => async (_command: string, args: readonly string[]) =>
+    args[0] === "--version" ? { code: 0, stdout: `tunnel-client v${version}\n`, stderr: "" } : { code: 0, stdout: "ok", stderr: "" };
+
+  // PATH discovery: a version-valid binary on PATH wins over the managed install.
+  await mkdir(pathDir, { recursive: true });
+  await writeFile(pathBinary, "fake executable");
+  await mkdir(dirname(managedBinary), { recursive: true });
+  await writeFile(managedBinary, "fake managed executable");
+  const fromPath = new OpenAiTunnelProvider({ enabled: true, managedRoot, environment, runCommand: versionRun("0.0.14") as never, platform: process.platform, verifyManagedBinary: async () => true });
+  let context = deadline();
+  const pathResult = await fromPath.doctor(context, request);
+  context.close();
+  assert.equal(pathResult.ok, true);
+  assert.equal(pathResult.version, "0.0.14");
+  assert.match(pathResult.detail ?? "", /source: path/u);
+
+  // Managed discovery: without a PATH hit the verified managed install is used.
+  const fromManaged = new OpenAiTunnelProvider({ enabled: true, managedRoot, environment: { ...environment, PATH: join(root, "empty-path") }, runCommand: versionRun("0.0.14") as never, platform: process.platform, verifyManagedBinary: async () => true });
+  context = deadline();
+  const managedResult = await fromManaged.doctor(context, request);
+  context.close();
+  assert.equal(managedResult.ok, true);
+  assert.match(managedResult.detail ?? "", /source: managed/u);
+
+  // An incompatible PATH binary is skipped; without autoInstall nothing is downloaded.
+  let installs = 0;
+  const incompatible = new OpenAiTunnelProvider({
+    enabled: true,
+    managedRoot: join(root, "managed-empty"),
+    environment,
+    runCommand: versionRun("0.0.13") as never,
+    platform: process.platform,
+    installManagedClient: async () => { installs += 1; return pathBinary; },
+  });
+  context = deadline();
+  const skipped = await incompatible.doctor(context, request);
+  context.close();
+  assert.equal(skipped.ok, false);
+  assert.match(skipped.detail ?? "", /client_not_installed/u);
+  assert.equal(installs, 0, "auto-install stays opt-in");
+
+  // autoInstall (input or provider option) triggers the managed install seam.
+  const autoInstalled = new OpenAiTunnelProvider({
+    enabled: true,
+    managedRoot: join(root, "managed-empty"),
+    environment: { ...environment, PATH: join(root, "empty-path") },
+    runCommand: versionRun("0.0.14") as never,
+    platform: process.platform,
+    installManagedClient: async (options) => { installs += 1; assert.equal(options.managedRoot, join(root, "managed-empty")); return pathBinary; },
+  });
+  context = deadline();
+  const downloaded = await autoInstalled.doctor(context, { ...request, input: { autoInstall: true } });
+  context.close();
+  assert.equal(downloaded.ok, true);
+  assert.match(downloaded.detail ?? "", /source: downloaded/u);
+  assert.equal(installs, 1);
 });
 
 test("optional real tunnel-client identity/credential smoke gate", { skip: process.env.PI_MAESTRO_OPENAI_TUNNEL_SMOKE !== "1" }, async () => {

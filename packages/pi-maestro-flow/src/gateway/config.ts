@@ -164,6 +164,8 @@ export interface GatewayRetentionConfig {
 export interface GatewayOpenAiTunnelConfig {
   /** Experimental provider opt-in; false by default. */
   enabled: boolean;
+  /** Explicit opt-in for the pinned, verified managed tunnel-client download. */
+  autoInstall: boolean;
   binaryPath?: string;
   tunnelIdEnv: string;
   runtimeKeyEnv: string;
@@ -201,6 +203,8 @@ export interface GatewayOpenAiSecureTunnelProfileConfig extends GatewayTunnelPro
   tunnelIdEnv: string;
   runtimeKeyEnv: string;
   credentialTtlMs: number;
+  /** Profile-level override for the managed tunnel-client download opt-in. */
+  autoInstall?: boolean;
 }
 export interface GatewaySshReverseTunnelProfileConfig extends GatewayTunnelProfileBase {
   provider: "ssh";
@@ -292,6 +296,7 @@ export function gatewayTunnelProfileInput(
     tunnelIdEnv: profile.tunnelIdEnv,
     runtimeKeyEnv: profile.runtimeKeyEnv,
     credentialTtlMs: profile.credentialTtlMs,
+    ...(profile.autoInstall === undefined ? {} : { autoInstall: profile.autoInstall }),
     ...(profile.binaryPath ? { binaryPath: profile.binaryPath } : {}),
   };
 }
@@ -393,6 +398,7 @@ const DEFAULT_TRANSPORT: GatewayTransportConfig = {
 const DEFAULT_TUNNELS: GatewayTunnelsConfig = {
   openai: {
     enabled: false,
+    autoInstall: false,
     tunnelIdEnv: "CONTROL_PLANE_TUNNEL_ID",
     runtimeKeyEnv: "CONTROL_PLANE_API_KEY",
     minimumVersion: "0.0.14",
@@ -783,7 +789,7 @@ export function normalizeGatewayConfig(value: unknown): GatewayConfig {
     }
   }
   const openaiRaw = optionalObject(tunnelsRaw.openai, "tunnels.openai");
-  knownKeys(openaiRaw, ["enabled", "binaryPath", "binary_path", "tunnelIdEnv", "tunnel_id_env", "runtimeKeyEnv", "runtime_key_env", "minimumVersion", "minimum_version", "credentialTtlMs", "credential_ttl_ms"], "tunnels.openai");
+  knownKeys(openaiRaw, ["enabled", "autoInstall", "auto_install", "binaryPath", "binary_path", "tunnelIdEnv", "tunnel_id_env", "runtimeKeyEnv", "runtime_key_env", "minimumVersion", "minimum_version", "credentialTtlMs", "credential_ttl_ms"], "tunnels.openai");
   const environmentName = (value: unknown, path: string, fallback: string): string => {
     const result = value === undefined ? fallback : stringValue(value, path, 128);
     if (!/^[A-Za-z_][A-Za-z0-9_]{0,127}$/u.test(result)) throw new GatewayConfigValidationError(`${path} must be an environment variable name`);
@@ -792,6 +798,7 @@ export function normalizeGatewayConfig(value: unknown): GatewayConfig {
   const minimumVersion = openaiRaw.minimumVersion ?? openaiRaw.minimum_version;
   const openai: GatewayOpenAiTunnelConfig = {
     enabled: bool(openaiRaw.enabled, "tunnels.openai.enabled", DEFAULT_TUNNELS.openai.enabled),
+    autoInstall: bool(openaiRaw.autoInstall ?? openaiRaw.auto_install, "tunnels.openai.autoInstall", DEFAULT_TUNNELS.openai.autoInstall),
     ...(optionalString(openaiRaw.binaryPath ?? openaiRaw.binary_path, "tunnels.openai.binaryPath", 4096) === undefined ? {} : { binaryPath: optionalString(openaiRaw.binaryPath ?? openaiRaw.binary_path, "tunnels.openai.binaryPath", 4096) }),
     tunnelIdEnv: environmentName(openaiRaw.tunnelIdEnv ?? openaiRaw.tunnel_id_env, "tunnels.openai.tunnelIdEnv", DEFAULT_TUNNELS.openai.tunnelIdEnv),
     runtimeKeyEnv: environmentName(openaiRaw.runtimeKeyEnv ?? openaiRaw.runtime_key_env, "tunnels.openai.runtimeKeyEnv", DEFAULT_TUNNELS.openai.runtimeKeyEnv),
@@ -812,6 +819,7 @@ export function normalizeGatewayConfig(value: unknown): GatewayConfig {
       "publicUrl", "public_url", "tunnelId", "tunnel_id", "credentialsFile", "credentials_file", "tokenFile", "token_file",
       "mcpAccess", "mcp_access",
       "tunnelIdEnv", "tunnel_id_env", "runtimeKeyEnv", "runtime_key_env", "credentialTtlMs", "credential_ttl_ms",
+      "autoInstall", "auto_install",
       "host", "user", "port", "remoteBindHost", "remote_bind_host", "remotePort", "remote_port",
       "localHost", "local_host", "identityFile", "identity_file", "configFile", "config_file",
       "knownHostsFile", "known_hosts_file", "connectTimeoutSeconds", "connect_timeout_seconds",
@@ -845,7 +853,8 @@ export function normalizeGatewayConfig(value: unknown): GatewayConfig {
     const hasNamedFields = item.tunnelId !== undefined || item.tunnel_id !== undefined
       || item.credentialsFile !== undefined || item.credentials_file !== undefined || item.tokenFile !== undefined || item.token_file !== undefined;
     const hasOpenAiFields = item.tunnelIdEnv !== undefined || item.tunnel_id_env !== undefined
-      || item.runtimeKeyEnv !== undefined || item.runtime_key_env !== undefined || item.credentialTtlMs !== undefined || item.credential_ttl_ms !== undefined;
+      || item.runtimeKeyEnv !== undefined || item.runtime_key_env !== undefined || item.credentialTtlMs !== undefined || item.credential_ttl_ms !== undefined
+      || item.autoInstall !== undefined || item.auto_install !== undefined;
     const hasSshFields = item.host !== undefined || item.user !== undefined || item.port !== undefined
       || item.remoteBindHost !== undefined || item.remote_bind_host !== undefined || item.remotePort !== undefined || item.remote_port !== undefined
       || item.localHost !== undefined || item.local_host !== undefined || item.identityFile !== undefined || item.identity_file !== undefined
@@ -904,6 +913,7 @@ export function normalizeGatewayConfig(value: unknown): GatewayConfig {
         tunnelIdEnv: environmentName(item.tunnelIdEnv ?? item.tunnel_id_env, `${path}.tunnelIdEnv`, openai.tunnelIdEnv),
         runtimeKeyEnv: environmentName(item.runtimeKeyEnv ?? item.runtime_key_env, `${path}.runtimeKeyEnv`, openai.runtimeKeyEnv),
         credentialTtlMs: integer(item.credentialTtlMs ?? item.credential_ttl_ms, `${path}.credentialTtlMs`, 60_000, 60 * 60_000, openai.credentialTtlMs),
+        ...(item.autoInstall === undefined && item.auto_install === undefined ? {} : { autoInstall: bool(item.autoInstall ?? item.auto_install, `${path}.autoInstall`, false) }),
         ...(mcpAccess === undefined ? {} : { mcpAccess }),
       };
     }
@@ -1106,9 +1116,10 @@ function canonicalYamlSection(key: string, value: unknown): unknown {
     let openai: unknown = rawOpenAi;
     if (rawOpenAi && typeof rawOpenAi === "object" && !Array.isArray(rawOpenAi)) {
       const o = rawOpenAi as Record<string, unknown>;
-      const { binaryPath, tunnelIdEnv, runtimeKeyEnv, minimumVersion, credentialTtlMs, ...rest } = o;
+      const { binaryPath, tunnelIdEnv, runtimeKeyEnv, minimumVersion, credentialTtlMs, autoInstall, ...rest } = o;
       openai = {
         ...rest,
+        ...(autoInstall === undefined ? {} : { auto_install: autoInstall }),
         ...(binaryPath === undefined ? {} : { binary_path: binaryPath }),
         ...(tunnelIdEnv === undefined ? {} : { tunnel_id_env: tunnelIdEnv }),
         ...(runtimeKeyEnv === undefined ? {} : { runtime_key_env: runtimeKeyEnv }),
@@ -1119,7 +1130,7 @@ function canonicalYamlSection(key: string, value: unknown): unknown {
     const profiles = Array.isArray(v.profiles) ? v.profiles.map((profile) => {
       if (!profile || typeof profile !== "object" || Array.isArray(profile)) return profile;
       const p = profile as Record<string, unknown>;
-      const { binaryPath, localPort, publicUrl, tunnelId, credentialsFile, tokenFile, tunnelIdEnv, runtimeKeyEnv, credentialTtlMs, mcpAccess, mcp_access, ...rest } = p;
+      const { binaryPath, localPort, publicUrl, tunnelId, credentialsFile, tokenFile, tunnelIdEnv, runtimeKeyEnv, credentialTtlMs, autoInstall, mcpAccess, mcp_access, ...rest } = p;
       const rawMcp = mcpAccess ?? mcp_access;
       const mcp = rawMcp && typeof rawMcp === "object" && !Array.isArray(rawMcp)
         ? (() => {
@@ -1152,6 +1163,7 @@ function canonicalYamlSection(key: string, value: unknown): unknown {
         ...(tunnelIdEnv === undefined ? {} : { tunnel_id_env: tunnelIdEnv }),
         ...(runtimeKeyEnv === undefined ? {} : { runtime_key_env: runtimeKeyEnv }),
         ...(credentialTtlMs === undefined ? {} : { credential_ttl_ms: credentialTtlMs }),
+        ...(autoInstall === undefined ? {} : { auto_install: autoInstall }),
       };
     }) : v.profiles;
     return { ...v, ...(openai === undefined ? {} : { openai }), ...(profiles === undefined ? {} : { profiles }) };

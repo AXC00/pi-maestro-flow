@@ -29,6 +29,7 @@ import {
   FABRIC_DIRECTORY_ADVERTISEMENT_AUTHORITY,
   FABRIC_DIRECTORY_PUBLISH_ADVERTISEMENT,
   FABRIC_DIRECTORY_RECORD_PERSISTED_ADVERTISEMENT,
+  FABRIC_DIRECTORY_REGISTER_PRESENCE,
   FABRIC_DIRECTORY_REGISTRY_AUTHORITY,
   FABRIC_DIRECTORY_STAGE_ADVERTISEMENT,
   FABRIC_DIRECTORY_WITHDRAW_ADVERTISEMENT,
@@ -378,11 +379,22 @@ export class FabricDirectory {
     }
 
     const currentConnector = this.#connectors.get(seed.connector.connectorId);
+    // Presence fields are learned from live inbound admissions, never carried by
+    // durable authority. A re-seed that omits them must not erase or compare them.
+    const mergedConnector: ConnectorRecord = {
+      ...seed.connector,
+      ...(seed.connector.instanceNonce === undefined && currentConnector?.instanceNonce !== undefined
+        ? { instanceNonce: currentConnector.instanceNonce }
+        : {}),
+      ...(seed.connector.lastSeenAt === undefined && currentConnector?.lastSeenAt !== undefined
+        ? { lastSeenAt: currentConnector.lastSeenAt }
+        : {}),
+    };
     const connectorHighWater = this.#connectorRevisionHighWater.get(seed.connector.connectorId);
     if (
       connectorHighWater !== undefined &&
-      seed.connector.revision <= connectorHighWater &&
-      !sameRecord(currentConnector ?? {}, seed.connector)
+      mergedConnector.revision <= connectorHighWater &&
+      !sameRecord(currentConnector ?? {}, mergedConnector)
     ) {
       throw new FabricContractError("stale_generation", "Connector revision must increase for authority changes", "connector.revision");
     }
@@ -392,7 +404,7 @@ export class FabricDirectory {
       if (device.connectorId === seed.connector.connectorId && !devices.has(deviceId)) nextDevices.delete(deviceId);
     }
     for (const device of seed.devices) nextDevices.set(device.deviceId, projectDevice(device));
-    this.#connectors.set(seed.connector.connectorId, { ...seed.connector });
+    this.#connectors.set(seed.connector.connectorId, { ...mergedConnector });
     this.#connectorRevisionHighWater.set(seed.connector.connectorId, Math.max(connectorHighWater ?? -1, seed.connector.revision));
     for (const device of seed.devices) {
       this.#deviceRevisionHighWater.set(
@@ -402,7 +414,7 @@ export class FabricDirectory {
     }
     const accepted = this.#advertisements.get(seed.connector.connectorId);
     const acceptedAuthorityChanged = accepted !== undefined && (
-      !sameRecord(currentConnector ?? {}, seed.connector) ||
+      !sameRecord(currentConnector ?? {}, mergedConnector) ||
       accepted.devices.length !== seed.devices.length ||
       accepted.devices.some((advertised) => {
         const current = devices.get(advertised.deviceId);
@@ -1010,6 +1022,22 @@ export class FabricDirectory {
   [FABRIC_DIRECTORY_REGISTRY_AUTHORITY](connectorId: string): ConnectorRecord | undefined {
     const record = this.#connectors.get(connectorId);
     return record === undefined ? undefined : { ...record };
+  }
+
+  /**
+   * Symbol-keyed package seam recording live Connector presence learned from an
+   * authenticated inbound admission. Presence is runtime state, not durable
+   * authority: it mutates the record in place without touching revision or the
+   * high-water fence, and seedAuthority preserves it across re-seeds.
+   */
+  [FABRIC_DIRECTORY_REGISTER_PRESENCE](connectorId: string, instanceNonce: string, lastSeenAt: number): ConnectorRecord | undefined {
+    assertFabricIdentifier(instanceNonce, "instanceNonce");
+    assertEpochMilliseconds(lastSeenAt, "lastSeenAt");
+    const record = this.#connectors.get(connectorId);
+    if (record === undefined) return undefined;
+    record.instanceNonce = instanceNonce;
+    record.lastSeenAt = lastSeenAt;
+    return { ...record };
   }
 
   getDevice(deviceId: string): DeviceRecord | undefined {

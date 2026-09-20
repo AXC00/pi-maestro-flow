@@ -454,9 +454,9 @@ export async function openMcpPanel(
           }
           done(undefined);
           resolve();
-        }, { noticeLines, keybindings, locale: getTuiLocale(locale) });
+        }, { noticeLines, keybindings, getTerminalRows: () => tui.terminal?.rows, locale: getTuiLocale(locale) });
       },
-      { overlay: true, overlayOptions: { anchor: "center", width: "94%" } },
+      { overlay: true, overlayOptions: { anchor: "center", width: "94%", maxHeight: "92%" } },
     );
   });
 
@@ -498,11 +498,12 @@ export async function openMcpAuthPanel(
         }, {
           authOnly: true,
           keybindings,
+          getTerminalRows: () => tui.terminal?.rows,
           locale: getTuiLocale(locale),
           noticeLines: [commandText("auth.instructions", undefined, locale)],
         });
       },
-      { overlay: true, overlayOptions: { anchor: "center", width: "94%" } },
+      { overlay: true, overlayOptions: { anchor: "center", width: "94%", maxHeight: "92%" } },
     );
   });
 

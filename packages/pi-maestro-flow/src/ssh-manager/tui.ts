@@ -12,7 +12,7 @@ import {
   helpLine,
   rule,
   type FrameTheme,
-} from "pi-cockpit/src/settings/ui-primitives.ts";
+} from "../tui/ui-primitives.ts";
 import {
   BracketedPasteDecoder,
   removeLastGrapheme,

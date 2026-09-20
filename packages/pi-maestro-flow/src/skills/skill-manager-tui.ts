@@ -13,7 +13,7 @@ import {
   helpLine,
   rule,
   type FrameTheme,
-} from "pi-cockpit/src/settings/ui-primitives.ts";
+} from "../tui/ui-primitives.ts";
 import { getTuiLocale } from "../tui/locale.ts";
 import type { ManagedSkill, ManagedSkillGroup, OptionalSkill } from "./skill-manager-store.ts";
 
@@ -51,11 +51,13 @@ export interface SkillManagerOverlayParams {
   initialState?: Partial<SkillManagerUiState>;
   /** Explicit UI language; otherwise follows the shared runtime TUI locale. */
   locale?: SupportedSettingsLocale;
+  /** Terminal rows from the host; absent keeps the legacy fixed cap. */
+  getTerminalRows?: () => number | undefined;
   requestRender: () => void;
   done: (action: SkillManagerAction) => void;
 }
 
-const MAX_VISIBLE = 12;
+const FALLBACK_MAX_VISIBLE = 12;
 
 const CATALOGS = {
   en: {
@@ -198,13 +200,14 @@ export class SkillManagerOverlay implements Component, Focusable {
 
     const inner = safeWidth - 2;
     const entries = this.filteredEntries();
+    const selected = this.selectedEntry();
+    const maxEntryRows = this.entryRowsBudget(Boolean(selected), Boolean(this.params.notice));
     const rows = [
       headerLine(this.params.theme, this.t("title"), [this.t("header.count", { count: this.params.skills.length })], inner),
       rule(inner),
-      ...this.entryRows(entries, inner),
+      ...this.entryRows(entries, inner, maxEntryRows),
       this.filterLine(inner, entries.filter((entry) => entry.kind === "skill").length),
     ];
-    const selected = this.selectedEntry();
     if (selected?.kind === "skill") {
       rows.push(helpLine(this.params.theme, selected.skill.description || selected.skill.filePath, inner));
     } else if (selected?.kind === "optional") {
@@ -244,8 +247,8 @@ export class SkillManagerOverlay implements Component, Focusable {
     }
     if (matchesKey(data, Key.up)) return this.moveSelection(-1);
     if (matchesKey(data, Key.down)) return this.moveSelection(1);
-    if (matchesKey(data, Key.pageUp)) return this.moveSelection(-MAX_VISIBLE);
-    if (matchesKey(data, Key.pageDown)) return this.moveSelection(MAX_VISIBLE);
+    if (matchesKey(data, Key.pageUp)) return this.moveSelection(-this.entryRowsBudget(false, false));
+    if (matchesKey(data, Key.pageDown)) return this.moveSelection(this.entryRowsBudget(false, false));
 
     if (this.filterActive) {
       if (matchesKey(data, Key.backspace) || data === "\b") {
@@ -290,12 +293,13 @@ export class SkillManagerOverlay implements Component, Focusable {
     return fit(text, width);
   }
 
-  private entryRows(entries: readonly SkillManagerEntry[], width: number): string[] {
+  private entryRows(entries: readonly SkillManagerEntry[], width: number, maxRows: number): string[] {
     if (entries.length === 0) {
       return [this.params.theme.fg("warning", fit(this.t("entry.empty"), width))];
     }
-    const start = visibleStart(this.selected, entries.length, MAX_VISIBLE);
-    return entries.slice(start, start + MAX_VISIBLE).map((entry, offset) => {
+    const visibleLimit = entries.length > maxRows ? Math.max(1, maxRows - 1) : maxRows;
+    const start = visibleStart(this.selected, entries.length, visibleLimit);
+    const rows = entries.slice(start, start + visibleLimit).map((entry, offset) => {
       const selected = start + offset === this.selected;
       const prefix = selected ? this.params.theme.fg("accent", "›") : " ";
       if (entry.kind === "group") {
@@ -343,6 +347,22 @@ export class SkillManagerOverlay implements Component, Focusable {
         width,
       );
     });
+    const hidden = entries.length - rows.length;
+    if (hidden > 0) rows.push(this.params.theme.fg("dim", fit(`… +${hidden} more`, width)));
+    return rows;
+  }
+
+  private entryRowsBudget(hasDetail: boolean, hasNotice: boolean): number {
+    const terminalRows = this.params.getTerminalRows?.();
+    if (!terminalRows || terminalRows <= 0) return FALLBACK_MAX_VISIBLE;
+    const overlayRows = Math.max(3, Math.floor(terminalRows * 0.92));
+    const borderRows = 2;
+    const fixedBodyRows = 2 // header + separator
+      + 1 // filter line
+      + 1 // footer hints
+      + (hasDetail ? 1 : 0)
+      + (hasNotice ? 1 : 0);
+    return Math.max(2, overlayRows - borderRows - fixedBodyRows);
   }
 
   private filterLine(width: number, count: number): string {

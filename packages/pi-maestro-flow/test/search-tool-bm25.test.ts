@@ -34,6 +34,27 @@ test("weighted BM25 ranks names and schema keys ahead of unrelated descriptions"
   assert.throws(() => searchTools(index, "browser", 0), /positive integer/);
 });
 
+test("union tool schemas surface variant parameter names as schema keys", () => {
+  const unionTool: ToolInfo = {
+    name: "ssh",
+    description: "Execute commands on SSH servers",
+    parameters: Type.Union([
+      Type.Object({ command: Type.String(), cwd: Type.Optional(Type.String()) }),
+      Type.Object({ action: Type.Literal("targets") }),
+      Type.Union([
+        Type.Object({ action: Type.Literal("job_list") }),
+        Type.Object({ action: Type.Literal("job_kill"), jobId: Type.String() }),
+      ]),
+    ]),
+    sourceInfo: { path: "test", type: "extension" },
+  };
+  const discoverable = toDiscoverableTool(unionTool);
+  assert.deepEqual(discoverable.schemaKeys, ["action", "command", "cwd", "jobId"]);
+
+  const index = buildToolSearchIndex([unionTool].map(toDiscoverableTool));
+  assert.equal(searchTools(index, "jobId", 1)[0]?.tool.name, "ssh");
+});
+
 test("session startup defers only low-frequency tools and keeps core tools eager", () => {
   let active = ["read", "todo", "mcp", "resource", "browser", "lsp", "smart_search"];
   const deferred = deferLowFrequencyTools({

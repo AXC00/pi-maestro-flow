@@ -50,6 +50,7 @@ import {
   type DecodedInputToken,
   type DraftLayoutLine,
 } from "./input-text.ts";
+import type { OverlayTheme } from "pi-maestro-settings-core/ui";
 
 const MAX_LOG_LINES = 500;
 const STREAMING_MAX_LINES = 8;
@@ -119,19 +120,27 @@ interface AgentLog {
   };
 }
 
-const dim = (s: string) => `\x1b[2m${s}\x1b[22m`;
-const bold = (s: string) => `\x1b[1m${s}\x1b[22m`;
-const yellow = (s: string) => `\x1b[33m${s}\x1b[39m`;
-const green = (s: string) => `\x1b[32m${s}\x1b[39m`;
-const red = (s: string) => `\x1b[31m${s}\x1b[39m`;
-const progressPalette: ProgressPalette = {
-  dim,
-  accent: green,
-  running: yellow,
-  success: green,
-  error: red,
-  bold,
-};
+interface AttachPalette extends ProgressPalette {
+  yellow(text: string): string;
+  green(text: string): string;
+  red(text: string): string;
+}
+
+/** Build the palette from the host theme; without a theme text is unstyled. */
+function buildPalette(theme?: OverlayTheme): AttachPalette {
+  const fg = (role: string) => (s: string) => theme ? theme.fg(role, s) : s;
+  return {
+    dim: fg("dim"),
+    accent: fg("accent"),
+    running: fg("warning"),
+    success: fg("success"),
+    error: fg("error"),
+    yellow: fg("warning"),
+    green: fg("success"),
+    red: fg("error"),
+    bold: (s: string) => theme?.bold ? theme.bold(s) : theme ? theme.fg("text", s) : s,
+  };
+}
 
 function fitFooter(width: number, segments: string[]): string {
   let footer = "";
@@ -148,12 +157,12 @@ function activeMs(agent: ActiveAgent, now = Date.now()): number {
     - (agent.sleptAt ? now - agent.sleptAt : 0);
 }
 
-function frameLine(content: string, innerWidth: number): string {
-  return dim("│") + truncateToWidth(` ${content}`, innerWidth, "…", true) + dim("│");
+function frameLine(content: string, innerWidth: number, palette: AttachPalette): string {
+  return palette.dim("│") + truncateToWidth(` ${content}`, innerWidth, "…", true) + palette.dim("│");
 }
 
-function frameRule(innerWidth: number): string {
-  return dim("─".repeat(Math.max(0, innerWidth - 1)));
+function frameRule(innerWidth: number, palette: AttachPalette): string {
+  return palette.dim("─".repeat(Math.max(0, innerWidth - 1)));
 }
 
 function titleCase(text: string): string {
@@ -180,23 +189,24 @@ function progressStatusText(
   entry: AgentProgressSnapshot,
   now: number,
   t: TuiTranslator,
+  palette: AttachPalette,
 ): string {
   const display = effectiveDisplayStatus(entry.status, entry.resultReadyAt, entry.lastActivityAt, now, entry.phase);
   const status = display === "stalled"
-    ? red(t("status.stalled", { seconds: idleSeconds(entry.lastActivityAt, now) }))
+    ? palette.red(t("status.stalled", { seconds: idleSeconds(entry.lastActivityAt, now) }))
     : display === "result-ready"
-      ? green(t("status.resultReady"))
+      ? palette.green(t("status.resultReady"))
       : toneText(
-          progressPalette,
+          palette,
           STATUS_PRESENTATION[display].tone,
           titleCase(translateStatusText(STATUS_PRESENTATION[display].text, t)),
         );
   const parts = [
     status,
-    entry.toolCount ? dim(t("metrics.tools", { count: entry.toolCount })) : "",
-    entry.tokens ? dim(t("metrics.tok", { count: entry.tokens })) : "",
+    entry.toolCount ? palette.dim(t("metrics.tools", { count: entry.toolCount })) : "",
+    entry.tokens ? palette.dim(t("metrics.tok", { count: entry.tokens })) : "",
   ].filter(Boolean);
-  return parts.join(dim(" · "));
+  return parts.join(palette.dim(" · "));
 }
 
 /**
@@ -204,7 +214,7 @@ function progressStatusText(
  * the widget flagged something odd, so it must expose the same derived states
  * the widget does — a 10-minute-idle agent cannot look like a fresh one.
  */
-function agentStatusText(agent: ActiveAgent, now: number, t: TuiTranslator): string {
+function agentStatusText(agent: ActiveAgent, now: number, t: TuiTranslator, palette: AttachPalette): string {
   const display = effectiveDisplayStatus(
     agent.status,
     agent.resultReadyAt,
@@ -213,11 +223,11 @@ function agentStatusText(agent: ActiveAgent, now: number, t: TuiTranslator): str
     agent.phase,
     agent.pendingInteractions?.size ?? 0,
   );
-  if (display === "stalled") return red(t("status.stalled", { seconds: idleSeconds(agent.lastActivityAt, now) }));
-  if (display === "result-ready") return green(t("status.resultReady"));
-  if (display === "completed") return dim(t("common.done"));
+  if (display === "stalled") return palette.red(t("status.stalled", { seconds: idleSeconds(agent.lastActivityAt, now) }));
+  if (display === "result-ready") return palette.green(t("status.resultReady"));
+  if (display === "completed") return palette.dim(t("common.done"));
   const presentation = STATUS_PRESENTATION[display];
-  return toneText(progressPalette, presentation.tone, titleCase(translateStatusText(presentation.text, t)));
+  return toneText(palette, presentation.tone, titleCase(translateStatusText(presentation.text, t)));
 }
 
 export class AttachOverlay implements Component, Focusable {
@@ -250,6 +260,7 @@ export class AttachOverlay implements Component, Focusable {
   private readonly onSend?: (correlationId: string, message: string) => Promise<{ ok: boolean; message: string }>;
   private readonly t: TuiTranslator;
   private readonly localeDisposer: () => void;
+  private readonly palette: AttachPalette;
 
   constructor(
     initial: ActiveAgent,
@@ -259,7 +270,9 @@ export class AttachOverlay implements Component, Focusable {
     loadTranscript?: TranscriptLoader,
     initialTranscript = false,
     private readonly locale?: SupportedSettingsLocale,
+    private readonly theme?: OverlayTheme,
   ) {
+    this.palette = buildPalette(theme);
     this.t = createTuiTranslator(locale);
     this.localeDisposer = locale === undefined
       ? onTuiLocaleChange(() => {
@@ -735,7 +748,7 @@ export class AttachOverlay implements Component, Focusable {
     const targetHeight = Math.max(6, Math.min(height ?? terminalHeight, terminalHeight));
     if (targetHeight <= 12) return this.renderDocked(log, w, targetHeight, now);
     const inner = w - 2;
-    const rows: string[] = [this.renderTabs(inner), frameRule(inner)];
+    const rows: string[] = [this.renderTabs(inner), frameRule(inner, this.palette)];
 
     if (this.activeId === MAIN_TAB) {
       this.setTickVisibility("hidden", now);
@@ -744,7 +757,7 @@ export class AttachOverlay implements Component, Focusable {
 
     if (!log) {
       this.setTickVisibility("hidden", now);
-      rows.push(dim(this.t("attach.noAgentSelected")));
+      rows.push(this.palette.dim(this.t("attach.noAgentSelected")));
       return this.renderFrame(rows, w);
     }
 
@@ -754,13 +767,13 @@ export class AttachOverlay implements Component, Focusable {
       : log.progress.find((entry) => entry.taskIndex === log.selectedTaskIndex);
     this.setTickVisibility("full", now);
     const uptime = Math.max(0, Math.round(activeMs(agent, now) / 1000));
-    const status = selected ? progressStatusText(selected, now, this.t) : agentStatusText(agent, now, this.t);
+    const status = selected ? progressStatusText(selected, now, this.t, this.palette) : agentStatusText(agent, now, this.t, this.palette);
     const title = selected
-      ? `${progressIcon(selected.status, progressPalette)} ${bold(progressLabel(selected))}${dim(` (${selected.agent})`)}`
-      : `${bold(agent.agent)}/${bold(agent.name ?? agent.correlationId.slice(0, 8))}`;
+      ? `${progressIcon(selected.status, this.palette)} ${this.palette.bold(progressLabel(selected))}${this.palette.dim(` (${selected.agent})`)}`
+      : `${this.palette.bold(agent.agent)}/${this.palette.bold(agent.name ?? agent.correlationId.slice(0, 8))}`;
     const meta = selected
       ? status
-      : `${status}  ${dim(`${uptime}s`)}  ${dim(this.t("attach.inboxCount", { count: agent.inbox.length }))}`;
+      : `${status}  ${this.palette.dim(`${uptime}s`)}  ${this.palette.dim(this.t("attach.inboxCount", { count: agent.inbox.length }))}`;
     rows.push(
       visibleWidth(title) + 2 + visibleWidth(meta) <= inner
         ? `${title}  ${meta}`
@@ -768,7 +781,7 @@ export class AttachOverlay implements Component, Focusable {
     );
 
     if (log.progress.length > 1) {
-      rows.push(frameRule(inner));
+      rows.push(frameRule(inner, this.palette));
       rows.push(...this.renderProgressTree(
         log,
         inner,
@@ -776,12 +789,12 @@ export class AttachOverlay implements Component, Focusable {
       ));
     }
 
-    rows.push(frameRule(inner));
+    rows.push(frameRule(inner, this.palette));
     rows.push(...(selected ? this.renderSelectedTools(selected, inner) : this.renderTools(log, inner, now)));
-    rows.push(frameRule(inner));
+    rows.push(frameRule(inner, this.palette));
     if (!selected) rows.push(...this.renderStream(log, inner));
     if (!selected && (log.streamingText || log.activeTools.some((tool) => tool.status === "running"))) {
-      rows.push(frameRule(inner));
+      rows.push(frameRule(inner, this.palette));
     }
 
     const logLines = selected
@@ -791,13 +804,13 @@ export class AttachOverlay implements Component, Focusable {
         : this.buildLog(log, Math.max(1, inner - 2));
     const tailRows: string[] = [];
     if (agent.status === "sleeping") {
-      tailRows.push(frameRule(inner));
-      tailRows.push(`${yellow("◉")} ${dim(this.t("attach.sleepingHint"))}`);
+      tailRows.push(frameRule(inner, this.palette));
+      tailRows.push(`${this.palette.yellow("◉")} ${this.palette.dim(this.t("attach.sleepingHint"))}`);
     }
     if (this.onSend) {
-      tailRows.push(frameRule(inner));
+      tailRows.push(frameRule(inner, this.palette));
       if (this.composing && this.sendStatus) {
-        tailRows.push(truncateToWidth(`${red("!")} ${this.sendStatus}`, inner, "…"));
+        tailRows.push(truncateToWidth(`${this.palette.red("!")} ${this.sendStatus}`, inner, "…"));
       }
       tailRows.push(...this.renderComposer(inner));
     }
@@ -819,12 +832,12 @@ export class AttachOverlay implements Component, Focusable {
       ? ` ${log.scrollOffset + 1}-${Math.min(log.scrollOffset + logHeight, logLines.length)}/${logLines.length}`
       : "";
     const agentHint = log.progress.length > 1
-      ? `  ${dim("0")} ${this.t("attach.footer.overview")}  ${dim(`1-${Math.min(9, log.progress.length)}`)} ${this.t("common.view")}`
+      ? `  ${this.palette.dim("0")} ${this.t("attach.footer.overview")}  ${this.palette.dim(`1-${Math.min(9, log.progress.length)}`)} ${this.t("common.view")}`
       : "";
     const transcriptHint = this.loadTranscript
       ? log.transcriptMode ? this.t("attach.footer.activity") : this.t("attach.footer.transcript")
       : "";
-    out.push(dim(fitFooter(w, [
+    out.push(this.palette.dim(fitFooter(w, [
       this.t("attach.footer.back"),
       this.onSend ? (this.composing ? this.t("attach.footer.send") : this.t("attach.footer.message")) : "",
       this.composing ? this.t("attach.footer.newline") : "",
@@ -837,14 +850,14 @@ export class AttachOverlay implements Component, Focusable {
   }
 
   private renderComposer(width: number, maxRows = MAX_COMPOSER_ROWS, framed = true): string[] {
-    const prefix = `${green("›")} `;
+    const prefix = `${this.palette.green("›")} `;
     // The frame line reserves `│ ` + a leading space (3 cols total); docked
     // rows truncate at `width` directly, so only the prefix is reserved.
     const draftWidth = Math.max(1, width - (framed ? 3 : 2));
     this.composerDraftWidth = draftWidth;
     if (!this.composing) {
       return [truncateToWidth(
-        this.sendStatus ? `${dim(this.t("attach.message.label"))} ${this.sendStatus}` : `${dim(this.t("attach.message.label"))} ${this.t("attach.message.compose")}`,
+        this.sendStatus ? `${this.palette.dim(this.t("attach.message.label"))} ${this.sendStatus}` : `${this.palette.dim(this.t("attach.message.label"))} ${this.t("attach.message.compose")}`,
         width,
         "…",
       )];
@@ -860,7 +873,7 @@ export class AttachOverlay implements Component, Focusable {
       : 0;
     const rows = layout.lines.slice(start, start + maxVisible);
     const out: string[] = [];
-    if (start > 0) out.push(truncateToWidth(dim("⋯"), width, "…"));
+    if (start > 0) out.push(truncateToWidth(this.palette.dim("⋯"), width, "…"));
     for (let i = 0; i < rows.length; i++) {
       const rowIndex = start + i;
       out.push(this.renderComposerRow(
@@ -886,13 +899,14 @@ export class AttachOverlay implements Component, Focusable {
     const text = line.text;
     const visualEnd = line.start + text.length;
     const marker = this.focused ? CURSOR_MARKER : "";
+    const inverse = this.theme?.inverse ?? ((s: string) => `\x1b[7m${s}\x1b[27m`);
     if (cursorOffset >= visualEnd) {
-      return truncateToWidth(`${prefix}${text}${marker}\x1b[7m \x1b[27m`, width, "…");
+      return truncateToWidth(`${prefix}${text}${marker}${inverse(" ")}`, width, "…");
     }
     const next = nextGraphemeBoundary(this.draft, cursorOffset);
     const cursorChar = this.draft.slice(cursorOffset, next);
     return truncateToWidth(
-      `${prefix}${this.draft.slice(line.start, cursorOffset)}${marker}\x1b[7m${cursorChar}\x1b[27m${this.draft.slice(next, visualEnd)}`,
+      `${prefix}${this.draft.slice(line.start, cursorOffset)}${marker}${inverse(cursorChar)}${this.draft.slice(next, visualEnd)}`,
       width,
       "…",
     );
@@ -903,8 +917,8 @@ export class AttachOverlay implements Component, Focusable {
       this.setTickVisibility("hidden", now);
       return [
         this.renderTabs(width),
-        truncateToWidth(dim(this.t("attach.mainDocked")), width, "…"),
-        dim(fitFooter(width, [
+        truncateToWidth(this.palette.dim(this.t("attach.mainDocked")), width, "…"),
+        this.palette.dim(fitFooter(width, [
           this.t("attach.footer.back"),
           this.t("attach.footer.switch"),
           this.t("attach.footer.return"),
@@ -914,8 +928,8 @@ export class AttachOverlay implements Component, Focusable {
     if (!log) {
       this.setTickVisibility("hidden", now);
       return [
-        truncateToWidth(dim(this.t("attach.noActiveSession")), width, "…"),
-        truncateToWidth(dim(this.t("attach.footer.back")), width, "…"),
+        truncateToWidth(this.palette.dim(this.t("attach.noActiveSession")), width, "…"),
+        truncateToWidth(this.palette.dim(this.t("attach.footer.back")), width, "…"),
       ];
     }
 
@@ -924,16 +938,16 @@ export class AttachOverlay implements Component, Focusable {
       ? undefined
       : log.progress.find((entry) => entry.taskIndex === log.selectedTaskIndex);
     this.setTickVisibility("tools", now);
-    const status = selected ? progressStatusText(selected, now, this.t) : agentStatusText(agent, now, this.t);
+    const status = selected ? progressStatusText(selected, now, this.t, this.palette) : agentStatusText(agent, now, this.t, this.palette);
     const title = selected
-      ? `${progressIcon(selected.status, progressPalette)} ${bold(progressLabel(selected))} ${dim(`(${selected.agent})`)}`
-      : `${bold(agent.agent)}/${bold(agent.name ?? agent.correlationId.slice(0, 8))}`;
+      ? `${progressIcon(selected.status, this.palette)} ${this.palette.bold(progressLabel(selected))} ${this.palette.dim(`(${selected.agent})`)}`
+      : `${this.palette.bold(agent.agent)}/${this.palette.bold(agent.name ?? agent.correlationId.slice(0, 8))}`;
     const lines: string[] = [
       this.renderTabs(width),
       truncateToWidth(`${title}  ${status}`, width, "…"),
     ];
 
-    const footer = dim(fitFooter(width, [
+    const footer = this.palette.dim(fitFooter(width, [
       this.t("attach.footer.back"),
       this.onSend ? (this.composing ? this.t("attach.footer.send") : this.t("attach.footer.message")) : "",
       this.composing ? this.t("attach.footer.newline") : "",
@@ -946,19 +960,19 @@ export class AttachOverlay implements Component, Focusable {
     ]));
     const tailRows: string[] = [];
     if (this.onSend && this.composing && this.sendStatus) {
-      tailRows.push(truncateToWidth(`${red("!")} ${this.sendStatus}`, width, "…"));
+      tailRows.push(truncateToWidth(`${this.palette.red("!")} ${this.sendStatus}`, width, "…"));
     }
     if (this.onSend) tailRows.push(...this.renderComposer(width, Math.max(1, Math.min(MAX_COMPOSER_ROWS, height - 6)), false));
     tailRows.push(footer);
 
     if (log.progress.length > 1) {
-      const tree = buildProgressTree(log.progress, progressPalette, now, this.locale);
+      const tree = buildProgressTree(log.progress, this.palette, now, this.locale);
       const focus = log.selectedTaskIndex ?? focusTaskIndex(log.progress);
       const maxTreeRows = Math.max(0, Math.min(3, height - lines.length - tailRows.length - 2));
       if (maxTreeRows > 0) {
         const window = selectProgressWindow(tree, maxTreeRows, focus);
         lines.push(...window.rows.map((row) => truncateToWidth(
-          `${row.taskIndex === log.selectedTaskIndex ? green("›") : " "} ${row.text}`,
+          `${row.taskIndex === log.selectedTaskIndex ? this.palette.green("›") : " "} ${row.text}`,
           width,
           "…",
         )));
@@ -978,7 +992,7 @@ export class AttachOverlay implements Component, Focusable {
             ...this.buildLog(log, width),
             ...log.streamingText.split("\n").filter((line) => line.trim()).slice(-STREAMING_MAX_LINES),
           ];
-    if (streamLines.length === 0) streamLines.push(dim(this.t("attach.waitingOutput")));
+    if (streamLines.length === 0) streamLines.push(this.palette.dim(this.t("attach.waitingOutput")));
 
     const contentHeight = Math.max(0, height - lines.length - tailRows.length);
     const maxOffset = Math.max(0, streamLines.length - contentHeight);
@@ -995,7 +1009,7 @@ export class AttachOverlay implements Component, Focusable {
   }
 
   private renderProgressTree(log: AgentLog, width: number, maxRows = GRAPH_LIST_MAX_ROWS): string[] {
-    const tree = buildProgressTree(log.progress, progressPalette, Date.now(), this.locale);
+    const tree = buildProgressTree(log.progress, this.palette, Date.now(), this.locale);
     const focus = log.selectedTaskIndex ?? focusTaskIndex(log.progress);
     const window = selectProgressWindow(tree, maxRows, focus);
     const running = log.progress.filter((entry) => entry.status === "running").length;
@@ -1004,7 +1018,7 @@ export class AttachOverlay implements Component, Focusable {
     const range = window.total > window.rows.length
       ? `${window.start + 1}-${window.start + window.rows.length}/${window.total}`
       : `${window.total}`;
-    const header = dim(this.t("attach.agentsSummary", {
+    const header = this.palette.dim(this.t("attach.agentsSummary", {
       running,
       pending,
       failed: failed ? ` · ${this.t("progress.summary.failedCount", { count: failed })}` : "",
@@ -1013,7 +1027,7 @@ export class AttachOverlay implements Component, Focusable {
     return [
       truncateToWidth(header, width, "…"),
       ...window.rows.map((row) => truncateToWidth(
-        `${row.taskIndex === log.selectedTaskIndex ? green("›") : " "} ${row.text}`,
+        `${row.taskIndex === log.selectedTaskIndex ? this.palette.green("›") : " "} ${row.text}`,
         width,
         "…",
       )),
@@ -1022,19 +1036,19 @@ export class AttachOverlay implements Component, Focusable {
 
   private renderSelectedTools(entry: AgentProgressSnapshot, width: number): string[] {
     const tools = entry.recentTools ?? [];
-    if (tools.length === 0) return [dim(idleLabel(entry.lastActivityAt, Date.now(), this.t))];
+    if (tools.length === 0) return [this.palette.dim(idleLabel(entry.lastActivityAt, Date.now(), this.t))];
     const parts = tools.slice(-6).map((tool) => {
-      if (tool.status === "running") return yellow(`${SPINNER[this.frame]} ${tool.name}`);
-      if (tool.status === "failed") return red(`✗ ${tool.name}`);
-      return dim(`✓ ${tool.name}`);
+      if (tool.status === "running") return this.palette.yellow(`${SPINNER[this.frame]} ${tool.name}`);
+      if (tool.status === "failed") return this.palette.red(`✗ ${tool.name}`);
+      return this.palette.dim(`✓ ${tool.name}`);
     });
-    if (tools.length > 6) parts.unshift(dim(`+${tools.length - 6}`));
-    return [truncateToWidth(`${dim(this.t("attach.tools"))} ${parts.join(dim("  "))}`, width, "…")];
+    if (tools.length > 6) parts.unshift(this.palette.dim(`+${tools.length - 6}`));
+    return [truncateToWidth(`${this.palette.dim(this.t("attach.tools"))} ${parts.join(this.palette.dim("  "))}`, width, "…")];
   }
 
   private buildSelectedLog(entry: AgentProgressSnapshot, width: number): string[] {
     const message = entry.lastMessage?.trim();
-    if (!message) return [dim(entry.status === "pending" ? this.t("attach.waitingDependencies") : this.t("attach.waitingOutput"))];
+    if (!message) return [this.palette.dim(entry.status === "pending" ? this.t("attach.waitingDependencies") : this.t("attach.waitingOutput"))];
     const lines: string[] = [];
     for (const rawLine of message.split("\n")) {
       lines.push(...wrapTextWithAnsi(rawLine, width));
@@ -1105,10 +1119,10 @@ export class AttachOverlay implements Component, Focusable {
   private buildTranscript(log: AgentLog, width: number): string[] {
     const transcript = log.transcript;
     if (!transcript) {
-      return [dim(log.transcriptLoading ? this.t("attach.loadingTranscript") : this.t("attach.noTranscript"))];
+      return [this.palette.dim(log.transcriptLoading ? this.t("attach.loadingTranscript") : this.t("attach.noTranscript"))];
     }
     if (transcript.rows.length === 0) {
-      return [dim(this.t("attach.emptyTranscript"))];
+      return [this.palette.dim(this.t("attach.emptyTranscript"))];
     }
     const locale = this.locale ?? getTuiLocale();
     const cache = log.transcriptCache;
@@ -1125,13 +1139,13 @@ export class AttachOverlay implements Component, Focusable {
       ? transcript.rows.length - AttachOverlay.TRANSCRIPT_MAX_ROWS
       : 0;
     const out: string[] = [];
-    if (start > 0) out.push(dim(this.t("attach.olderMessages", { count: start })));
+    if (start > 0) out.push(this.palette.dim(this.t("attach.olderMessages", { count: start })));
     for (let i = start; i < transcript.rows.length; i++) {
       out.push(...this.renderTranscriptRow(transcript.rows[i]!, width));
     }
-    if (log.transcriptLoading) out.push(dim(this.t("attach.refreshing")));
+    if (log.transcriptLoading) out.push(this.palette.dim(this.t("attach.refreshing")));
     if (transcript.source === "memory") {
-      out.push(dim(this.t("attach.memoryTranscript")));
+      out.push(this.palette.dim(this.t("attach.memoryTranscript")));
     }
     log.transcriptCache = {
       width,
@@ -1149,45 +1163,45 @@ export class AttachOverlay implements Component, Focusable {
     switch (row.kind) {
       case "user":
         return this.prefixedLines(
-          `${progressPalette.accent("❯")} `,
+          `${this.palette.accent("❯")} `,
           row.text,
           contentWidth,
           3,
         );
       case "assistant":
         return this.prefixedLines(
-          `${progressPalette.dim("·")} `,
+          `${this.palette.dim("·")} `,
           row.text,
           contentWidth,
           3,
         );
       case "tool": {
         const name = row.toolName ?? "tool";
-        const head = `${progressPalette.dim("▸")} ${progressPalette.accent(name)} `;
+        const head = `${this.palette.dim("▸")} ${this.palette.accent(name)} `;
         const lines = this.limitText(row.text, contentWidth - visibleWidth(head), 1);
         if (lines.length === 0) return [head.trimEnd()];
         return lines.map((line, i) => i === 0 ? `${head}${line}` : line);
       }
       case "tool_result": {
-        const mark = row.isError ? progressPalette.error("✗") : progressPalette.dim("·");
+        const mark = row.isError ? this.palette.error("✗") : this.palette.dim("·");
         return this.prefixedLines(`${mark} `, row.text, contentWidth, 3);
       }
       case "thinking": {
         const lines = row.text.trim().split("\n").filter((line) => line.trim() !== "");
         const preview = lines[0] ?? "";
         const suffix = lines.length > 1
-          ? progressPalette.dim(this.t("attach.thinkingLines", { count: lines.length }))
+          ? this.palette.dim(this.t("attach.thinkingLines", { count: lines.length }))
           : "";
         // Truncate the preview against the width left after the suffix, so the
         // line-count hint is never cut by the outer frame truncation.
         const available = Math.max(1, contentWidth - visibleWidth(suffix));
-        return [`${progressPalette.dim("…")} ${progressPalette.dim(truncateToWidth(preview, available, "…"))}${suffix}`];
+        return [`${this.palette.dim("…")} ${this.palette.dim(truncateToWidth(preview, available, "…"))}${suffix}`];
       }
       case "meta":
-        return [progressPalette.dim(`─ ${truncateToWidth(row.text, contentWidth, "…")}`)];
+        return [this.palette.dim(`─ ${truncateToWidth(row.text, contentWidth, "…")}`)];
       case "system":
       default:
-        return this.prefixedLines(progressPalette.dim("»") + " ", row.text, contentWidth, 3);
+        return this.prefixedLines(this.palette.dim("»") + " ", row.text, contentWidth, 3);
     }
   }
 
@@ -1210,17 +1224,17 @@ export class AttachOverlay implements Component, Focusable {
     if (!trimmed) return [];
     const raw = trimmed.split("\n").map((line) => line.trimEnd());
     const shown = raw.slice(0, maxLines).map((line) => truncateToWidth(line, width, "…"));
-    if (raw.length > maxLines) shown.push(progressPalette.dim("…"));
+    if (raw.length > maxLines) shown.push(this.palette.dim("…"));
     return shown;
   }
 
   private renderMainTab(rows: string[], inner: number, w: number): string[] {
-    rows.push(frameRule(inner));
-    rows.push(dim(`● ${this.t("attach.main")}`));
-    rows.push(dim(`   ${this.t("attach.mainReturn")}`));
-    rows.push(frameRule(inner));
+    rows.push(frameRule(inner, this.palette));
+    rows.push(this.palette.dim(`● ${this.t("attach.main")}`));
+    rows.push(this.palette.dim(`   ${this.t("attach.mainReturn")}`));
+    rows.push(frameRule(inner, this.palette));
     const out = this.renderFrame(rows, w);
-    out.push(dim(fitFooter(w, [
+    out.push(this.palette.dim(fitFooter(w, [
       this.t("attach.footer.back"),
       this.t("attach.footer.switchCount", { count: this.order.length }),
       this.t("attach.footer.return"),
@@ -1234,21 +1248,21 @@ export class AttachOverlay implements Component, Focusable {
       return truncateToWidth(this.t("attach.compactCancel", { content }), width, "…");
     }
     if (this.activeId === MAIN_TAB) {
-      return truncateToWidth(dim(this.t("attach.mainCompact")), width, "…");
+      return truncateToWidth(this.palette.dim(this.t("attach.mainCompact")), width, "…");
     }
-    if (!log) return truncateToWidth(`${dim("□")} ${this.t("common.agents")}`, width, "…");
+    if (!log) return truncateToWidth(`${this.palette.dim("□")} ${this.t("common.agents")}`, width, "…");
     const selected = log.selectedTaskIndex === undefined
       ? undefined
       : log.progress.find((entry) => entry.taskIndex === log.selectedTaskIndex);
     if (selected) {
       return truncateToWidth(
-        `${progressIcon(selected.status, progressPalette)} ${selected.taskIndex + 1} ${progressLabel(selected)}`,
+        `${progressIcon(selected.status, this.palette)} ${selected.taskIndex + 1} ${progressLabel(selected)}`,
         width,
         "…",
       );
     }
     const agent = log.agent;
-    const icon = agent.status === "sleeping" ? yellow("◉") : agent.status === "completed" ? dim("✓") : green("■");
+    const icon = agent.status === "sleeping" ? this.palette.yellow("◉") : agent.status === "completed" ? this.palette.dim("✓") : this.palette.green("■");
     const name = agent.name ?? agent.correlationId.slice(0, 6);
     return truncateToWidth(`${icon} ${agent.agent}/${name} · ${this.t("attach.compactMessage")}`, width, "…");
   }
@@ -1256,33 +1270,33 @@ export class AttachOverlay implements Component, Focusable {
   private renderFrame(rows: string[], width: number): string[] {
     const inner = width - 2;
     return [
-      dim(`╭${"─".repeat(inner)}╮`),
-      ...rows.map((row) => frameLine(row, inner)),
-      dim(`╰${"─".repeat(inner)}╯`),
+      this.palette.dim(`╭${"─".repeat(inner)}╮`),
+      ...rows.map((row) => frameLine(row, inner, this.palette)),
+      this.palette.dim(`╰${"─".repeat(inner)}╯`),
     ];
   }
 
   private renderTabs(width: number): string {
-    if (this.order.length === 0) return dim(this.t("common.agents"));
+    if (this.order.length === 0) return this.palette.dim(this.t("common.agents"));
     const activeIndex = Math.max(0, this.order.indexOf(this.activeId));
     const labels = this.order.map((cid) => {
       if (cid === MAIN_TAB) {
         const main = `● ${this.t("attach.main")}`;
-        return cid === this.activeId ? `${green("▸")} ${bold(green(main))}` : main;
+        return cid === this.activeId ? `${this.palette.green("▸")} ${this.palette.bold(this.palette.green(main))}` : main;
       }
       const log = this.agents.get(cid);
-      if (!log) return dim(cid.slice(0, 6));
+      if (!log) return this.palette.dim(cid.slice(0, 6));
       const agent = log.agent;
       const name = agent.name ?? cid.slice(0, 6);
       const icon = agent.status === "sleeping" ? "◉" : agent.status === "completed" ? "✓" : "■";
       const label = `${icon} @${name}`;
-      return cid === this.activeId ? `${green("▸")} ${bold(green(label))}` : dim(label);
+      return cid === this.activeId ? `${this.palette.green("▸")} ${this.palette.bold(this.palette.green(label))}` : this.palette.dim(label);
     });
-    const prefix = `${dim(`${this.t("common.agents")} ${activeIndex + 1}/${this.order.length} ·`)} `;
-    const full = `${prefix}${labels.join(dim(" · "))}`;
+    const prefix = `${this.palette.dim(`${this.t("common.agents")} ${activeIndex + 1}/${this.order.length} ·`)} `;
+    const full = `${prefix}${labels.join(this.palette.dim(" · "))}`;
     if (visibleWidth(full) <= width) return full;
-    const hiddenLeft = activeIndex > 0 ? dim(`‹${activeIndex}`) : "";
-    const hiddenRight = activeIndex < this.order.length - 1 ? dim(`${this.order.length - activeIndex - 1}›`) : "";
+    const hiddenLeft = activeIndex > 0 ? this.palette.dim(`‹${activeIndex}`) : "";
+    const hiddenRight = activeIndex < this.order.length - 1 ? this.palette.dim(`${this.order.length - activeIndex - 1}›`) : "";
     return truncateToWidth(
       `${prefix}${labels[activeIndex]}${hiddenLeft ? ` ${hiddenLeft}` : ""}${hiddenRight ? ` ${hiddenRight}` : ""}`,
       width,
@@ -1291,30 +1305,30 @@ export class AttachOverlay implements Component, Focusable {
   }
 
   private renderTools(log: AgentLog, width: number, now: number): string[] {
-    if (log.activeTools.length === 0) return [dim(idleLabel(log.agent.lastActivityAt, now, this.t))];
+    if (log.activeTools.length === 0) return [this.palette.dim(idleLabel(log.agent.lastActivityAt, now, this.t))];
     const parts: string[] = [];
     const spinner = SPINNER[this.frame];
     for (const tool of log.activeTools.slice(-6)) {
       const seconds = Math.max(0, Math.round((now - tool.startedAt) / 1000));
-      if (tool.status === "running") parts.push(yellow(`${spinner} ${bold(tool.name)} ${dim(`${seconds}s`)}`));
-      else if (tool.status === "failed") parts.push(red(`✗ ${tool.name}`));
-      else parts.push(dim(`✓ ${tool.name}`));
+      if (tool.status === "running") parts.push(this.palette.yellow(`${spinner} ${this.palette.bold(tool.name)} ${this.palette.dim(`${seconds}s`)}`));
+      else if (tool.status === "failed") parts.push(this.palette.red(`✗ ${tool.name}`));
+      else parts.push(this.palette.dim(`✓ ${tool.name}`));
     }
-    if (log.activeTools.length > 6) parts.unshift(dim(`+${log.activeTools.length - 6}`));
-    return [truncateToWidth(`${dim(this.t("attach.tools"))} ${parts.join(dim("  "))}`, width, "…")];
+    if (log.activeTools.length > 6) parts.unshift(this.palette.dim(`+${log.activeTools.length - 6}`));
+    return [truncateToWidth(`${this.palette.dim(this.t("attach.tools"))} ${parts.join(this.palette.dim("  "))}`, width, "…")];
   }
 
   private renderStream(log: AgentLog, width: number): string[] {
-    if (!log.streamingText) return [dim(this.t("attach.outputWaiting"))];
+    if (!log.streamingText) return [this.palette.dim(this.t("attach.outputWaiting"))];
     const all = log.streamingText.split("\n");
     const tail = all.slice(-STREAMING_MAX_LINES);
     const header = all.length > STREAMING_MAX_LINES
-      ? dim(this.t("attach.outputEarlier", { count: all.length - STREAMING_MAX_LINES }))
-      : dim(this.t("attach.output"));
+      ? this.palette.dim(this.t("attach.outputEarlier", { count: all.length - STREAMING_MAX_LINES }))
+      : this.palette.dim(this.t("attach.output"));
     const contentWidth = Math.max(1, width - 3);
     return [
       header,
-      ...tail.map((line) => `${dim("│")} ${truncateToWidth(line, contentWidth, "…")}`),
+      ...tail.map((line) => `${this.palette.dim("│")} ${truncateToWidth(line, contentWidth, "…")}`),
     ];
   }
 
@@ -1345,14 +1359,14 @@ export class AttachOverlay implements Component, Focusable {
     const result: string[] = [];
     for (const entry of log.lines) {
       for (const line of wrapTextWithAnsi(entry.text, width)) {
-        if (entry.kind === "tool") result.push(`${green("■")} ${bold(line)}`);
-        else if (entry.kind === "output") result.push(`${dim("│")} ${line}`);
-        else if (entry.kind === "system") result.push(`${dim("»")} ${yellow(line)}`);
+        if (entry.kind === "tool") result.push(`${this.palette.green("■")} ${this.palette.bold(line)}`);
+        else if (entry.kind === "output") result.push(`${this.palette.dim("│")} ${line}`);
+        else if (entry.kind === "system") result.push(`${this.palette.dim("»")} ${this.palette.yellow(line)}`);
         else result.push(`  ${line}`);
       }
     }
     if (inbox.length > 0) {
-      result.push(dim(this.t("attach.inbox")));
+      result.push(this.palette.dim(this.t("attach.inbox")));
       for (const message of inbox.slice(-5)) {
         const time = new Date(message.timestamp).toISOString().slice(11, 19);
         // Payloads are capped by bytes (256KB total), never by display size —
@@ -1362,9 +1376,9 @@ export class AttachOverlay implements Component, Focusable {
           : message.payload;
         const wrapped = wrapTextWithAnsi(`[${time}] ◀ ${message.from}: ${payload}`, width);
         for (const line of wrapped.slice(0, INBOX_PREVIEW_LINES)) {
-          result.push(`${yellow("◀")} ${line}`);
+          result.push(`${this.palette.yellow("◀")} ${line}`);
         }
-        if (wrapped.length > INBOX_PREVIEW_LINES) result.push(`${yellow("◀")} ${dim("…")}`);
+        if (wrapped.length > INBOX_PREVIEW_LINES) result.push(`${this.palette.yellow("◀")} ${this.palette.dim("…")}`);
       }
     }
     log.logCache = {

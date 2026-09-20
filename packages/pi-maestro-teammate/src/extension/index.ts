@@ -9920,6 +9920,8 @@ This Monitor-only lifecycle tool loads configured target ids without exposing SS
               outputLog: targetAgent.outputLog,
             }),
           initialTranscript,
+          undefined,
+          _theme,
         );
         overlay.setRequestRender(() => tui.requestRender());
 
@@ -10875,8 +10877,8 @@ This Monitor-only lifecycle tool loads configured target ids without exposing SS
       widgetCtx.ui.setWidget("teammate-agents", (tui, theme) => {
         widgetTui = tui;
         return {
-          render(width: number): string[] {
-            return renderAgentStatusWidget(widgetAgents, width, theme);
+          render(width: number, height?: number): string[] {
+            return renderAgentStatusWidget(widgetAgents, width, theme, height);
           },
           invalidate() {},
         };

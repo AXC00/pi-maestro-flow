@@ -472,3 +472,34 @@ test("disabled Fabric and strict Pi/SSH schemas fail closed while Pi tools injec
   assert.equal(typeof calls[0]?.args.deadlineAt, "number");
   assert.equal(calls[0]?.cwd, root);
 });
+
+test("dependent lease TTLs are not capped by the renewable connection lease", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "gateway-fabric-ttl-"));
+  const fixture = await setupRuntime(root);
+  const { runtime } = fixture;
+  t.after(async () => { await runtime.close(); await rm(root, { recursive: true, force: true }); });
+  const owner = createGatewayPrincipal("stdio", "owner", { authenticated: true, workspaceId: fixture.localWorkspaceId });
+
+  const connected = resultData(await runtime.call("device", control("connect", {
+    deviceId: "device-1", connectorId: "connector-1", expectedCredentialGeneration: 1,
+  }), owner)).connection as { connectionId: string; generation: number; expiresAt: number };
+  fixture.connections.acceptAdvertisement(advertisement(connected.connectionId, connected.generation, fixture.localWorkspaceId));
+
+  // The provider lease expires in ~60s; a longer requested TTL must still win
+  // because heartbeats renew the connection lease underneath dependent leases.
+  const binding = resultData(await runtime.call("workspace", control("bind", {
+    deviceId: "device-1", connectionId: connected.connectionId, workspaceId: "fabric-workspace-1",
+    expectedConnectionGeneration: connected.generation, expectedWorkspaceGeneration: 1,
+    requestedTtlMs: 120_000, deadlineAt: Date.now() + 300_000,
+  }), owner)).binding as { bindingId: string; expiresAt: number; revision: number };
+  assert.ok(binding.expiresAt > connected.expiresAt, "binding expiry must not be capped by the connection lease");
+
+  const route = resultData(await runtime.call("route", control("open", {
+    connectionId: connected.connectionId, workspaceBindingId: binding.bindingId, endpointId: "endpoint-1",
+    expectedConnectionGeneration: connected.generation, expectedWorkspaceGeneration: 1,
+    expectedEndpointGeneration: 1, requestedTtlMs: 90_000, deadlineAt: Date.now() + 300_000,
+    operationClass: "mcp-read", pathCandidates: ["hub"],
+  }), owner)).route as { routeId: string; expiresAt: number; revision: number };
+  assert.ok(route.expiresAt > connected.expiresAt, "route expiry must not be capped by the connection lease");
+  assert.ok(route.expiresAt <= binding.expiresAt, "route expiry remains bounded by its workspace binding");
+});

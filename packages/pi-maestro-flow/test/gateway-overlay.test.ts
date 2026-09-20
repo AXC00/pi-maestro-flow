@@ -670,7 +670,12 @@ test("Gateway uses home/config pages, renders two columns, and saves OpenAI tunn
     "",
   ].join("\n"), "utf8");
 
-  const overlay = new GatewayOverlay({ cwd: "D:/cfg-demo", requestRender: () => undefined, initialRefresh: false, close: () => undefined });
+  const theme = {
+    fg: (name: string, text: string) => `<${name}>${text}</>`,
+    bg: (name: string, text: string) => `<bg:${name}>${text}</>`,
+    bold: (text: string) => `<b>${text}</>`,
+  };
+  const overlay = new GatewayOverlay({ cwd: "D:/cfg-demo", requestRender: () => undefined, initialRefresh: false, close: () => undefined, theme });
   const renderText = () => overlay.render(110).join("\n");
   const select = (key: string) => {
     overlay["configSelected"] = overlay["configEntries"]().findIndex((entry) => entry.key === key);
@@ -694,7 +699,7 @@ test("Gateway uses home/config pages, renders two columns, and saves OpenAI tunn
 
   select("commands.default");
   overlay.handleInput(" ");
-  assert.match(renderText(), /default: \x1b\[33mconfirm/);
+  assert.match(renderText(), /default: <warning>confirm/);
 
   select("commandsAllow");
   overlay.handleInput("\r");
@@ -797,4 +802,57 @@ test("Gateway collaboration view distinguishes independent Todo and exposes memb
   assert.match(text, /lost/);
   assert.match(text, /next cursor 7 · oldest 7/);
   assert.match(text, /cursor gap: older Monitor events were lost/);
+});
+
+test("tunnel page Esc closes the overlay when it is the initial page", async (t) => {
+  const { GatewayOverlay } = await import("../src/tui/gateway-overlay.ts");
+  let closed = 0;
+  const overlay = new GatewayOverlay({ cwd: "D:/tunnel-esc", requestRender: () => undefined, initialRefresh: false, initialPage: "tunnel", close: () => { closed++; } });
+  t.after(() => overlay.dispose());
+  const text = overlay.render(100).join("\n");
+  assert.match(text, /Tunnel/);
+  assert.match(text, /Esc 关闭/);
+  overlay.handleInput("\x1b");
+  assert.equal(closed, 1);
+  assert.equal(overlay["closed"], true);
+});
+
+test("u opens the tunnel page from home and Esc returns to home", async (t) => {
+  const { GatewayOverlay } = await import("../src/tui/gateway-overlay.ts");
+  let closed = 0;
+  const overlay = new GatewayOverlay({ cwd: "D:/tunnel-nav", requestRender: () => undefined, initialRefresh: false, close: () => { closed++; } });
+  t.after(() => overlay.dispose());
+  assert.match(overlay.render(100).join("\n"), /U 隧道/);
+  overlay.handleInput("u");
+  assert.equal(overlay["mode"], "tunnel");
+  const text = overlay.render(100).join("\n");
+  assert.match(text, /Tunnel/);
+  assert.match(text, /Esc 返回/);
+  overlay.handleInput("\x1b");
+  assert.equal(closed, 0);
+  assert.equal(overlay["mode"], "list");
+  assert.match(overlay.render(100).join("\n"), /服务概览/);
+});
+
+test("config page Esc closes the overlay when it is the initial page", async (t) => {
+  const { GatewayOverlay } = await import("../src/tui/gateway-overlay.ts");
+  let closed = 0;
+  const overlay = new GatewayOverlay({ cwd: "D:/config-esc", requestRender: () => undefined, initialRefresh: false, initialPage: "config", close: () => { closed++; } });
+  t.after(() => overlay.dispose());
+  assert.equal(overlay["mode"], "config");
+  overlay.handleInput("\x1b");
+  assert.equal(closed, 1);
+  assert.equal(overlay["closed"], true);
+});
+
+test("config page Esc returns home when entered from home", async (t) => {
+  const { GatewayOverlay } = await import("../src/tui/gateway-overlay.ts");
+  let closed = 0;
+  const overlay = new GatewayOverlay({ cwd: "D:/config-nav", requestRender: () => undefined, initialRefresh: false, close: () => { closed++; } });
+  t.after(() => overlay.dispose());
+  overlay.handleInput("2");
+  assert.equal(overlay["mode"], "config");
+  overlay.handleInput("\x1b");
+  assert.equal(closed, 0);
+  assert.equal(overlay["mode"], "list");
 });

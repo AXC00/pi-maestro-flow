@@ -1,0 +1,38 @@
+[package]
+name = "pi-fluent-tui"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "pi-fluent-tui application crate (P3: Devin-style TUI — pi-rpc + blitz-dom + scrollback)."
+
+[dependencies]
+# --- P0 spike deps: blitz-dom 0.3.0-beta.2 headless layout pipeline ---
+#
+# NOTE: dioxus-native-dom 0.8.0-alpha.1 hard-pins blitz-dom =0.3.0-beta.1.
+# Cargo cannot put blitz-dom beta.1 and beta.2 in one dependency graph
+# (semver-compatible prereleases unify to a single version), so the
+# Dioxus-driven pipeline lives in the standalone crate
+# `pi-tui/spikes/dioxus-blitz/` (own workspace + lockfile). See SPIKE-NOTES.md.
+blitz-dom = { version = "=0.3.0-beta.2", default-features = false, features = ["system-fonts", "complex-scripts"] }
+blitz-traits = "=0.3.0-beta.2"
+# complex-scripts: ICU4X segmentation data for CJK/complex scripts
+parley = { version = "0.11", features = ["complex-scripts"] }
+
+# --- P3: TUI assembly ---
+scrollback = { path = "../scrollback" }
+pi-rpc = { path = "../pi-rpc" }
+tokio = { version = "1", features = ["full"] }
+crossterm = { version = "0.29", features = ["event-stream"] }
+futures-util = "0.3"
+unicode-segmentation = "1"
+unicode-width = "0.2"
+serde_json = "1"
+# P4: terminal_markdown (RECON §9 — original uses pulldown-cmark 0.13.1)
+pulldown-cmark = { version = "=0.13.1", default-features = false }
+# /copy — system clipboard
+arboard = "3"
+# @ file mentions — gitignore-aware walker
+ignore = "0.4"
+# ctrl+v image paste — PNG encode + base64 for the wire
+png = "0.17"
+base64 = "0.22"

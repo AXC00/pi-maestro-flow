@@ -694,3 +694,42 @@ test("abort and pre-open authority errors fail closed", async () => {
   await expectCode(manager.connect(request(), aborted.signal), "cancelled");
   assert.equal(opens, 0);
 });
+
+test("inbound admission registers the connector instance nonce for later outbound connect", async () => {
+  const directory = new FabricDirectory();
+  directory.seedAuthority({ connector: connector({ instanceNonce: undefined }), devices: [device()] });
+  const transports = new TransportRegistry();
+  transports.register({
+    kind: "ssh",
+    connect: async () => channel(2, async () => undefined, { connectorInstanceNonce: "ephemeral-1" }),
+  });
+  const manager = new FabricConnectionManager(directory, transports, { now: () => 1000 });
+  const inbound = await manager.acceptInbound({
+    requestId: "inbound-nonce", connectorId: "connector-a", expectedCredentialGeneration: 2,
+    connectorInstanceNonce: "ephemeral-1", capabilityDigest: "digest-a", limits,
+    establishedAt: 1000, expiresAt: 2000,
+  }, { close: async () => undefined });
+  await manager.disconnect(inbound.connectionId, inbound.generation);
+  const outbound = await manager.connect(request(), new AbortController().signal);
+  assert.equal(outbound.state, "connected");
+  assert.equal(outbound.generation, 2);
+});
+
+test("authority re-seed preserves learned presence from inbound admissions", async () => {
+  const directory = new FabricDirectory();
+  directory.seedAuthority({ connector: connector({ instanceNonce: undefined }), devices: [device()] });
+  const manager = new FabricConnectionManager(directory, new TransportRegistry(), { now: () => 1000 });
+  const inbound = await manager.acceptInbound({
+    requestId: "inbound-presence", connectorId: "connector-a", expectedCredentialGeneration: 2,
+    connectorInstanceNonce: "ephemeral-1", capabilityDigest: "digest-a", limits,
+    establishedAt: 1000, expiresAt: 2000,
+  }, { close: async () => undefined });
+  // Re-enrollment/hydration never carries runtime presence; the learned nonce
+  // must survive the revision fence rather than trip it or be erased.
+  directory.seedAuthority({
+    connector: connector({ instanceNonce: undefined, lastSeenAt: undefined }),
+    devices: [device()],
+  });
+  const renewed = await manager.renewInboundLease(inbound.connectionId, inbound.generation, 2_500);
+  assert.equal(renewed.expiresAt, 2_500);
+});

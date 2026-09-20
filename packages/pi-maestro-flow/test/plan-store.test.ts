@@ -183,6 +183,40 @@ test("PlanStore persists execution choice and reconciles Workflow binding withou
   }
 });
 
+test("PlanStore persists a bound decision document through approval and reload", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-plan-source-doc-"));
+  try {
+    const store = new PlanStore(join(root, "workspace"), { rootDir: join(root, "global") });
+    const approved = await store.approve("# Plan with decision doc", 0, {
+      execution: {
+        backend: "standalone",
+        context: "current",
+        sourceDocument: "docs/session-run-minimal-state-architecture-20260812.md",
+      },
+    });
+    assert.deepEqual(approved.manifest.sourceDocuments, [
+      "docs/session-run-minimal-state-architecture-20260812.md",
+    ]);
+    assert.equal(
+      approved.manifest.execution?.sourceDocument,
+      "docs/session-run-minimal-state-architecture-20260812.md",
+    );
+
+    const reloaded = await store.load();
+    assert.deepEqual(reloaded.manifest.sourceDocuments, [
+      "docs/session-run-minimal-state-architecture-20260812.md",
+    ]);
+
+    const withoutDoc = await store.approve("# Plan without decision doc", reloaded.manifest.revision, {
+      execution: { backend: "standalone", context: "current" },
+    });
+    assert.equal(withoutDoc.manifest.sourceDocuments, undefined);
+    assert.equal((await store.load()).manifest.sourceDocuments, undefined);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("PlanStore rejects Workflow binding updates that do not match the approved handoff", async () => {
   const root = await mkdtemp(join(tmpdir(), "pi-plan-workflow-binding-fence-"));
   try {

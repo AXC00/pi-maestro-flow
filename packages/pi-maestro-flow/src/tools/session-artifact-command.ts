@@ -6,6 +6,8 @@ import {
   type ExtensionAPI,
   type ExtensionCommandContext,
 } from "@earendil-works/pi-coding-agent";
+import { matchesKey, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import { openOverlay, resolveGlyphs } from "pi-maestro-settings-core/ui";
 import { KnowledgeCliAdapter, type KnowledgeReviewView } from "../knowledge/cli-adapter.ts";
 import { tryCopyToClipboard } from "../session/session-export.ts";
 import {
@@ -224,21 +226,30 @@ async function openArtifactOverlay(
   sessionLabel: string,
   initialSelectedId?: string,
 ): Promise<SessionArtifactOverlayAction> {
-  const result = await ctx.ui.custom<SessionArtifactOverlayAction | undefined>(
-    (tui, theme, _keybindings, done) => new SessionArtifactOverlay({
-      sessionLabel,
-      artifacts,
-      initialSelectedId,
-      theme: theme as unknown as {
-        fg(name: string, text: string): string;
-        bold(text: string): string;
-      },
-      requestRender: () => tui.requestRender(),
-      done,
-    }),
+  const result = await openOverlay<SessionArtifactOverlayAction>(
+    ctx,
     {
-      overlay: true,
-      overlayOptions: { anchor: "center", width: "92%", maxHeight: "90%" },
+      kind: "card",
+      title: `Artifacts · ${sessionLabel} · ${artifacts.length}`,
+      width: "92%",
+      maxHeight: "90%",
+      anchor: "center",
+      hints: [
+        { key: "↑↓/←→", verb: "select" },
+        { key: "c", verb: "copy" },
+        { key: "p", verb: "copy path" },
+        { key: "e", verb: "export" },
+        { key: "Esc", verb: "close" },
+      ],
+    },
+    new SessionArtifactOverlay({ sessionLabel, artifacts, initialSelectedId }),
+    {
+      utils: {
+        measure: visibleWidth,
+        clip: (text, width, ellipsis) => truncateToWidth(text, width, ellipsis),
+      },
+      glyphs: resolveGlyphs("nerd"),
+      matchesKey: (data, keyId) => matchesKey(data, keyId as never),
     },
   );
   return result ?? { kind: "close", selectedId: initialSelectedId };

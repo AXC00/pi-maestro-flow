@@ -1,4 +1,6 @@
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
+import { matchesKey, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import { openOverlay, resolveGlyphs } from "pi-maestro-settings-core/ui";
 import { stat } from "node:fs/promises";
 import { formatBytes } from "../session/session-export.ts";
 import {
@@ -42,20 +44,30 @@ async function pickTurnsInteractive(
 ): Promise<number[] | undefined> {
   const items = turnItems(turns);
   if (items.length === 1) return [items[0]!.index];
-  const result = await ctx.ui.custom<MarkdownReviewOverlayAction | undefined>(
-    (tui, theme, _keybindings, done) =>
-      new MarkdownReviewOverlay({
-        turns: items,
-        theme: theme as unknown as {
-          fg(name: string, text: string): string;
-          bold(text: string): string;
-        },
-        requestRender: () => tui.requestRender(),
-        done: (action) => done(action),
-      }),
+  const result = await openOverlay<MarkdownReviewOverlayAction>(
+    ctx,
     {
-      overlay: true,
-      overlayOptions: { anchor: "center", width: "92%", maxHeight: "90%" },
+      kind: "card",
+      title: "Markdown Review",
+      width: "92%",
+      maxHeight: "90%",
+      anchor: "center",
+      hints: [
+        { key: "Space", verb: "勾选" },
+        { key: "a", verb: "全选" },
+        { key: "n", verb: "清空" },
+        { key: "e", verb: "导出" },
+        { key: "Esc", verb: "关闭" },
+      ],
+    },
+    new MarkdownReviewOverlay({ turns: items }),
+    {
+      utils: {
+        measure: visibleWidth,
+        clip: (text, width, ellipsis) => truncateToWidth(text, width, ellipsis),
+      },
+      glyphs: resolveGlyphs("nerd"),
+      matchesKey: (data, keyId) => matchesKey(data, keyId as never),
     },
   );
   if (!result) return undefined;

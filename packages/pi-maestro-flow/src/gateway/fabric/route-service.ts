@@ -41,8 +41,10 @@ export class GatewayFabricRouteService {
           const route = await this.route(runtime, request.routeId!);
           const binding = await this.authorize(principal, runtime, route);
           const endpoint = runtime.directory.getEndpoint(route.endpointId)!;
-          const connection = runtime.connections.requireReadyForDevice(route.connectionId, route.connectionGeneration, endpoint.deviceId);
-          const expiresAt = this.support.boundedExpiry(request, connection.expiresAt, binding?.expiresAt);
+          // Liveness is fenced here; the lease expiry is not a TTL ceiling —
+          // heartbeats renew it while dependent leases keep their requested TTL.
+          runtime.connections.requireReadyForDevice(route.connectionId, route.connectionGeneration, endpoint.deviceId);
+          const expiresAt = this.support.boundedExpiry(request, binding?.expiresAt);
           return { route: await runtime.admissions.renewRoute(route.routeId, expectedRevision(request), expiresAt) };
         }
         case "route.close": {
@@ -68,6 +70,8 @@ export class GatewayFabricRouteService {
     if (endpoint.generation !== request.expectedEndpointGeneration) {
       throw new FabricContractError("stale_generation", "Fabric Endpoint generation is stale", "expectedEndpointGeneration");
     }
+    // Liveness is fenced here; the lease expiry is not a TTL ceiling —
+    // heartbeats renew it while dependent leases keep their requested TTL.
     const connection = runtime.connections.requireReadyForDevice(
       request.connectionId!,
       request.expectedConnectionGeneration!,
@@ -101,7 +105,7 @@ export class GatewayFabricRouteService {
       connectionGeneration: connection.generation,
       endpointGeneration: endpoint.generation,
       issuedAt: now,
-      expiresAt: this.support.boundedExpiry(request, connection.expiresAt, binding?.expiresAt),
+      expiresAt: this.support.boundedExpiry(request, binding?.expiresAt),
       state: "open",
       revision: 0,
       deviceId: endpoint.deviceId,

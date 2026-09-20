@@ -1,4 +1,5 @@
 import { Key, decodeKittyPrintable, matchesKey, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import { makeBorderFrame, resolveGlyphs, type OverlayTheme } from "pi-maestro-settings-core/ui";
 import { statusIcon } from "../extension/monitor.ts";
 import {
   createTuiTranslator,
@@ -33,6 +34,11 @@ interface SessionSendOverlayCallbacks {
 }
 
 const MAX_MESSAGE_LENGTH = 64 * 1024;
+const FRAME_GLYPHS = resolveGlyphs("nerd");
+const FRAME_UTILS = {
+  measure: visibleWidth,
+  clip: (text: string, width: number, ellipsis: string) => truncateToWidth(text, width, ellipsis),
+};
 
 /** Small session picker used by /teammate-send. */
 export class SessionSendOverlay {
@@ -46,7 +52,11 @@ export class SessionSendOverlay {
   private readonly t: TuiTranslator;
   private readonly localeDisposer: () => void;
 
-  constructor(private readonly cb: SessionSendOverlayCallbacks, locale?: SupportedSettingsLocale) {
+  constructor(
+    private readonly cb: SessionSendOverlayCallbacks,
+    locale?: SupportedSettingsLocale,
+    private readonly theme?: OverlayTheme,
+  ) {
     this.t = createTuiTranslator(locale);
     this.localeDisposer = locale === undefined
       ? onTuiLocaleChange(() => {
@@ -61,20 +71,34 @@ export class SessionSendOverlay {
     this.requestRender = fn;
   }
 
+  private paint(role: string, text: string): string {
+    const theme = this.theme;
+    if (!theme) return text;
+    return theme.fg(role, text);
+  }
+
+  private paintBold(text: string): string {
+    const theme = this.theme;
+    if (!theme) return text;
+    return theme.bold ? theme.bold(text) : theme.fg("text", text);
+  }
+
   render(width: number): string[] {
-    const inner = Math.max(1, width - 4);
-    const lines: string[] = [];
-    const dim = (value: string) => `\x1b[2m${value}\x1b[0m`;
-    const bold = (value: string) => `\x1b[1m${value}\x1b[0m`;
-    const accent = (value: string) => `\x1b[36m${value}\x1b[0m`;
-    const green = (value: string) => `\x1b[32m${value}\x1b[0m`;
+    const dim = (value: string) => this.paint("dim", value);
+    const bold = (value: string) => this.paintBold(value);
+    const accent = (value: string) => this.paint("accent", value);
+    const green = (value: string) => this.paint("success", value);
 
-    lines.push(dim(`+${"-".repeat(inner)}+`));
-    lines.push(this.frameLine(bold(` ${this.t("sessionSend.title")}`), inner, dim));
-    lines.push(this.frameLine(dim(` ${this.t("sessionSend.intro")}`), inner, dim));
+    const rows: string[] = [];
+    rows.push(bold(` ${this.t("sessionSend.title")}`));
+    rows.push(dim(` ${this.t("sessionSend.intro")}`));
 
-    const maxVisible = Math.min(this.sessions.length, 10);
-    const scrollStart = Math.max(0, Math.min(this.cursor - 4, this.sessions.length - maxVisible));
+    // ui-conventions-006: the visible window follows the terminal-height
+    // budget (70% maxHeight minus chrome), not a fixed row count.
+    const termRows = process.stdout?.rows ?? 24;
+    const budget = Math.max(3, Math.floor(termRows * 0.7) - 10);
+    const maxVisible = Math.min(this.sessions.length, budget);
+    const scrollStart = Math.max(0, Math.min(this.cursor - Math.floor(maxVisible / 2), this.sessions.length - maxVisible));
     for (let index = scrollStart; index < scrollStart + maxVisible && index < this.sessions.length; index++) {
       const session = this.sessions[index]!;
       const current = index === this.cursor;
@@ -87,31 +111,31 @@ export class SessionSendOverlay {
         : session.correlationId.split(":").at(-1) ?? session.correlationId;
       const id = dim(` · id=${identifier.slice(0, 8)}`);
       const row = ` ${pointer} ${check} ${statusIcon(session.status)} ${session.displayName}${id}  ${dim(translateStatusIdentifier(session.status, this.t))}  ${dim(session.agentRole)}${source}`;
-      lines.push(this.frameLine(current ? accent(row) : row, inner, dim));
+      rows.push(current ? accent(row) : row);
     }
     if (this.sessions.length === 0) {
-      lines.push(this.frameLine(dim(`  ${this.t("sessionSend.noPeers")}`), inner, dim));
+      rows.push(dim(`  ${this.t("sessionSend.noPeers")}`));
     }
+    const hidden = this.sessions.length - maxVisible;
+    if (hidden > 0) rows.push(dim(`  ${hidden} more`));
 
-    lines.push(this.frameLine("", inner, dim));
+    rows.push("");
     const target = this.selected ? this.sessions.find((session) => session.correlationId === this.selected) : undefined;
-    lines.push(this.frameLine(` ${this.t("sessionSend.target")} ${target?.displayName ?? dim(this.t("sessionSend.selectPlaceholder"))}`, inner, dim));
-    lines.push(this.frameLine(` ID: ${target?.correlationId ?? dim("—")}`, inner, dim));
+    rows.push(` ${this.t("sessionSend.target")} ${target?.displayName ?? dim(this.t("sessionSend.selectPlaceholder"))}`);
+    rows.push(` ID: ${target?.correlationId ?? dim("—")}`);
+    const cursorCell = this.theme?.inverse ? this.theme.inverse(" ") : "\x1b[7m \x1b[0m";
     const messageValue = this.editingMessage
-      ? ` > ${this.message}\x1b[7m \x1b[0m`
+      ? ` > ${this.message}${cursorCell}`
       : ` > ${this.message || dim(this.t("sessionSend.editPlaceholder"))}`;
-    lines.push(this.frameLine(` ${this.t("sessionSend.message")} ${messageValue}`, inner, dim));
-    if (this.statusText) lines.push(this.frameLine(dim(` ${this.statusText}`), inner, dim));
-    lines.push(this.frameLine("", inner, dim));
-    lines.push(this.frameLine(dim(` ${this.t("sessionSend.footer")}`), inner, dim));
-    lines.push(dim(`+${"-".repeat(inner)}+`));
-    return lines;
-  }
-
-  private frameLine(content: string, inner: number, dim: (value: string) => string): string {
-    const truncated = truncateToWidth(content, inner, "…");
-    const pad = Math.max(0, inner - visibleWidth(truncated));
-    return `${dim("|")} ${truncated}${" ".repeat(pad)} ${dim("|")}`;
+    rows.push(` ${this.t("sessionSend.message")} ${messageValue}`);
+    if (this.statusText) rows.push(dim(` ${this.statusText}`));
+    rows.push("");
+    rows.push(dim(` ${this.t("sessionSend.footer")}`));
+    // Unified chrome: shared rounded border + theme border color.
+    return makeBorderFrame(rows, Math.max(4, width - 2), FRAME_GLYPHS, FRAME_UTILS, {
+      theme: this.theme,
+      borderColor: "borderMuted",
+    });
   }
 
   handleInput(data: string): void {
@@ -207,7 +231,7 @@ export async function showSessionSendOverlay(
 ): Promise<SessionSendOverlayResult | null> {
   return ctx.ui.custom<SessionSendOverlayResult | null>(
     (tui, _theme, _keybindings, done) => {
-      const overlay = new SessionSendOverlay({ getSessions: deps.getSessions, close: done }, deps.locale);
+      const overlay = new SessionSendOverlay({ getSessions: deps.getSessions, close: done }, deps.locale, _theme as OverlayTheme | undefined);
       overlay.setRequestRender(() => tui.requestRender());
       return {
         render: (width: number) => overlay.render(width),

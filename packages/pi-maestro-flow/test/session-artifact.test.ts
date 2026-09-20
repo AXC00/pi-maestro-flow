@@ -120,6 +120,25 @@ function commandContext(actions: Array<"copy" | "copyPath" | "export" | "close">
   return { ctx, notifications, renders };
 }
 
+const testKeys = {
+  up: (d: string) => d === "\x1b[A" || d === "k",
+  down: (d: string) => d === "\x1b[B" || d === "j",
+  pageUp: (d: string) => d === "\x1b[5~",
+  pageDown: (d: string) => d === "\x1b[6~",
+  confirm: (d: string) => d === "\r" || d === "\n",
+  cancel: (d: string) => d === "\x1b",
+};
+
+function renderText(overlay: SessionArtifactOverlay, width: number, height = 24): string {
+  return overlay.render(width, height, theme as never)
+    .map((row) => row.map((s) => s.text).join(""))
+    .join("\n");
+}
+
+function attachOverlay(overlay: SessionArtifactOverlay, onClose: (action: SessionArtifactOverlayAction) => void): void {
+  overlay.attach({ requestRender() {}, close: (action) => { if (action) onClose(action); } });
+}
+
 test("Artifact overlay previews Markdown, switches narrow mode, and exposes copy/export actions", () => {
   const artifacts: SessionArtifactItem[] = [
     {
@@ -141,18 +160,19 @@ test("Artifact overlay previews Markdown, switches narrow mode, and exposes copy
   const overlay = new SessionArtifactOverlay({
     sessionLabel: "Pi session-1",
     artifacts,
-    theme,
-    requestRender() {},
-    done(value) { action = value; },
   });
+  attachOverlay(overlay, (value) => { action = value; });
   for (const width of [40, 80, 120]) {
-    const lines = overlay.render(width);
-    for (const line of lines) assert.ok(visibleWidth(line) <= width, `width ${width}: ${line}`);
+    const rows = overlay.render(width - 2, 22, theme as never);
+    for (const row of rows) {
+      const text = row.map((s) => s.text).join("");
+      assert.ok(visibleWidth(text) <= width, `width ${width}: ${text}`);
+    }
   }
-  overlay.render(40);
-  overlay.handleInput("\r");
-  assert.match(overlay.render(40).join("\n"), /Plan/);
-  overlay.handleInput("c");
+  renderText(overlay, 40);
+  overlay.handleKey("\r", testKeys);
+  assert.match(renderText(overlay, 40), /Plan/);
+  overlay.handleKey("c", testKeys);
   assert.deepEqual(action, { kind: "copy", selectedId: "plan-current" });
 });
 
@@ -166,31 +186,29 @@ test("Artifact overlay switches artifacts with left/right and scrolls preview wi
   const overlay = new SessionArtifactOverlay({
     sessionLabel: "Pi session-1",
     artifacts,
-    theme,
-    requestRender() {},
-    done(value) { action = value; },
   });
+  attachOverlay(overlay, (value) => { action = value; });
 
   // Wide mode: left/right switch artifacts, up/down scroll the preview.
-  overlay.render(100);
-  overlay.handleInput("\x1b[C"); // right
-  assert.match(overlay.render(100).join("\n"), /› \[P\] Second/);
-  overlay.handleInput("\x1b[D"); // left
-  const wide = overlay.render(100).join("\n");
+  renderText(overlay, 100);
+  overlay.handleKey("\x1b[C", testKeys); // right
+  assert.match(renderText(overlay, 100), /› \[P\] Second/);
+  overlay.handleKey("\x1b[D", testKeys); // left
+  const wide = renderText(overlay, 100);
   assert.match(wide, /› \[P\] First/);
   assert.match(wide, /line 1/);
-  overlay.handleInput("\x1b[B"); // down scrolls preview, does not switch
-  const scrolled = overlay.render(100).join("\n");
+  overlay.handleKey("\x1b[B", testKeys); // down scrolls preview, does not switch
+  const scrolled = renderText(overlay, 100);
   assert.match(scrolled, /› \[P\] First/);
   assert.match(scrolled, /2-\d+\/40/);
-  overlay.handleInput("p");
+  overlay.handleKey("p", testKeys);
   assert.deepEqual(action, { kind: "copyPath", selectedId: "a" });
 
   // Narrow preview: left/right switches artifacts directly.
-  overlay.render(40);
-  overlay.handleInput("\r");
-  overlay.handleInput("\x1b[C"); // right inside preview
-  assert.match(overlay.render(40).join("\n"), /Second/);
+  renderText(overlay, 40);
+  overlay.handleKey("\r", testKeys);
+  overlay.handleKey("\x1b[C", testKeys); // right inside preview
+  assert.match(renderText(overlay, 40), /Second/);
 });
 
 test("/artifact aggregates session Plan, Review, and staged Knowledge documents and copies Markdown", async () => {

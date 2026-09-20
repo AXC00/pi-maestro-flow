@@ -1932,6 +1932,7 @@ export function renderAgentStatusWidget(
   agents: ActiveAgent[],
   width: number,
   theme: AgentWidgetTheme,
+  height?: number,
 ): string[] {
   const viewportWidth = Math.max(1, width);
   // Keep the last terminal column empty so live row updates cannot trigger
@@ -1967,7 +1968,15 @@ export function renderAgentStatusWidget(
   for (const row of [...unorderedRows].sort(activityOrder)) append(row);
   if (rows.length === 0) return [];
 
-  const maxVisible = viewportWidth < 20 ? 3 : viewportWidth < 40 ? 4 : 6;
+  const legacyMaxVisible = viewportWidth < 20 ? 3 : viewportWidth < 40 ? 4 : 6;
+  const widgetRows = widgetRowBudget(height);
+  const detailRows = widgetRows === undefined
+    ? undefined
+    : Math.max(1, widgetRows - (viewportWidth < 20 ? 0 : 1));
+  const selectionCapacity = detailRows ?? legacyMaxVisible;
+  const maxVisible = detailRows !== undefined && rows.length > selectionCapacity
+    ? Math.max(1, selectionCapacity - 1)
+    : selectionCapacity;
   const selected = new Set<string>();
   const liveEdge = rows.find((row) => LIVE_AGENT_STATUSES.has(row.status));
   if (liveEdge) selected.add(liveEdge.correlationId);
@@ -2081,6 +2090,11 @@ export function renderAgentStatusWidget(
     lines.push(truncateToWidth(theme.fg("dim", tuiT("widget.inspectMore", { count: hidden })), safeWidth, "…"));
   }
   return lines;
+}
+
+function widgetRowBudget(height: number | undefined): number | undefined {
+  if (!height || height <= 0) return undefined;
+  return Math.max(3, Math.min(10, Math.floor(height * 0.15)));
 }
 
 export function handleChildLifecycleEvent(

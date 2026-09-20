@@ -8,6 +8,7 @@ import {
 	visibleWidth,
 	wrapTextWithAnsi,
 } from "@earendil-works/pi-tui";
+import { makeOverlayFrame } from "pi-maestro-settings-core/ui";
 import { sanitizeExtensionStatusText } from "./extension-status.ts";
 import type { IconGlyphs } from "./icons.ts";
 import { fitLineByPriority, visibleStart, type PrioritizedSegment, type WidthUtils } from "./layout.ts";
@@ -283,16 +284,9 @@ export class BashBgOverlay implements Component, Focusable {
 	}
 
 	private card(rows: string[], width: number, selectedRows: ReadonlySet<number> = new Set()): string[] {
-		const theme = this.params.theme;
-		const box = this.params.glyphs.box;
-		const edge = box.horizontal.repeat(Math.max(0, width - 2));
-		const border = (glyph: string) => theme.bg("customMessageBg", theme.fg("borderMuted", glyph));
-		const out = [border(`${box.topLeft}${edge}${box.topRight}`)];
-		rows.forEach((row, index) => {
-			out.push(theme.bg(selectedRows.has(index) ? "selectedBg" : "customMessageBg", pad(` ${row}`, width)));
-		});
-		out.push(border(`${box.bottomLeft}${edge}${box.bottomRight}`));
-		return out;
+		// Delegate to the shared overlay frame (same borderless card +
+		// customMessageBg fill + selectedBg rows) — no private border code.
+		return makeOverlayFrame(rows, width, this.params.theme, this.params.glyphs, { measure: visibleWidth, clip: truncateToWidth }, { selectedRows });
 	}
 
 	private move(delta: number): void {

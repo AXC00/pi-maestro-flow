@@ -18,7 +18,7 @@ import {
   helpLine,
   rule,
   type FrameTheme,
-} from "pi-cockpit/src/settings/ui-primitives.ts";
+} from "./ui-primitives.ts";
 import { getTuiLocale } from "./locale.ts";
 import {
   ALL_CONFIG_KEYS,
@@ -266,6 +266,8 @@ export interface SmartSearchConfigOverlayParams {
   close: () => void;
   initialKey?: string;
   sync?: WebAccessConfigSyncLike;
+  /** Terminal rows from the host; absent keeps the legacy fixed cap. */
+  getTerminalRows?: () => number | undefined;
   /** Explicit UI language; otherwise follows the shared runtime TUI locale. */
   locale?: SupportedSettingsLocale;
 }
@@ -275,7 +277,7 @@ type StatusTone = "dim" | "success" | "warning" | "error";
 
 const CTRL_U = "\x15";
 const CTRL_S = "\x13";
-const MAX_VISIBLE_ITEMS = 10;
+const FALLBACK_MAX_VISIBLE_ITEMS = 10;
 
 // 编辑模式下忽略的导航/编辑/功能键：其转义序列（如 `\x1b[A`）若被当作文本追加，
 // sanitize 后会把 `[A`、`[3~` 之类残渣混入输入（例如编辑文本字段按方向键出现乱码）。
@@ -363,8 +365,11 @@ export class SmartSearchConfigOverlay implements Component, Focusable {
       rows.push(helpLine(this.params.theme, this.saving ? this.t("state.saving") : this.t("footer.editHelp"), inner));
     } else {
       const filteredKeys = this.filteredKeys();
-      const start = Math.max(0, Math.min(this.selected - Math.floor(MAX_VISIBLE_ITEMS / 2), filteredKeys.length - MAX_VISIBLE_ITEMS));
-      const visibleKeys = filteredKeys.slice(start, start + MAX_VISIBLE_ITEMS);
+      const maxRows = this.visibleItemBudget(Boolean(this.status));
+      const visibleLimit = filteredKeys.length > maxRows ? Math.max(1, maxRows - 1) : maxRows;
+      const start = Math.max(0, Math.min(this.selected - Math.floor(visibleLimit / 2), filteredKeys.length - visibleLimit));
+      const visibleKeys = filteredKeys.slice(start, start + visibleLimit);
+      const hidden = filteredKeys.length - visibleKeys.length;
       const sourceLabel = this.configSource === "smart-search" ? this.t("source.smartSearch") : this.t("source.webAccess");
       rows.push(helpLine(this.params.theme, this.t("filter.line", {
         query: this.query || this.t("filter.allKeys"),
@@ -389,6 +394,7 @@ export class SmartSearchConfigOverlay implements Component, Focusable {
           inner,
         ));
       }
+      if (hidden > 0) rows.push(this.params.theme.fg("dim", fit(`… +${hidden} more`, inner)));
       rows.push(helpLine(this.params.theme, this.t("footer.listHelp"), inner));
     }
     if (this.status) rows.push(fit(this.params.theme.fg(this.statusTone, this.status), inner));
@@ -460,10 +466,11 @@ export class SmartSearchConfigOverlay implements Component, Focusable {
       return;
     }
     const length = this.filteredKeys().length;
+    const page = this.visibleItemBudget(Boolean(this.status));
     if (matchesKey(data, Key.up)) this.selected = wrapIndex(this.selected - 1, length);
     else if (matchesKey(data, Key.down)) this.selected = wrapIndex(this.selected + 1, length);
-    else if (matchesKey(data, Key.pageUp)) this.selected = clampIndex(this.selected - MAX_VISIBLE_ITEMS, length);
-    else if (matchesKey(data, Key.pageDown)) this.selected = clampIndex(this.selected + MAX_VISIBLE_ITEMS, length);
+    else if (matchesKey(data, Key.pageUp)) this.selected = clampIndex(this.selected - page, length);
+    else if (matchesKey(data, Key.pageDown)) this.selected = clampIndex(this.selected + page, length);
     else if (isHomeKey(data)) this.selected = 0;
     else if (isEndKey(data)) this.selected = Math.max(0, length - 1);
     else if (matchesKey(data, Key.enter)) this.beginEdit();
@@ -610,6 +617,18 @@ export class SmartSearchConfigOverlay implements Component, Focusable {
     return this.filteredKeys()[this.selected];
   }
 
+  private visibleItemBudget(hasStatus: boolean): number {
+    const terminalRows = this.params.getTerminalRows?.();
+    if (!terminalRows || terminalRows <= 0) return FALLBACK_MAX_VISIBLE_ITEMS;
+    const overlayRows = Math.max(3, Math.floor(terminalRows * 0.9));
+    const borderRows = 2;
+    const fixedBodyRows = 2 // header + separator
+      + 1 // filter line
+      + 1 // footer help
+      + (hasStatus ? 1 : 0);
+    return Math.max(2, overlayRows - borderRows - fixedBodyRows);
+  }
+
   private escape(): void {
     if (this.mode === "edit") {
       this.mode = "list";
@@ -640,6 +659,7 @@ export async function showSmartSearchConfigOverlay(
       requestRender: () => tui.requestRender(),
       close: () => done(undefined),
       sync: resolvedSync,
+      getTerminalRows: () => tui.terminal?.rows,
       locale,
     });
     return overlay;

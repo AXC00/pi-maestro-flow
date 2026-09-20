@@ -1,0 +1,16 @@
+[package]
+name = "dioxus-blitz-spike"
+version = "0.1.0"
+edition = "2021"
+description = "P0 spike: dioxus-native-dom 0.8.0-alpha.1 + blitz-dom 0.3.0-beta.1 headless layout pipeline (standalone workspace — see pi-tui/SPIKE-NOTES.md)."
+
+# Standalone workspace: dioxus-native-dom pins blitz-dom =0.3.0-beta.1, which
+# cannot coexist with the main workspace's blitz-dom 0.3.0-beta.2.
+[workspace]
+
+[dependencies]
+dioxus = { version = "=0.8.0-alpha.1", default-features = false, features = ["macro", "html", "signals", "hooks"] }
+dioxus-native-dom = "=0.8.0-alpha.1"
+blitz-dom = "=0.3.0-beta.1"
+blitz-traits = "=0.3.0-beta.1"
+parley = "0.10"

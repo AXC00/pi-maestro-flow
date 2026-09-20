@@ -36,6 +36,8 @@ export interface GoalOverlayParams {
   onAction: (action: GoalOverlayAction, goalId: string) => void | Promise<void>;
   /** Sampled once per passive render; the overlay intentionally owns no clock timer. */
   now?: () => number;
+  /** Terminal row budget for list/detail bodies (ui-conventions-006). */
+  getTerminalRows?: () => number | undefined;
 }
 
 type GoalOverlayMode = "list" | "detail" | "confirm";
@@ -124,11 +126,15 @@ export class GoalOverlay implements Component, Focusable {
     if (entries.length === 0) {
       rows.push(fitLine("○ no goals · /goal create <objective>", inner));
     } else {
-      const start = visibleStart(this.selected, entries.length, 8);
-      for (let index = start; index < Math.min(entries.length, start + 8); index++) {
+      const maxRows = this.listEntryBudget(Boolean(this.status));
+      const visibleLimit = entries.length > maxRows ? Math.max(1, maxRows - 1) : maxRows;
+      const start = visibleStart(this.selected, entries.length, visibleLimit);
+      for (let index = start; index < Math.min(entries.length, start + visibleLimit); index++) {
         if (index === this.selected) selectedRows.add(rows.length);
         rows.push(this.goalRow(entries[index], index === this.selected, inner));
       }
+      const hidden = entries.length - (rows.length - 2);
+      if (hidden > 0) rows.push(this.params.theme.fg("dim", fitLine(`… +${hidden} more`, inner)));
     }
     if (this.status) rows.push(fitLine(this.status, inner));
     rows.push(this.helpLine(inner));
@@ -140,11 +146,14 @@ export class GoalOverlay implements Component, Focusable {
     const leftWidth = Math.max(30, Math.floor((inner - 3) * 0.42));
     const rightWidth = inner - leftWidth - 3;
     const entries = this.entries();
-    const start = visibleStart(this.selected, entries.length, 8);
-    const left = entries.slice(start, start + 8).map((entry, offset) =>
+    const maxRows = this.listEntryBudget(Boolean(this.status));
+    const visibleLimit = entries.length > maxRows ? Math.max(1, maxRows - 1) : maxRows;
+    const start = visibleStart(this.selected, entries.length, visibleLimit);
+    const left = entries.slice(start, start + visibleLimit).map((entry, offset) =>
       this.goalRow(entry, start + offset === this.selected, leftWidth)
     );
-    const right = this.detailLines(this.selectedEntry(), rightWidth, 5, now);
+    if (entries.length > left.length) left.push(this.params.theme.fg("dim", fitLine(`… +${entries.length - left.length} more`, leftWidth)));
+    const right = this.detailLines(this.selectedEntry(), rightWidth, this.detailObjectiveBudget(5), now);
     const rowCount = Math.max(left.length, right.length, 1);
     const rows: string[] = [this.header(inner), this.separator(inner)];
     const selectedRows = new Set<number>();
@@ -160,7 +169,7 @@ export class GoalOverlay implements Component, Focusable {
   private renderDetail(width: number, now: number): string[] {
     const inner = width - 2;
     const rows: string[] = [this.header(inner), this.separator(inner)];
-    rows.push(...this.detailLines(this.selectedEntry(), inner, 12, now));
+    rows.push(...this.detailLines(this.selectedEntry(), inner, this.detailObjectiveBudget(12), now));
     if (this.status) rows.push(fitLine(this.status, inner));
     rows.push(this.helpLine(inner, ["Esc back", "↑↓ goal", "s switch", "p stop", "r resume", "x clear"]));
     return this.card(rows, width);
@@ -240,6 +249,25 @@ export class GoalOverlay implements Component, Focusable {
       + `${theme.fg("accent", `${active} active`)} · ${theme.fg("warning", `${stopped} stopped`)} · ${theme.fg("success", `${done} done`)}`,
       width,
     );
+  }
+
+  private listEntryBudget(hasStatus: boolean): number {
+    // maxHeight is 90%; subtract border, header+separator, footer, and status.
+    return this.bodyBudget(2 + 1 + (hasStatus ? 1 : 0), 8);
+  }
+
+  private detailObjectiveBudget(fallback: number): number {
+    // Detail pages have fixed metadata rows after the objective; objective text
+    // gets the remaining height budget instead of a hardcoded 5/12 cap.
+    return this.bodyBudget(2 + 1 + 8 + (this.status ? 1 : 0), fallback);
+  }
+
+  private bodyBudget(reservedBodyRows: number, fallback: number): number {
+    const terminalRows = this.params.getTerminalRows?.();
+    if (!terminalRows || terminalRows <= 0) return fallback;
+    const overlayRows = Math.max(3, Math.floor(terminalRows * 0.9));
+    const borderRows = 2;
+    return Math.max(2, overlayRows - borderRows - reservedBodyRows);
   }
 
   private helpLine(width: number, segments?: string[]): string {

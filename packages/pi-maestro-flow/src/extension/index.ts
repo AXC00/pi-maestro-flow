@@ -2893,6 +2893,7 @@ When NOT to use:
         view: enrichedView,
         requestRender: () => tui.requestRender(),
         close: () => done(undefined),
+        theme: _theme,
         onAction: async (action: SessionOverlayAction, runId?: string) => {
           if (action !== "decision") {
             const planBlock = onToolCallPlan({ toolName: "run-control", input: { action } }, approvalMode === "bypassPermissions");
@@ -2995,6 +2996,7 @@ When NOT to use:
         requestRender: () => tui.requestRender(),
         close: () => done(undefined),
         theme,
+        getTerminalRows: () => tui.terminal?.rows,
         onAction: async (action: GoalOverlayAction, goalId: string) => {
           // Lifecycle commands act on the current goal, so surface the selected one first.
           if (getActiveGoal()?.id !== goalId && !switchCurrentGoal(goalId, ctx)) {
@@ -3042,6 +3044,7 @@ When NOT to use:
       overlay = new KnowledgeOverlay({
         view,
         requestRender: () => tui.requestRender(),
+        theme: _theme,
         close: () => {
           void refreshKnowledgePendingStatus(ctx, sessionId);
           done(undefined);

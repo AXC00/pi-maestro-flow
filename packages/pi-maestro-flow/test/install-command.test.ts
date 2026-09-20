@@ -189,8 +189,9 @@ test("readInstallDoc returns shipped content and setup docs preserve explicit sa
     assert.match(openAiTunnel, new RegExp(`## ${section}`), `OpenAI tunnel doc needs ${section}`);
   }
   assert.match(openAiTunnel, /experimental/i);
-  assert.match(openAiTunnel, /no auto-download/i);
+  assert.match(openAiTunnel, /opt-in auto-install/i);
   assert.match(openAiTunnel, /no provisioning/i);
+  assert.match(openAiTunnel, /auto_install: false/);
   assert.match(openAiTunnel, /minimum_version: "0\.0\.14"/);
   assert.match(openAiTunnel, /tunnel_id_env: "CONTROL_PLANE_TUNNEL_ID"/);
   assert.match(openAiTunnel, /runtime_key_env: "CONTROL_PLANE_API_KEY"/);

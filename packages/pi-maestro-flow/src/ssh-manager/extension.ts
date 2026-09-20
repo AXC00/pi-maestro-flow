@@ -467,6 +467,9 @@ Use action=targets to list provider-owned target ids, then pass targetId on a co
             },
           };
         }
+        if (!("action" in params) && !("command" in params)) {
+          throw new Error("SSH call requires a command or an action. Use action=targets to list configured servers.");
+        }
         executionHost = resolveExecutionHost(requestedTargetId);
         if ("command" in params) {
           const { targetId: _targetId, ...commandInput } = params;
@@ -591,7 +594,8 @@ Use action=targets to list provider-owned target ids, then pass targetId on a co
       if (options.isPartial) return new Text("", 0, 0);
       const details = result.details as SshToolDetails | undefined;
       const text = result.content.find((item) => item.type === "text")?.text ?? "";
-      const isError = (result as { isError?: boolean }).isError === true
+      const isError = context.isError === true
+        || (result as { isError?: boolean }).isError === true
         || (typeof details?.exitCode === "number" && details.exitCode !== 0);
       const fallbackHost = singleSelectedHostForDisplay();
       return toolResultLine(theme, {

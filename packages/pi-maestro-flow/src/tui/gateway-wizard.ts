@@ -17,7 +17,7 @@ import { spawnSync } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { Key, type Component, type Focusable, matchesKey, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
-import { makeBorderFrame, resolveGlyphs } from "pi-maestro-settings-core/ui";
+import { makeBorderFrame, resolveGlyphs, type OverlayTheme } from "pi-maestro-settings-core/ui";
 
 const FRAME_GLYPHS = resolveGlyphs("nerd");
 const FRAME_UTILS = {
@@ -31,6 +31,8 @@ export interface GatewayWizardParams {
   cwd: string;
   requestRender: () => void;
   close: () => void;
+  /** Theme for role colors; when absent the wizard renders unstyled. */
+  theme?: OverlayTheme;
 }
 
 export interface GatewayConfigChanges {
@@ -62,6 +64,8 @@ export interface GatewayConfigChanges {
   filesDeny?: string[];
   /** Experimental OpenAI tunnel provider configuration. Values are env names, never secrets. */
   openAiTunnelEnabled?: boolean;
+  /** Opt-in for the pinned, verified managed tunnel-client download. */
+  openAiAutoInstall?: boolean;
   openAiTunnelBinaryPath?: string;
   openAiTunnelIdEnv?: string;
   openAiRuntimeKeyEnv?: string;
@@ -464,6 +468,15 @@ export class GatewayWizardOverlay implements Component, Focusable {
   private changes: GatewayConfigChanges = {};
   private readonly existingConfig: string;
 
+  /** Legacy numeric code → semantic role → theme slot. */
+  private fg(code: string, text: string): string {
+    const theme = this.params.theme;
+    if (!theme || !code) return text;
+    const role = CODE_ROLE[code];
+    if (role === "bold") return theme.bold ? theme.bold(text) : theme.fg("text", text);
+    return theme.fg(role ?? "text", text);
+  }
+
   constructor(private readonly params: GatewayWizardParams) {
     let existing = "";
     try {
@@ -492,9 +505,9 @@ export class GatewayWizardOverlay implements Component, Focusable {
     const inner = safeWidth - 2;
     const rows = [fitLine(`Pi Maestro Gateway 配置向导 · ${STEP_LABEL[this.step]}`, inner), rule(inner)];
     rows.push(...this.renderStep(inner));
-    if (this.status) rows.push(fitLine(fg("33", this.status), inner));
+    if (this.status) rows.push(fitLine(this.fg("33", this.status), inner));
     rows.push(fitSegments(inner, this.controls()));
-    return frame(rows, safeWidth);
+    return frame(rows, safeWidth, this.params.theme);
   }
 
   private controls(): string[] {
@@ -507,7 +520,7 @@ export class GatewayWizardOverlay implements Component, Focusable {
 
   private renderStep(inner: number): string[] {
     const option = (index: number, label: string, hint = "") =>
-      fitLine(`${this.selected === index && !this.editing ? "›" : " "} ${label}${hint ? `  ${fg("2", hint)}` : ""}`, inner);
+      fitLine(`${this.selected === index && !this.editing ? "›" : " "} ${label}${hint ? `  ${this.fg("2", hint)}` : ""}`, inner);
     switch (this.step) {
       case "listen":
         return [
@@ -546,15 +559,15 @@ export class GatewayWizardOverlay implements Component, Focusable {
           option(0, "继续"),
         ];
       case "tunnel": {
-        const cloudflared = fg("2", "由 Gateway supervisor doctor 检测显式配置/PATH");
+        const cloudflared = this.fg("2", "由 Gateway supervisor doctor 检测显式配置/PATH");
         const running = this.tunnelStarting || this.tunnelGeneration !== undefined
-          ? fg("32", `${this.tunnelStarting ? "启动探活中" : "运行中"}${this.changes.tunnelUrl ? ` · ${this.changes.tunnelUrl}` : "（等待分层 readiness…）"}`)
-          : fg("2", "未运行");
+          ? this.fg("32", `${this.tunnelStarting ? "启动探活中" : "运行中"}${this.changes.tunnelUrl ? ` · ${this.changes.tunnelUrl}` : "（等待分层 readiness…）"}`)
+          : this.fg("2", "未运行");
         return [
           fitLine(`公网隧道（Cloudflare Quick Tunnel）— cloudflared ${cloudflared}`, inner),
           fitLine(`  唯一模式：启动后自动绑定本地端口并生成公网 URL，无需手动填写`, inner),
           fitLine(`  状态: ${running}`, inner),
-          fitLine("  OpenAI Secure MCP Tunnel: experimental；需显式配置受支持 tunnel-client + env 凭据，向导不下载/创建资源", inner),
+          fitLine("  OpenAI Secure MCP Tunnel: experimental；需显式配置受支持 tunnel-client + env 凭据，向导不创建资源（auto_install 另行显式开启）", inner),
           option(0, this.tunnelGeneration ? "隧道已就绪" : "启动隧道", "Enter/g 由 Gateway supervisor 探活"),
           option(1, "→ 下一步（写入确认）", "需隧道已启动"),
           fitLine("  提示: Enter/g 启动 · x 停止 · Esc 返回", inner),
@@ -875,22 +888,31 @@ function rule(width: number): string {
   return "─".repeat(Math.max(0, width));
 }
 
-function frame(rows: readonly string[], width: number): string[] {
+function frame(rows: readonly string[], width: number, theme?: OverlayTheme): string[] {
   // This surface's `width` is the inner content width; the frame adds the two
   // border columns, so convert to the shared helper's outer-width contract.
   return makeBorderFrame(rows, width + 2, FRAME_GLYPHS, FRAME_UTILS, {
     corners: "square",
     clip: false,
     pad: false,
+    theme,
+    borderColor: "borderMuted",
   });
 }
 
+const CODE_ROLE: Record<string, string> = {
+  "1": "bold",
+  "2": "dim",
+  "31": "error",
+  "32": "success",
+  "33": "warning",
+  "34": "muted",
+  "35": "accent",
+  "36": "accent",
+};
+
 function fitSegments(width: number, segments: readonly string[]): string {
   return fitLine(segments.join("  ·  "), width);
-}
-
-function fg(code: string, text: string): string {
-  return `\x1b[${code}m${text}\x1b[0m`;
 }
 
 function isEnter(data: string): boolean {

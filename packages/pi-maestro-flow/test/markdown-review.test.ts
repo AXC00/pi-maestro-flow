@@ -446,22 +446,39 @@ test("exportReviewDocument surfaces pandoc ENOENT and failures", async () => {
   }
 });
 
+const overlayTestKeys = {
+  up: (d: string) => d === "\x1b[A" || d === "k",
+  down: (d: string) => d === "\x1b[B" || d === "j",
+  pageUp: (d: string) => d === "\x1b[5~",
+  pageDown: (d: string) => d === "\x1b[6~",
+  confirm: (d: string) => d === "\r" || d === "\n",
+  cancel: (d: string) => d === "\x1b",
+};
+
+const overlayTestTheme = {
+  fg: (_name: string, text: string) => text,
+  bold: (text: string) => text,
+};
+
 function overlayFixture(items: MarkdownReviewTurnItem[]) {
   let action: MarkdownReviewOverlayAction | undefined;
   let renders = 0;
-  const overlay = new MarkdownReviewOverlay({
-    turns: items,
-    theme: {
-      fg: (_name, text) => text,
-      bold: (text) => text,
-    },
-    requestRender: () => {
-      renders++;
-    },
-    done: (next) => {
-      action = next;
-    },
+  const controller = new MarkdownReviewOverlay({ turns: items });
+  controller.attach({
+    requestRender: () => { renders++; },
+    close: (next) => { if (next) action = next; },
   });
+  const overlay = {
+    render: (width: number, height = 24): string[] =>
+      controller.render(width - 2, height - 2, overlayTestTheme)
+        .map((row) => row.map((s) => s.text).join("")),
+    // Mirror the host: handled input triggers a re-render.
+    handleInput: (data: string) => {
+      const handled = controller.handleKey(data, overlayTestKeys);
+      if (handled) renders++;
+      return handled;
+    },
+  };
   return {
     overlay,
     action: () => action,
@@ -511,7 +528,7 @@ test("overlay navigation and render smoke", () => {
   const fixture = overlayFixture(overlayTurns);
   const rendered = fixture.overlay.render(120);
   assert.ok(rendered.length > 0);
-  assert.ok(rendered.join("\n").includes("Markdown Review"));
+  assert.ok(rendered.join("\n").includes("turns"));
   fixture.overlay.handleInput("\x1b[B"); // down
   fixture.overlay.handleInput("\x1b[B"); // down
   fixture.overlay.handleInput("\r"); // wide 模式 Enter 不切换预览 — 无副作用
@@ -566,22 +583,18 @@ test("exportReviewDocument creates parent directories for markdown", async () =>
 
 test("overlay honors the overlay height budget on short terminals", () => {
   const fixture = overlayFixture(overlayTurns);
-  const originalRows = process.stdout.rows;
-  (process.stdout as { rows: number }).rows = 10;
-  try {
-    const budget = Math.max(1, Math.floor(10 * 0.9));
-    const rendered = fixture.overlay.render(120);
-    assert.ok(rendered.length <= budget, `expected <=${budget} rows, got ${rendered.length}`);
+  // The controller receives the inner budget (chrome excluded); a 10-row
+  // terminal at 90% maxHeight gives the body 9-2=7 rows.
+  const budget = Math.max(1, Math.floor(10 * 0.9) - 2);
+  const rendered = fixture.overlay.render(120, budget + 2);
+  assert.ok(rendered.length <= budget, `expected <=${budget} rows, got ${rendered.length}`);
 
-    // 状态行场景：清空选择后请求导出，status 行出现在渲染中。
-    fixture.overlay.handleInput("n");
-    fixture.overlay.handleInput("e");
-    const withStatus = fixture.overlay.render(120);
-    assert.ok(withStatus.join("\n").includes("未选择任何 turn"));
-    assert.ok(withStatus.length <= budget, `expected <=${budget} rows with status, got ${withStatus.length}`);
-  } finally {
-    (process.stdout as { rows: number }).rows = originalRows;
-  }
+  // 状态行场景：清空选择后请求导出，status 行出现在渲染中。
+  fixture.overlay.handleInput("n");
+  fixture.overlay.handleInput("e");
+  const withStatus = fixture.overlay.render(120, budget + 2);
+  assert.ok(withStatus.join("\n").includes("未选择任何 turn"));
+  assert.ok(withStatus.length <= budget, `expected <=${budget} rows with status, got ${withStatus.length}`);
 });
 
 test("export format type is closed", () => {

@@ -1,9 +1,18 @@
 /** Experimental OpenAI Secure MCP Tunnel provider (external CLI orchestration only). */
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
-import { existsSync, realpathSync } from "node:fs";
+import { existsSync, realpathSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { isAbsolute, join } from "node:path";
+import { delimiter, isAbsolute, join } from "node:path";
+import { gatewayGlobalStateRoot } from "../../state-paths.ts";
+import {
+  ensureManagedOpenAiTunnelClient,
+  managedOpenAiTunnelClientPath,
+  openAiTunnelClientAssetFor,
+  sha256File,
+  type OpenAiManagedInstallOptions,
+  type OpenAiTunnelClientAsset,
+} from "./openai-client-managed.ts";
 import type {
   GatewayTunnelDeadlineContext,
   GatewayTunnelDoctorResult,
@@ -44,6 +53,14 @@ export interface OpenAiTunnelGatewayCredential {
 export interface OpenAiTunnelProviderOptions {
   /** Explicit opt-in. The provider is experimental and disabled by default. */
   enabled?: boolean;
+  /** Explicit opt-in for the pinned, verified managed download. Off by default. */
+  autoInstall?: boolean;
+  /** Root for the managed client install; defaults to the Gateway global state tools directory. */
+  managedRoot?: string;
+  /** Test seam for the managed install path. */
+  installManagedClient?: (options: OpenAiManagedInstallOptions) => Promise<string>;
+  /** Test seam for managed-binary integrity verification; defaults to the pinned SHA-256 check. */
+  verifyManagedBinary?: (executablePath: string, asset: OpenAiTunnelClientAsset) => Promise<boolean>;
   binaryPath?: string;
   minimumVersion?: string;
   tunnelIdEnv?: string;
@@ -74,6 +91,7 @@ export interface OpenAiTunnelCommandResult {
 
 interface OpenAiInput {
   enabled: boolean;
+  autoInstall: boolean;
   binaryPath?: string;
   localPort: number;
   mcpPath: string;
@@ -87,6 +105,13 @@ interface ValidatedDoctor {
   executablePath: string;
   version: string;
   input: OpenAiInput;
+}
+
+interface OpenAiClientDiscovery {
+  executablePath: string;
+  source: "explicit" | "path" | "managed" | "downloaded";
+  /** Pre-verified for managed/downloaded candidates; explicit/PATH candidates are checked by doctor. */
+  version?: string;
 }
 
 interface OpenAiRuntime {
@@ -173,21 +198,27 @@ export class OpenAiTunnelProvider implements GatewayTunnelProvider {
       const input = this.input(request);
       context.throwIfExpired("doctor");
       if (!input.enabled) return { ok: false, detail: "experimental_blocked: OpenAI Tunnel is experimental and must be explicitly enabled" };
-      const executablePath = resolveOpenAiTunnelClient(input.binaryPath ?? this.options.binaryPath);
-      if (!executablePath) return { ok: false, detail: "client_not_installed: tunnel-client was not found; automatic download is disabled" };
+      const discovered = await this.discoverClient(context, input);
+      if (!discovered) {
+        return { ok: false, detail: "client_not_installed: tunnel-client was not found via binaryPath, PATH, or the managed install; set binaryPath or enable auto_install for a pinned verified download" };
+      }
+      const { executablePath } = discovered;
       const tunnelId = this.secretReference(input.tunnelIdEnv, "tunnel id");
       const runtimeKey = this.secretReference(input.runtimeKeyEnv, "runtime API key");
       if (!tunnelId || !runtimeKey) return { ok: false, detail: "credentials_missing: configured tunnel id/runtime API key environment references are unavailable" };
       assertOpenAiTunnelId(tunnelId);
       const environment = this.childEnvironment(input, runtimeKey);
-      const versionResult = await runWithinTunnelDeadline(context, "client version", () => this.runCommandImpl(executablePath, this.contract.versionArgs, { env: environment, context }));
-      const versionOutput = `${versionResult.stdout}\n${versionResult.stderr}`;
-      const version = parseOpenAiTunnelClientVersion(versionOutput);
-      if (versionResult.code !== 0 || !version) return { ok: false, detail: `client_identity_invalid: ${redactOpenAiTunnelText(versionOutput, [runtimeKey]).trim() || "unrecognized tunnel-client --version output"}` };
       const minimum = this.options.minimumVersion ?? OPENAI_TUNNEL_CLIENT_MINIMUM_VERSION;
+      let version = discovered.version;
+      if (version === undefined) {
+        const versionResult = await runWithinTunnelDeadline(context, "client version", () => this.runCommandImpl(executablePath, this.contract.versionArgs, { env: environment, context }));
+        const versionOutput = `${versionResult.stdout}\n${versionResult.stderr}`;
+        version = versionResult.code === 0 ? parseOpenAiTunnelClientVersion(versionOutput) : undefined;
+        if (!version) return { ok: false, detail: `client_identity_invalid: ${redactOpenAiTunnelText(versionOutput, [runtimeKey]).trim() || "unrecognized tunnel-client --version output"}` };
+      }
       if (!isSupportedOpenAiTunnelClientVersion(version, minimum)) return { ok: false, detail: `client_version_incompatible: tunnel-client ${version} is outside supported ${minimum}..0.0.x`, executablePath, version };
       this.doctors.set(runtimeKeyFor(request), { executablePath, version, input });
-      return { ok: true, executablePath, version, detail: `experimental: validated public tunnel-client CLI contract ${version}` };
+      return { ok: true, executablePath, version, detail: `experimental: validated public tunnel-client CLI contract ${version} (source: ${discovered.source})` };
     } catch (error) {
       return { ok: false, detail: redactOpenAiTunnelText(error instanceof Error ? error.message : String(error)) };
     }
@@ -330,11 +361,12 @@ export class OpenAiTunnelProvider implements GatewayTunnelProvider {
     const raw = request.input ?? {};
     const forbidden = ["runtimeKey", "runtimeApiKey", "apiKey", "token", "authorization", "gatewayToken", "configFile"].find((key) => raw[key] !== undefined);
     if (forbidden) throw providerError("invalid_arguments", `OpenAI Tunnel rejects literal secret/config input: ${forbidden}`);
-    const allowed = new Set(["mode", "enabled", "experimental", "binaryPath", "localPort", "mcpPath", "publicUrl", "tunnelIdEnv", "runtimeKeyEnv", "credentialTtlMs"]);
+    const allowed = new Set(["mode", "enabled", "experimental", "autoInstall", "binaryPath", "localPort", "mcpPath", "publicUrl", "tunnelIdEnv", "runtimeKeyEnv", "credentialTtlMs"]);
     const unknown = Object.keys(raw).find((key) => !allowed.has(key));
     if (unknown) throw providerError("invalid_arguments", `Unknown OpenAI Tunnel input: ${unknown}`);
     if (raw.mode !== undefined && raw.mode !== "secure") throw providerError("tunnel_mode_unsupported", "Only OpenAI Secure Tunnel mode is supported");
     const enabled = raw.enabled === undefined && raw.experimental === undefined ? this.options.enabled === true : raw.enabled === true || raw.experimental === true;
+    const autoInstall = raw.autoInstall === undefined ? this.options.autoInstall === true : raw.autoInstall === true;
     const binaryPath = raw.binaryPath === undefined ? undefined : String(raw.binaryPath);
     const localPort = raw.localPort === undefined ? this.options.defaultLocalPort ?? DEFAULT_LOCAL_PORT : Number(raw.localPort);
     if (!Number.isSafeInteger(localPort) || localPort < 1 || localPort > 65_535) throw providerError("invalid_arguments", "OpenAI Tunnel localPort must be in [1, 65535]");
@@ -344,7 +376,7 @@ export class OpenAiTunnelProvider implements GatewayTunnelProvider {
     const runtimeKeyEnv = envName(raw.runtimeKeyEnv === undefined ? this.options.runtimeKeyEnv ?? "CONTROL_PLANE_API_KEY" : String(raw.runtimeKeyEnv), "runtimeKeyEnv");
     const credentialTtlMs = raw.credentialTtlMs === undefined ? this.options.credentialTtlMs ?? DEFAULT_CREDENTIAL_TTL_MS : Number(raw.credentialTtlMs);
     if (!Number.isSafeInteger(credentialTtlMs) || credentialTtlMs < 1_000 || credentialTtlMs > 60 * 60_000) throw providerError("invalid_arguments", "OpenAI Tunnel credential TTL must be in [1000, 3600000] ms");
-    return { enabled, ...(binaryPath === undefined ? {} : { binaryPath }), localPort, mcpPath, ...(publicUrl ? { publicUrl } : {}), tunnelIdEnv, runtimeKeyEnv, credentialTtlMs };
+    return { enabled, autoInstall, ...(binaryPath === undefined ? {} : { binaryPath }), localPort, mcpPath, ...(publicUrl ? { publicUrl } : {}), tunnelIdEnv, runtimeKeyEnv, credentialTtlMs };
   }
 
   private secretReference(name: string, label: string): string | undefined {
@@ -359,6 +391,72 @@ export class OpenAiTunnelProvider implements GatewayTunnelProvider {
     for (const name of ["OPENAI_ADMIN_KEY", "OPENAI_API_KEY", "CONTROL_PLANE_API_KEY", input.runtimeKeyEnv]) delete environment[name];
     environment[OPENAI_TUNNEL_RUNTIME_KEY_ENV] = runtimeKey;
     return environment;
+  }
+
+  /** Identity/version probes never receive the runtime key or broader OpenAI authority. */
+  private versionCheckEnvironment(input: OpenAiInput): NodeJS.ProcessEnv {
+    const environment = { ...this.env };
+    for (const name of ["OPENAI_ADMIN_KEY", "OPENAI_API_KEY", "CONTROL_PLANE_API_KEY", input.runtimeKeyEnv]) delete environment[name];
+    return environment;
+  }
+
+  /**
+   * Discovery order: explicit binaryPath, then PATH, then the managed install,
+   * then (only with autoInstall) a pinned verified download. PATH candidates
+   * that fail version validation are skipped rather than fatal.
+   */
+  private async discoverClient(context: GatewayTunnelDeadlineContext, input: OpenAiInput): Promise<OpenAiClientDiscovery | undefined> {
+    const explicit = resolveOpenAiTunnelClient(input.binaryPath ?? this.options.binaryPath);
+    if (explicit) return { executablePath: explicit, source: "explicit" };
+
+    const executableName = this.platform === "win32" ? `${OPENAI_TUNNEL_CLIENT_EXECUTABLE}.exe` : OPENAI_TUNNEL_CLIENT_EXECUTABLE;
+    for (const directory of (this.env.PATH ?? "").split(delimiter)) {
+      if (!directory) continue;
+      const candidate = join(directory, executableName);
+      if (!existsSync(candidate) || !statSync(candidate).isFile()) continue;
+      const resolved = (() => { try { return realpathSync.native(candidate); } catch { return candidate; } })();
+      const version = await this.clientVersion(context, resolved, input);
+      if (version !== undefined) return { executablePath: resolved, source: "path", version };
+    }
+
+    const managedRoot = this.options.managedRoot ?? join(gatewayGlobalStateRoot(), "tools", "openai-tunnel-client");
+    const install = this.options.installManagedClient ?? ensureManagedOpenAiTunnelClient;
+    const asset = openAiTunnelClientAssetFor(this.platform);
+    if (asset) {
+      const managedPath = managedOpenAiTunnelClientPath(managedRoot, asset);
+      // The managed install is trusted only while it still matches the pinned
+      // binary hash; a tampered or foreign file falls through to reinstall.
+      const verify = this.options.verifyManagedBinary ?? (async (path, candidate) => await sha256File(path).catch(() => undefined) === candidate.binarySha256);
+      if (existsSync(managedPath) && await verify(managedPath, asset)) {
+        const version = await this.clientVersion(context, managedPath, input);
+        if (version !== undefined) return { executablePath: managedPath, source: "managed", version };
+      }
+    }
+    if (!input.autoInstall) return undefined;
+    const installed = await install({
+      managedRoot,
+      platform: this.platform,
+      context,
+      fetch: this.fetchImpl,
+      verifyVersion: async (path) => (await this.clientVersion(context, path, input)) !== undefined,
+    });
+    const version = await this.clientVersion(context, installed, input);
+    return version === undefined ? undefined : { executablePath: installed, source: "downloaded", version };
+  }
+
+  /** Run `--version` and return the version only when it satisfies the configured minimum. */
+  private async clientVersion(context: GatewayTunnelDeadlineContext, executablePath: string, input: OpenAiInput): Promise<string | undefined> {
+    try {
+      const result = await runWithinTunnelDeadline(context, "client version", () => this.runCommandImpl(executablePath, this.contract.versionArgs, { env: this.versionCheckEnvironment(input), context }));
+      if (result.code !== 0) return undefined;
+      const version = parseOpenAiTunnelClientVersion(`${result.stdout}\n${result.stderr}`);
+      if (!version) return undefined;
+      const minimum = this.options.minimumVersion ?? OPENAI_TUNNEL_CLIENT_MINIMUM_VERSION;
+      return isSupportedOpenAiTunnelClientVersion(version, minimum) ? version : undefined;
+    } catch (error) {
+      if (context.signal.aborted || context.remainingMs() <= 0) throw error;
+      return undefined;
+    }
   }
 
   private async probeLocal(context: GatewayTunnelDeadlineContext, runtime: OpenAiRuntime): Promise<GatewayTunnelProbeResult> {

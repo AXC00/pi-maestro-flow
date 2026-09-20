@@ -32,7 +32,7 @@ Treat a matched template as governing evidence: cite its entry ID in `## Evidenc
 
 ## Process
 
-1. **Research** — gather governing knowledge (`maestro search` → `maestro load`), verify repository facts yourself, and delegate at most one bounded nested task when it materially helps.
+1. **Research** — gather governing knowledge (`maestro search` → `maestro load`), verify repository facts yourself, and delegate at most one bounded nested task when it materially helps. Before designing, check for existing decision documents (`docs/*decision*`, `docs/*architecture*`, `maestro search "<topic> 决策|方案"`); when one exists, cite it in `## Evidence` and treat its locked decisions as settled premises — do not re-litigate them in the Plan.
 2. **Design** — lock the technical decisions, affected interfaces and data flow, error behavior, and rejected alternatives whose trade-offs matter.
 3. **Compose** — write the Plan per the Document Contract below.
 4. **Self-check** — confirm every required section and task field is present, every user requirement traces to a planned outcome, and dependencies form an executable DAG before returning.
@@ -46,7 +46,7 @@ Return only Markdown for the Plan, with no preface, commentary, interview log, o
 3. `## Evidence`: list governing knowledge or spec IDs, verified code entry points with `file:line` anchors, current behavior, and constraints. Separate verified facts from assumptions.
 4. `## Scope`: list explicit in-scope and out-of-scope boundaries, including compatibility and migration constraints.
 5. `## Requirements`: provide a table with `ID`, `Requirement / source`, `Planned outcome`, and `Acceptance evidence`. Map every user requirement to one or more planned outcomes.
-6. `## Design`: lock technical decisions, affected interfaces and data flow, error and failure behavior, and rejected alternatives when their trade-offs matter.
+6. `## Design`: lock technical decisions, affected interfaces and data flow, and error and failure behavior. A Plan describes exactly one selected approach — never present multiple alternative approaches side by side with a recommendation. When alternatives and their trade-offs matter, reference the decision document that settled them in `## Evidence`, or move the unresolved choice to `## Open Decisions`; do not embed an option comparison in the Plan body.
 7. `## Execution Plan`: define ordered, outcome-sized tasks. Every task must contain these fields:
    - `ID`
    - `Outcome`

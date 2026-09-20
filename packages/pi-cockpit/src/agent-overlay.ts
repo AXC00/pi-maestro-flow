@@ -9,6 +9,7 @@ import {
 	truncateToWidth,
 	visibleWidth,
 } from "@earendil-works/pi-tui";
+import { frameToAnsi, renderChromeMarked } from "pi-maestro-settings-core/ui";
 import { effectiveAgentStatus, isCliAgent, isExpertLeader, type AgentDisplayStatus } from "./agents-store.ts";
 import { scrollBy, type AgentScrollState } from "./agent-scroll.ts";
 import type { IconGlyphs } from "./icons.ts";
@@ -520,14 +521,19 @@ export class AgentOverlay implements Component, Focusable {
 	}
 
 	private card(rows: string[], width: number): string[] {
-		const box = this.params.glyphs.box;
-		const edge = box.horizontal.repeat(Math.max(0, width - 2));
-		const background = (value: string) => this.params.theme.bg("customMessageBg", value);
-		return [
-			background(this.params.theme.fg("borderMuted", `${box.topLeft}${edge}${box.topRight}`)),
-			...rows.map((row) => background(pad(` ${row}`, width))),
-			background(this.params.theme.fg("borderMuted", `${box.bottomLeft}${edge}${box.bottomRight}`)),
-		];
+		// Unified chrome: rounded card + customMessageBg fill via the shared
+		// renderer. Rows already carry theme styling, so they pass through as
+		// plain spans (ANSI-aware clip keeps them intact).
+		const utils = { measure: visibleWidth, clip: truncateToWidth };
+		const { frame, fillRows } = renderChromeMarked(
+			{ kind: "card", fill: true },
+			rows.map((row) => [{ text: row }]),
+			width,
+			rows.length + 2,
+			this.params.glyphs,
+			utils,
+		);
+		return frameToAnsi(frame, this.params.theme, utils, { fillRows });
 	}
 
 	private moveSelection(delta: number): void {
