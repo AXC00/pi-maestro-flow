@@ -154,3 +154,76 @@ interface SoftCompactionSettings {
   velocity→compact（`action=compact`+reason，非新 band）仅在 Phase 2 证明低误报后启用；
   cache 在 provider 语义标准化后做 auto-prune 有界 defer（带 hysteresis）。
 - **砍掉**：depth。**降级**：prunableFraction（解释指标）、cache（telemetry）。
+
+## 11. Payload 上限与图片 token 估算（v0.30.x 追加）
+
+### 动机
+
+图片 base64 payload 与 token 压力是**正交**的两条曲线：a 个截图可能在 token 上只占
+1M 窗口的 3%，却把**请求体**堆到 13MB，一旦超过本地 AI Toolbox 网关的 16MiB 硬上限
+（`MAX_REQUEST_BODY_BYTES = 16 * 1024 * 1024`），网关直接断连（Broken pipe），`fetch failed`。
+现存故障历史：29 张图/12.69MB base64/单次请求 16.07MB，8 分钟重试耗尽。
+
+结论：payload 体积**不能**由 token 压力驱动，必须由独立字节预算驱动。
+
+### 配置面（新增）
+
+```jsonc
+// 顶层 compaction 字段，默认 undefined = 无上限（不启用）
+{
+  "compaction": {
+    "payloadLimitBytes": 16777216   // 估算请求体字节上限，例如本地代理 16MiB
+  }
+}
+```
+
+- **默认无上限**：不引入任何外部传输约束；用户在 `/maestro-compaction` 显式设置后才启用。
+- 非法值（非正数/非有限）在 `validateCompactionPatch`/`validateEffectiveCompactionSettings` 拒绝。
+- 读取/合并/校验沿用现有顶层字段模式（user→project 逐字段 merge）。
+
+### 图片 token 估算（替换固定 1200）
+
+`estimateMessageTokens` 对图片块**不再清空后固定 1200**：
+
+```
+每张图片 = max(1200, decodedBytes / 512)
+其中 decodedBytes ≈ base64Bytes * 3 / 4
+```
+
+- **下限 1200**：小截图不被低估，token 压力行为向后兼容。
+- **无上限**：token 估算随体积单调增长；不把传输层限制（如 AI Toolbox 16MiB）硬编码进估算器——
+  外部约束由 `payloadLimitBytes` 承载，估算只做物理近似（base64→解码字节→token）。
+- **仍将 base64 从普通 JSON 文本序列化中剥离**（lightweight copy），绝不按 `/4` 算文本 token。
+- document 块仍固定 2000，不套用图片算法。
+- 该值仅是**本地压力启发式**，不等于 provider 账单。
+
+### 通用 payload 回收（新增独立 pass）
+
+`estimatePayloadBytes` 估算整个请求体字节（文本 + base64 + 结构开销）；
+`runPayloadLimitPrune` 在**估算超限**时运行，**在 token 压力早退之前**执行，因此即使
+band=normal 也能为超限 payload 发出信号，且**从历史最旧开始逐条回收**：
+
+- 候选：历史 `toolResult` 中含 image block 或大文本、非 error、非 control 工具、未被 manifest claim 的消息。
+- 回收动作：优先 `imagePruneReplacement`（图片→占位），否则 `pruneToolResult`（大文本→记录化/可重放占位）。
+- **保护边界 = 当前 user 消息**（含其图片）及之后内容；不采用 `keepRecentTokens`——刚读入的截图正是
+  需要回收的对象。（`keepRecentTokens` 属 token 语义，字节护栏必须独立。）
+- 顺序：**最旧优先**（不受内容类型影响，旧图片/旧大输出一视同仁）。
+- **保护边界 = 当前 user 消息，且当超限全在保护区内时触发压缩**：若无可回收内容（所有超限字节都
+  在当前 user 消息里——例如刚贴的一张巨图），裁剪无法帮忙，policy 返回 `action:"compact"`（类似
+  手动 `/compact`），让摘要压缩把当前指令（含内嵌图片）折叠为占位，从而下次请求体低于上限。
+  这是“不删当前指令”与“不撞墙”之间的逃逸阀。
+- 记录：manifest 新增 `level: "payload"`，persist/restore 支持（`restorePruneReplacement` 按确定性
+  replacement 重建字节一致的占位；旧 manifest 无该 level 时安全回退）。
+- 重复评估：候选被 claim，不会二次替换。
+
+### 边界说明（flow vs agent core）
+
+- **pi-maestro-flow**：只能对**已在上下文**的历史图片做字节降级与更准确的 token 估算；
+  它不拥有“图片进上下文前的 resize”。
+- **上游 TODO（earendil-works/pi · packages/coding-agent）**：`read` 工具在
+  `image-resize-core` 已有 Photon JPEG 路径，但早退条件 `尺寸≤2000 && base64<4.5MB`
+  会让合规的 PNG 截图（如 1920×1080 / 2443KB）**原样返回、不转 JPEG**。
+  实测同图 JPEG q85 仅 302KB（约 8 倍节省）。上游修复方向：尺寸/字节合规时
+  对无损格式（PNG/BMP/TIFF/WebP）尝试 JPEG 再编码，若显著更小（<60%）则采用，
+  保持宽高比与坐标语义。流侧无法拦截 read 输出，此项必须在上游完成。
+- 摘要请求**始终剥图**（`[image]`/`[image:route]` 占位，零图片上传），本特性不改变该语义。

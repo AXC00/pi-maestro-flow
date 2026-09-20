@@ -74,6 +74,7 @@ test("compaction settings resolve paths, precedence, and field-level sources", a
       reserveTokens: DEFAULT_RESERVE_TOKENS,
       keepRecentTokens: DEFAULT_KEEP_RECENT_TOKENS,
       model: undefined,
+      payloadLimitBytes: undefined,
       soft: { ...DEFAULT_SOFT_COMPACTION },
       newContext: { enabled: DEFAULT_NEW_CONTEXT_ENABLED },
       source: {
@@ -83,6 +84,7 @@ test("compaction settings resolve paths, precedence, and field-level sources", a
         model: "default",
         soft: "default",
         newContext: "default",
+        payloadLimitBytes: "default",
       },
     });
 
@@ -102,6 +104,7 @@ test("compaction settings resolve paths, precedence, and field-level sources", a
       reserveTokens: 24_000,
       keepRecentTokens: 12_000,
       model: undefined,
+      payloadLimitBytes: undefined,
       soft: { ...DEFAULT_SOFT_COMPACTION },
       newContext: { enabled: DEFAULT_NEW_CONTEXT_ENABLED },
       source: {
@@ -111,6 +114,7 @@ test("compaction settings resolve paths, precedence, and field-level sources", a
         model: "default",
         soft: "default",
         newContext: "default",
+        payloadLimitBytes: "default",
       },
     });
   } finally {
@@ -141,6 +145,7 @@ test("compaction settings ignore malformed files and invalid optional fields", a
       reserveTokens: DEFAULT_RESERVE_TOKENS,
       keepRecentTokens: DEFAULT_KEEP_RECENT_TOKENS,
       model: undefined,
+      payloadLimitBytes: undefined,
       soft: { ...DEFAULT_SOFT_COMPACTION },
       newContext: { enabled: DEFAULT_NEW_CONTEXT_ENABLED },
       source: {
@@ -150,6 +155,7 @@ test("compaction settings ignore malformed files and invalid optional fields", a
         model: "default",
         soft: "default",
         newContext: "default",
+        payloadLimitBytes: "default",
       },
     });
     await assert.rejects(

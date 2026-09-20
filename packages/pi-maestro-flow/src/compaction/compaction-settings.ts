@@ -186,18 +186,26 @@ export function createDefaultSoftCompaction(): SoftCompactionSettings {
 }
 
 export const DEFAULT_SOFT_COMPACTION: SoftCompactionSettings = createDefaultSoftCompaction();
-
 export interface CompactionConfigPatch {
   enabled?: boolean;
   reserveTokens?: number;
   keepRecentTokens?: number;
   /** Compaction summary model as `provider/id`; undefined follows the active session model. */
   model?: string;
+  /**
+   * Optional payload byte ceiling for the estimate request body. When set, the
+   * compaction layer evicts the OLDEST eligible messages (oldest-first,
+   * images first among equals) before sending so the body stays under the
+   * limit. Undefined = no ceiling (default). This is an environment
+   * constraint (e.g. a local proxy gateway's 16MiB cap), applied only when
+   * explicitly configured via /maestro-compaction.
+   */
+  payloadLimitBytes?: number;
   soft?: SoftCompactionConfigPatch;
   newContext?: NewContextCompactionConfigPatch;
 }
 
-export const COMPACTION_FIELDS = ["enabled", "reserveTokens", "keepRecentTokens", "model", "newContext"] as const;
+export const COMPACTION_FIELDS = ["enabled", "reserveTokens", "keepRecentTokens", "model", "newContext", "payloadLimitBytes"] as const;
 
 export type CompactionSettingSource = "project" | "user" | "default";
 
@@ -207,6 +215,8 @@ export interface EffectiveCompactionSettings {
   keepRecentTokens: number;
   /** Configured compaction model (`provider/id`); undefined follows the active session model. */
   model?: string;
+  /** Optional payload byte ceiling; undefined = no ceiling (default). */
+  payloadLimitBytes?: number;
   soft: SoftCompactionSettings;
   /** Explicit new-context mode gate; defaults on and never affects automatic compaction. */
   newContext: NewContextCompactionSettings;
@@ -256,6 +266,8 @@ function readRawCompaction(path: string): CompactionConfigPatch {
     const kr = positiveInt(hard?.keepRecentTokens) ?? positiveInt(c.keepRecentTokens);
     if (kr !== undefined) patch.keepRecentTokens = kr;
     if (typeof c.model === "string" && c.model.trim().length > 0) patch.model = c.model.trim();
+    const payloadLimit = positiveNumber(c.payloadLimitBytes);
+    if (payloadLimit !== undefined) patch.payloadLimitBytes = payloadLimit;
     const soft = readRawSoft(c.soft);
     if (soft) patch.soft = soft;
     const newContext = readRawNewContext(c.newContext);
@@ -390,12 +402,14 @@ export function resolveEffectiveCompactionSettings(
     model: "default",
     soft: "default",
     newContext: "default",
+    payloadLimitBytes: "default",
   };
 
   let enabled = true;
   let reserveTokens = DEFAULT_RESERVE_TOKENS;
   let keepRecentTokens = DEFAULT_KEEP_RECENT_TOKENS;
   let model: string | undefined;
+  let payloadLimitBytes: number | undefined;
   const soft: SoftCompactionSettings = createDefaultSoftCompaction();
   const newContext: NewContextCompactionSettings = { enabled: DEFAULT_NEW_CONTEXT_ENABLED };
 
@@ -404,6 +418,7 @@ export function resolveEffectiveCompactionSettings(
     if (patch.reserveTokens !== undefined) { reserveTokens = patch.reserveTokens; source.reserveTokens = src; }
     if (patch.keepRecentTokens !== undefined) { keepRecentTokens = patch.keepRecentTokens; source.keepRecentTokens = src; }
     if (patch.model !== undefined) { model = patch.model; source.model = src; }
+    if (patch.payloadLimitBytes !== undefined) { payloadLimitBytes = patch.payloadLimitBytes; source.payloadLimitBytes = src; }
     if (patch.newContext?.enabled !== undefined) {
       newContext.enabled = patch.newContext.enabled;
       source.newContext = src;
@@ -449,7 +464,7 @@ export function resolveEffectiveCompactionSettings(
     }
   }
 
-  return { enabled, reserveTokens, keepRecentTokens, model, soft, newContext, source };
+  return { enabled, reserveTokens, keepRecentTokens, model, payloadLimitBytes, soft, newContext, source };
 }
 
 export function validateCompactionPatch(
@@ -473,6 +488,9 @@ export function validateCompactionPatch(
     if (!Number.isSafeInteger(value) || value <= 0) {
       errors.push(`${field} must be a positive safe integer`);
     }
+  }
+  if (patch.payloadLimitBytes !== undefined && !isPositiveFiniteNumber(patch.payloadLimitBytes)) {
+    errors.push(`payloadLimitBytes must be a positive finite number`);
   }
 
   const rt = patch.reserveTokens;
@@ -595,6 +613,9 @@ export function validateEffectiveCompactionSettings(settings: EffectiveCompactio
   if (!Number.isSafeInteger(settings.keepRecentTokens) || settings.keepRecentTokens <= 0) {
     errors.push(`keepRecentTokens must be a positive safe integer`);
   }
+  if (settings.payloadLimitBytes !== undefined && !isPositiveFiniteNumber(settings.payloadLimitBytes)) {
+    errors.push(`payloadLimitBytes must be a positive finite number`);
+  }
   if (settings.model !== undefined && (typeof settings.model !== "string" || !settings.model.includes("/"))) {
     errors.push(`model must be a "provider/id" reference`);
   }
@@ -712,6 +733,7 @@ async function patchSettingsFile(path: string, patch: CompactionConfigPatch): Pr
   const compaction = normalizeCompactionRecord(isRecord(root.compaction) ? { ...root.compaction } : {});
   if (patch.enabled !== undefined) compaction.enabled = patch.enabled;
   if (patch.model !== undefined) compaction.model = patch.model;
+  if (patch.payloadLimitBytes !== undefined) compaction.payloadLimitBytes = patch.payloadLimitBytes;
   if (patch.reserveTokens !== undefined || patch.keepRecentTokens !== undefined) {
     const hard = isRecord(compaction.hard) ? { ...compaction.hard } : {};
     if (patch.reserveTokens !== undefined) {
@@ -788,6 +810,11 @@ async function replaceKnownFieldsInSettingsFile(path: string, values: Compaction
   }
   if (Object.keys(hard).length === 0) delete compaction.hard;
   else compaction.hard = hard;
+  // Payload byte ceiling: undefined means "no ceiling" — clear the field so a
+  // user who unsets the limit in the TUI gets a clean removal, not a stale
+  // persisted value.
+  if (values.payloadLimitBytes === undefined) delete compaction.payloadLimitBytes;
+  else compaction.payloadLimitBytes = values.payloadLimitBytes;
   if (values.soft !== undefined) {
     const soft: Record<string, unknown> = {};
     for (const [key, value] of Object.entries(values.soft)) {

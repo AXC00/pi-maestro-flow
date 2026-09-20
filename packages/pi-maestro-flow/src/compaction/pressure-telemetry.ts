@@ -29,6 +29,7 @@ import {
   type MessageRecord,
   type CompactionSettings,
   estimateMessageTokens,
+  estimatePayloadBytes,
   pruneToolResult,
   assistantUsage,
   latestProviderUsageEpoch,
@@ -220,6 +221,8 @@ export function computeContextSignals(input: {
   estimatedTokens: number;
   contextWindow: number;
   thresholdTokens: number;
+  /** Optional payload byte ceiling; when set, payload signals are computed. */
+  payloadLimitBytes?: number;
 }): ContextSignals {
   const { messages, estimatedTokens, contextWindow, thresholdTokens } = input;
   const fullnessRatio = contextWindow > 0 ? estimatedTokens / contextWindow : 0;
@@ -227,7 +230,19 @@ export function computeContextSignals(input: {
   const { prunableTokens, redundantTokens } = scanContextTokens(messages);
   const prunableFraction = estimatedTokens > 0 ? Math.min(1, prunableTokens / estimatedTokens) : 0;
   const redundantFraction = estimatedTokens > 0 ? Math.min(1, redundantTokens / estimatedTokens) : 0;
-  return { fullnessRatio, criticalGap, prunableFraction, redundantFraction, cacheHitRatio: latestCacheHitRatio(messages) };
+  const signals: ContextSignals = {
+    fullnessRatio,
+    criticalGap,
+    prunableFraction,
+    redundantFraction,
+    cacheHitRatio: latestCacheHitRatio(messages),
+  };
+  if (input.payloadLimitBytes !== undefined) {
+    signals.payloadBytes = estimatePayloadBytes(messages);
+    signals.payloadLimitBytes = input.payloadLimitBytes;
+    signals.payloadLimitExceeded = signals.payloadBytes > input.payloadLimitBytes;
+  }
+  return signals;
 }
 
 /**
@@ -240,6 +255,10 @@ export function decideContextAction(band: ContextPressureBand, signals: ContextS
   if (signals.prunableFraction > 0) reasons.push(`prunable:${Math.round(signals.prunableFraction * 100)}%`);
   if (signals.redundantFraction && signals.redundantFraction > 0) reasons.push(`redundant:${Math.round(signals.redundantFraction * 100)}%`);
   if (signals.cacheHitRatio !== undefined) reasons.push(`cache:${Math.round(signals.cacheHitRatio * 100)}%`);
+  if (signals.payloadLimitExceeded) {
+    const mb = signals.payloadBytes !== undefined ? (signals.payloadBytes / (1024 * 1024)).toFixed(1) : "?";
+    reasons.push(`payload-bytes:${mb}MB`);
+  }
   return { band, action, reasons };
 }
 

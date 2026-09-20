@@ -46,7 +46,7 @@ import {
 type CompactionField = typeof COMPACTION_FIELDS[number];
 type EditableCompactionField = Exclude<CompactionField, "enabled" | "newContext">;
 type SoftMechanismItem = "softLossless" | "softCacheGate" | "softTimeBased" | "softRelevance" | "softDedup";
-type MenuItem = "threshold" | "enabled" | "keepRecentTokens" | "softEnabled" | SoftMechanismItem | "compactModel" | "newContext";
+type MenuItem = "threshold" | "enabled" | "keepRecentTokens" | "softEnabled" | SoftMechanismItem | "compactModel" | "newContext" | "payloadLimitBytes";
 type ConfigFieldItem = Exclude<MenuItem, "softEnabled" | SoftMechanismItem | "newContext">;
 type SaveState = "clean" | "dirty" | "saving" | "failed";
 
@@ -76,6 +76,7 @@ const CATALOGS = {
     "item.softTimeBased": "Time-based staleness",
     "item.softRelevance": "Relevance ranking",
     "item.softDedup": "Cross-turn dedup",
+    "item.payloadLimitBytes": "Payload byte limit",
     "item.compactModel": "Compaction model",
     "item.newContext": "Explicit new-context compaction",
     "item.threshold.short": "Threshold",
@@ -86,6 +87,7 @@ const CATALOGS = {
     "item.softTimeBased.short": "Time",
     "item.softRelevance.short": "Relevance",
     "item.softDedup.short": "Dedup",
+    "item.payloadLimitBytes.short": "Payload",
     "item.compactModel.short": "Model",
     "item.newContext.short": "New ctx",
     "item.keepRecentTokens.short": "Keep",
@@ -98,6 +100,7 @@ const CATALOGS = {
     "detail.softTimeBased": "When the last assistant message is older than the threshold, the cache is certain to be stale; skips the cache economy gate and prunes directly; off by default.",
     "detail.softRelevance": "Prioritizes pruning low-relevance output by lexical relevance (BM25/keywords) to the latest user instruction; off by default.",
     "detail.softDedup": "Replaces verbatim duplicates of earlier tool output with context pointers; referenced output stays protected; off by default.",
+    "detail.payloadLimitBytes": "Max request body size in bytes. When exceeded, the oldest messages are dropped first to keep requests small. Unset = no limit.",
     "detail.compactModel": "Model used for text-compaction summaries; follows the current session model by default and falls back at runtime when resolution fails.",
     "detail.newContext": "Allows standalone new_context requests and Todo advance transition:new_context. On by default; this gate never changes threshold-triggered automatic compaction.",
     "value.on": "● On",
@@ -106,10 +109,12 @@ const CATALOGS = {
     "value.inheritPrefix": "Inherited from",
     "value.unconfigured": "Unconfigured, follows the current session model",
     "value.followSession": "Follow session model",
+    "value.unlimited": "Unlimited (off)",
     "value.reservePrefix": "Reserve",
     "editor.title": "Edit",
     "editor.current": "Current value",
     "editor.newValue": "New value",
+    "editor.bytes": "bytes",
     "editor.tokens": "tokens",
     "editor.configThreshold": "Configured threshold",
     "editor.configReserve": "Configured reserve",
@@ -228,6 +233,7 @@ const CATALOGS = {
     "item.softTimeBased": "时间基冷检测",
     "item.softRelevance": "相关性排序",
     "item.softDedup": "跨轮去重",
+    "item.payloadLimitBytes": "负载字节上限",
     "item.compactModel": "压缩模型",
     "item.newContext": "显式新上下文压缩",
     "item.threshold.short": "阈值",
@@ -238,6 +244,7 @@ const CATALOGS = {
     "item.softTimeBased.short": "时间",
     "item.softRelevance.short": "相关",
     "item.softDedup.short": "去重",
+    "item.payloadLimitBytes.short": "负载",
     "item.compactModel.short": "模型",
     "item.newContext.short": "新上下文",
     "item.keepRecentTokens.short": "保留",
@@ -250,6 +257,7 @@ const CATALOGS = {
     "detail.softTimeBased": "距最后一条助手消息超过阈值时缓存必然过期，跳过缓存经济门槛直接裁剪；默认关闭。",
     "detail.softRelevance": "按最近用户指令的词法相关性（BM25/关键词）优先裁剪低相关输出；默认关闭。",
     "detail.softDedup": "把与更早工具输出逐字重复的片段替换为上下文指针，被引用输出受保护；默认关闭。",
+    "detail.payloadLimitBytes": "请求体大小上限（字节）。超出时从最旧内容开始清理，避免请求过大被网关拒绝。默认不限制。",
     "detail.compactModel": "用于生成文本压缩摘要的模型；默认跟随当前会话模型，解析失败运行时自动回退。",
     "detail.newContext": "允许 standalone new_context 请求与 Todo advance transition:new_context。默认开启；此门禁不会改变按阈值触发的自动压缩。",
     "value.on": "● 已开启",
@@ -258,10 +266,12 @@ const CATALOGS = {
     "value.inheritPrefix": "继承自",
     "value.unconfigured": "未配置，跟随当前会话模型",
     "value.followSession": "跟随会话模型",
+    "value.unlimited": "无上限（未启用）",
     "value.reservePrefix": "预留",
     "editor.title": "修改",
     "editor.current": "当前值",
     "editor.newValue": "新值",
+    "editor.bytes": "字节",
     "editor.tokens": "Token",
     "editor.configThreshold": "配置阈值",
     "editor.configReserve": "配置预留",
@@ -376,6 +386,7 @@ interface ScopeDraft {
   reserveTokens?: string;
   keepRecentTokens?: string;
   model?: string;
+  payloadLimitBytes?: string;
   newContext?: { enabled?: boolean };
   soft?: SoftCompactionConfigPatch;
 }
@@ -420,7 +431,7 @@ const SOFT_MECHANISM_KEYS: Record<SoftMechanismItem, "lossless" | "cache" | "tim
 const MENU_ITEMS: readonly MenuItem[] = [
   "threshold", "enabled", "keepRecentTokens", "softEnabled",
   "softLossless", "softCacheGate", "softTimeBased", "softRelevance", "softDedup",
-  "compactModel", "newContext",
+  "compactModel", "newContext", "payloadLimitBytes",
 ];
 
 function isSoftMechanismItem(item: MenuItem): item is SoftMechanismItem {
@@ -439,6 +450,7 @@ function itemLabel(item: MenuItem): CatalogKey {
     case "softRelevance": return "item.softRelevance";
     case "softDedup": return "item.softDedup";
     case "compactModel": return "item.compactModel";
+    case "payloadLimitBytes": return "item.payloadLimitBytes";
     case "newContext": return "item.newContext";
   }
 }
@@ -458,6 +470,7 @@ function shortLabel(item: MenuItem): CatalogKey {
     case "softRelevance": return "item.softRelevance.short";
     case "softDedup": return "item.softDedup.short";
     case "compactModel": return "item.compactModel.short";
+    case "payloadLimitBytes": return "item.payloadLimitBytes.short";
     case "newContext": return "item.newContext.short";
     case "keepRecentTokens": return "item.keepRecentTokens.short";
   }
@@ -689,7 +702,7 @@ export class CompactionSettingsOverlay implements Component, Focusable {
       headerLine(this.params.theme, `${this.t("editor.title")}${this.t(itemLabel(item))}`, [this.scopeLabel(this.scope)], inner),
       rule(inner),
       fit(`${this.t("editor.current")} · ${this.itemValue(item)}`, inner),
-      this.params.theme.fg("accent", fit(`› ${this.t("editor.newValue")} · ${this.formattedEditValue()} ${this.t("editor.tokens")}`, inner)),
+      this.params.theme.fg("accent", fit(`› ${this.t("editor.newValue")} · ${this.formattedEditValue()} ${item === "payloadLimitBytes" ? this.t("editor.bytes") : this.t("editor.tokens")}`, inner)),
     ];
     if (item === "threshold") {
       const capacity = this.linkedThreshold();
@@ -1017,6 +1030,11 @@ export class CompactionSettingsOverlay implements Component, Focusable {
       return effective.soft[SOFT_MECHANISM_KEYS[item]]?.enabled === true ? this.t("value.on") : this.t("value.off");
     }
     if (item === "compactModel") return effective.model ?? this.t("value.followSession");
+    if (item === "payloadLimitBytes") {
+      return effective.payloadLimitBytes === undefined
+        ? this.t("value.unlimited")
+        : `${formatNumber(effective.payloadLimitBytes)} ${this.t("editor.bytes")}`;
+    }
     if (item === "threshold") {
       const model = this.linkedThreshold();
       return model.usable
@@ -1440,6 +1458,7 @@ function toDraft(patch: CompactionConfigPatch): ScopeDraft {
     ...(patch.reserveTokens !== undefined ? { reserveTokens: String(patch.reserveTokens) } : {}),
     ...(patch.keepRecentTokens !== undefined ? { keepRecentTokens: String(patch.keepRecentTokens) } : {}),
     ...(patch.model !== undefined ? { model: patch.model } : {}),
+    ...(patch.payloadLimitBytes !== undefined ? { payloadLimitBytes: String(patch.payloadLimitBytes) } : {}),
     ...(patch.newContext !== undefined ? { newContext: { ...patch.newContext } } : {}),
     ...(patch.soft !== undefined ? { soft: { ...patch.soft } } : {}),
   };
@@ -1451,6 +1470,7 @@ function draftToPatch(draft: ScopeDraft): CompactionConfigPatch {
     ...(draft.reserveTokens !== undefined ? { reserveTokens: Number(draft.reserveTokens) } : {}),
     ...(draft.keepRecentTokens !== undefined ? { keepRecentTokens: Number(draft.keepRecentTokens) } : {}),
     ...(draft.model !== undefined ? { model: draft.model } : {}),
+    ...(draft.payloadLimitBytes !== undefined ? { payloadLimitBytes: Number(draft.payloadLimitBytes) } : {}),
     ...(draft.newContext !== undefined ? { newContext: { ...draft.newContext } } : {}),
     ...(draft.soft !== undefined ? { soft: { ...draft.soft } } : {}),
   };

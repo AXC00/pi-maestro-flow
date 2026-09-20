@@ -176,13 +176,40 @@ test("estimateMessageTokens charges documents a fixed cost, not base64 text size
   assert.ok(tokens >= 2000, `document must include the fixed ~2000 per-document estimate`);
 });
 
-test("estimateMessageTokens keeps image estimate unchanged at ~1200 per image", () => {
-  const oneImage = estimateMessageTokens({
+test("estimateMessageTokens estimates images proportionally to base64 size with a floor", () => {
+  const small = estimateMessageTokens({
     role: "user",
     content: [imageBlock()],
     timestamp: 1,
   } as never);
-  assert.ok(oneImage >= 1200 && oneImage < 1300, `single image ~1200, got ${oneImage}`);
+  assert.ok(small >= 1200 && small < 1600, `small 5KB image stays near the floor, got ${small}`);
+  const largeData = "A".repeat(2_000_000); // ~1.5MB decoded
+  const large = estimateMessageTokens({
+    role: "user",
+    content: [{ type: "image", data: largeData, mimeType: "image/png" }],
+    timestamp: 1,
+  } as never);
+  assert.ok(large > small, `larger image must estimate higher (${large} vs ${small})`);
+  assert.ok(large < 10_000, `2MB image must stay bounded, got ${large}`);
+});
+
+test("estimateMessageTokens grows image estimate with payload size without a transport cap", () => {
+  const huge = "A".repeat(50_000_000); // 50MB base64
+  const tokens = estimateMessageTokens({
+    role: "user",
+    content: [{ type: "image", data: huge, mimeType: "image/png" }],
+    timestamp: 1,
+  } as never);
+  // No transport ceiling is baked into the estimator: a bigger payload keeps
+  // costing more, while still never being counted as text tokens.
+  const medium = estimateMessageTokens({
+    role: "user",
+    content: [{ type: "image", data: "A".repeat(2_000_000), mimeType: "image/png" }],
+    timestamp: 1,
+  } as never);
+  assert.ok(tokens > medium, `larger payload must estimate higher (${tokens} vs ${medium})`);
+  assert.ok(tokens < 100_000, `50MB payload stays bounded by decoded-bytes ratio, got ${tokens}`);
+  assert.ok(tokens < 10_000_000, `never counts base64 as text tokens, got ${tokens}`);
 });
 
 test("estimateMessageTokens charges image and document blocks independently in one message", () => {
